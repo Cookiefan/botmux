@@ -109,6 +109,68 @@ describe('canRunDaemonCommand gate', () => {
     expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_owner', undefined, '/status')).toBe(true);
   });
 
+  /**
+   * `/login` under trigger-user auth.
+   *
+   * The feature makes each person act as themselves, and `/login` is the only
+   * way to obtain a personal identity — so while it required canOperate the
+   * feature was unusable for exactly the people it exists for: a non-admin was
+   * refused the CLI for having no credentials, and refused the one command that
+   * supplies them. Nobody could break that deadlock from inside the chat.
+   *
+   * The relaxation is deliberately conditional, so both directions are pinned
+   * here: a bot that never opted in keeps `/login` on canOperate.
+   */
+  describe('/login when trigger-user auth is on', () => {
+    const enable = (enabled: boolean) => {
+      getBot('ct1').config.triggerUserAuth = enabled
+        ? { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' }
+        : undefined;
+    };
+
+    it('lets a canTalk-only sender authorize themselves', () => {
+      enable(true);
+      // Same sender the old gate refused: talk-granted, not an operator.
+      expect(canOperate('ct1', 'oc_1', 'ou_guest')).toBe(false);
+      expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(true);
+    });
+
+    it('stays on canOperate for a bot that did not opt in', () => {
+      enable(false);
+      expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(false);
+      // ...and the owner is unaffected either way.
+      expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_owner', undefined, '/login')).toBe(true);
+    });
+
+    it('is off for an explicit { enabled: false } policy', () => {
+      getBot('ct1').config.triggerUserAuth = { enabled: false, tools: [], fallback: 'bot-identity' };
+      expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, '/login')).toBe(false);
+    });
+
+    it('opens ONLY /login — every other management command stays gated', () => {
+      enable(true);
+      // The point of scoping this to one command: enabling a credential feature
+      // must not hand a talk-granted user the management surface.
+      for (const cmd of ['/restart', '/cd', '/close', '/botconfig', '/oncall', '/repo']) {
+        expect(canRunDaemonCommand('ct1', 'oc_1', 'ou_guest', undefined, cmd), cmd).toBe(false);
+      }
+    });
+
+    it('still requires canTalk — a stranger with no route in is refused', () => {
+      enable(true);
+      // Relaxed to canTalk, NOT to "anyone". Someone with no grant, not in an
+      // oncall chat, and not in an open p2p has no leg to stand on.
+      expect(canTalk('ct1', 'oc_other', 'ou_stranger')).toBe(false);
+      expect(canRunDaemonCommand('ct1', 'oc_other', 'ou_stranger', undefined, '/login')).toBe(false);
+    });
+
+    it('reaches an oncall-chat member without naming /login in the downgrade list', () => {
+      enable(true);
+      getBot('ct1').config.canTalkDaemonCommands = undefined;
+      expect(canRunDaemonCommand('ct1', 'oc_oncall', 'ou_stranger', undefined, '/login')).toBe(true);
+    });
+  });
+
   it('p2pOpen leg works only when chatType is passed (fail-closed without)', () => {
     const bot = getBot('ct1');
     bot.config.p2pOpen = true;

@@ -2100,6 +2100,13 @@ export function canOperate(
   return !!senderOpenId && allowedUsers.includes(senderOpenId);
 }
 
+/** Whether this bot opted into trigger-user CLI auth. Fail-closed: an
+ *  unreadable / unregistered bot keeps `/login` on canOperate. */
+function triggerUserAuthEnabledForBot(larkAppId: string): boolean {
+  try { return getBot(larkAppId).config.triggerUserAuth?.enabled === true; }
+  catch { return false; }
+}
+
 /**
  * Daemon 命令统一闸：canOperate 恒放行；此外，bot 配置的 `canTalkDaemonCommands`
  * 名单内的命令降到 canTalk 判定（oncall / allowedChatGroup / grant / p2pOpen 等
@@ -2117,6 +2124,12 @@ export function canOperate(
  * union_id 的情况）；否则「团队拉群里外部 bot 能 talk 却执行不了降权到 canTalk 的命令
  * （如 /status）」——单一 talk 谓词在这道 daemon 命令闸继续分叉。不传（人的路径）→
  * 原样走 canTalk / evaluateTalk，语义不变。canOperate 那段人/bot 通用，不受影响。
+ *
+ * `/login` 另有一条例外：**开启了 triggerUserAuth 的 bot** 上它降到 canTalk。该功能
+ * 要求每个人用自己的身份，而 `/login` 是取得个人身份的唯一入口——留在 canOperate 会
+ * 形成死锁（非管理员既被 CLI 拒、又不能发那条能解锁的命令）。它只授权调用者自己
+ * （落盘 per-person，按 `message.senderId` 归属），拿不到也覆盖不了别人的凭证。
+ * 未开该功能的 bot 不变（没有消费 per-person token 的地方，放开无收益）。
  *
  * `/repo` 另有一个更窄的同部署 sibling bot 例外：仅当飞书事件把发送方盖章为 bot，
  * receiver cross-ref 命中 sender open_id，且 sender union_id 精确匹配当前仍配置的唯一
@@ -2137,6 +2150,27 @@ export function canRunDaemonCommand(
   if (cmd === '/repo' && larkStampedBotSender === true
     && isVerifiedLocalSiblingBot(config.session.dataDir, larkAppId, senderOpenId, senderUnionId)) {
     return true;
+  }
+  // `/login` under trigger-user auth. That feature requires each person to act
+  // as themselves, and `/login` is the ONLY way to obtain a personal identity —
+  // so leaving it on canOperate made the feature unusable for exactly the people
+  // it exists for: a non-admin was refused the CLI for lacking credentials, and
+  // refused the command that supplies them. Neither they nor the agent could
+  // break the deadlock.
+  //
+  // Safe to relax because every `/login` path is scoped to the SENDER: the
+  // command reads `message.senderId` and tokens land in a per-person file
+  // (`user-token-<app>-<openId>.json`), so one person authorizing cannot read,
+  // overwrite, or reveal anyone else's. It grants nothing beyond the caller's
+  // own Feishu/ByteCloud permissions — it is self-service, not management.
+  //
+  // Scoped to bots that opted in: with the feature off, nothing consumes a
+  // per-person token, so opening the command would widen the surface for no
+  // benefit. Those bots keep the old canOperate-only behavior.
+  if (cmd === '/login' && triggerUserAuthEnabledForBot(larkAppId)) {
+    return botSender
+      ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
+      : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   }
   const list = getBot(larkAppId).config.canTalkDaemonCommands;
   if (!list?.includes(cmd)) return false;
