@@ -3386,7 +3386,9 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
       />
       {enabled ? (
         <>
-          <div className="bd-row">
+          {/* data-trigger-user-auth-tools 是 CSS 钩子：这一行要横排（标题 + 两个
+              复选框），需就地取消 .bd-row 的竖排 grid，见 style.css 同名选择器。 */}
+          <div className="bd-row" data-trigger-user-auth-tools="">
             <span>{tr('botDefaults.triggerUserAuthTools')}</span>
             {(['lark-cli', 'bytedcli'] as const).map(tool => (
               <label key={tool} className="bd-inline-check">

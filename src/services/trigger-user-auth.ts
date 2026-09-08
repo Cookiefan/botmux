@@ -146,6 +146,34 @@ function isTool(value: unknown): value is TriggerUserAuthTool {
  */
 export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig | null {
   if (raw === undefined || raw === null) return null;
+  // Accept a JSON **string** holding the object, not because it is a shape we
+  // want written, but because one already exists on disk: a dashboard bug wrote
+  // the policy as text, and this parser runs while loading EVERY bot. Throwing
+  // on it took the whole fleet down (`bots.json` has one shared array — one bad
+  // entry means no bot loads at all, and the dashboard crash-loops).
+  //
+  // Tolerating it here is what keeps a single mistyped field from being a
+  // fleet-wide outage. The write door is fixed too (dashboard-ipc-server.ts
+  // coerces before it stores); this is the safety net for configs already
+  // written, which no amount of fixing the writer can retroactively repair.
+  if (typeof raw === 'string') {
+    const text = raw.trim();
+    if (!text) return null;
+    let decoded: unknown;
+    try { decoded = JSON.parse(text); }
+    catch {
+      throw new TriggerUserAuthConfigError(
+        'triggerUserAuth must be an object (got a string that is not valid JSON)',
+      );
+    }
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth must be an object');
+    }
+    // Re-enter with the decoded object so every rule below applies unchanged —
+    // a legacy string gets exactly the same validation as a fresh object, with
+    // no second copy of the rules to drift.
+    return parseTriggerUserAuthConfig(decoded);
+  }
   if (typeof raw !== 'object' || Array.isArray(raw)) {
     throw new TriggerUserAuthConfigError('triggerUserAuth must be an object');
   }

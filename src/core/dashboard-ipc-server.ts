@@ -262,7 +262,7 @@ import {
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
-import { tokenStoreProtection } from '../services/trigger-user-auth.js';
+import { tokenStoreProtection, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -4785,6 +4785,13 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
   let codexAuthSync: 'shared' | 'isolated' = 'shared';
   try { if (getBot(cachedLarkAppId).config.codexAuthSync === 'isolated') codexAuthSync = 'isolated'; } catch { /* default shared */ }
+  // Trigger-user auth policy. Without it in this payload the dashboard panel has
+  // nothing to read back, so it rendered the toggle OFF for a bot that had the
+  // feature ON — and the tool checkboxes / fallback / advisories never appeared
+  // at all (they are gated on the toggle). The PUT door stores the policy fine;
+  // it was only ever invisible on reload.
+  let triggerUserAuth: TriggerUserAuthConfig | null = null;
+  try { triggerUserAuth = getBot(cachedLarkAppId).config.triggerUserAuth ?? null; } catch { /* unset → off */ }
   let skillInjection: 'global' | 'prompt' | 'off' | null = null;
   // How this bot's CLI delivers botmux skills, so the dashboard can render the
   // control correctly: 'dynamic' = per-session --plugin-dir (claude-family, not
@@ -4936,6 +4943,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     replyStyle,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     codexAuthSync,
+    triggerUserAuth,
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
@@ -6168,8 +6176,14 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
 
 // PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
 // `{ triggerUserAuth: object | null }`：null / 空对象 → 清除（关闭）。
-// 与 /botconfig set 共用 applyConfigField，因此两个门的校验完全一致：拒绝原因
-// （比如「fallback 不能是 device」）原样透出，不在这里另写一套判断。
+// 与 /botconfig set 共用 coerceConfigValue + applyConfigField，因此两个门的校验
+// 完全一致：拒绝原因（比如「fallback 不能是 device」）原样透出，不在这里另写一套判断。
+//
+// ⚠️ `applyConfigField` 对 kind:'json' 字段是**原样落盘**（`entry[key] = value`），
+// 自己不做解析。所以这里必须先过 coerceConfigValue 把 JSON **文本**变成**对象**再交给它
+// ——把文本直接传下去会让 bots.json 存成一个字符串，而 `parseTriggerUserAuthConfig`
+// 要求对象、遇字符串直接 throw，于是**整个 bots.json 解析失败、全部 bot 都加载不出来**
+// （dashboard 随之 crash-loop）。改这里前先读 bot-config-store.ts 的 json 分支。
 ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { triggerUserAuth?: unknown };
@@ -6177,13 +6191,15 @@ ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
   catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
   const spec = findConfigField('triggerUserAuth');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
-  // '' is the store's "clear" sentinel; anything else goes through the shared
-  // JSON coercion so a malformed policy is rejected the same way here as it is
-  // from chat.
-  const raw = body.triggerUserAuth === null || body.triggerUserAuth === undefined
-    ? ''
-    : JSON.stringify(body.triggerUserAuth);
-  const r = await applyConfigField(cachedLarkAppId, spec, raw);
+  // null / undefined = 关闭（清除该 key）；其余一律过共享 JSON 校验，畸形策略在这里
+  // 就被拒，和从聊天里 /botconfig set 的拒绝口径逐字一致。
+  let value: unknown = null;
+  if (body.triggerUserAuth !== null && body.triggerUserAuth !== undefined) {
+    const coerced = coerceConfigValue(spec, JSON.stringify(body.triggerUserAuth));
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, r);
   jsonRes(res, 200, { ok: true });
 });

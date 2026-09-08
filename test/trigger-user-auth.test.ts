@@ -88,6 +88,56 @@ describe('parseTriggerUserAuthConfig', () => {
     expect(() => parseTriggerUserAuthConfig({ enabled: 'true' })).toThrow(/enabled/);
     expect(() => parseTriggerUserAuthConfig({ enabled: true, tools: 'lark-cli' })).toThrow(/tools/);
   });
+
+  /**
+   * A dashboard bug stored this policy as JSON **text** instead of an object.
+   * Because this parser runs while loading every bot out of one shared
+   * `bots.json` array, throwing on it meant NO bot loaded — a single mistyped
+   * field became a fleet-wide outage, with the dashboard crash-looping.
+   *
+   * So the legacy string is read rather than rejected. What must not soften is
+   * the validation itself: a string still gets exactly the same rules as an
+   * object, so a bad fallback or an unknown tool is refused either way.
+   */
+  describe('legacy value stored as a JSON string', () => {
+    const legacy = '{"enabled":true,"tools":["lark-cli","bytedcli"],"fallback":"bot-identity"}';
+
+    it('reads the object out of the string instead of taking the fleet down', () => {
+      expect(parseTriggerUserAuthConfig(legacy)).toEqual({
+        enabled: true,
+        tools: ['lark-cli', 'bytedcli'],
+        fallback: 'bot-identity',
+      });
+    });
+
+    it('parses a legacy string exactly as it parses the same object', () => {
+      const asObject = JSON.parse(legacy);
+      expect(parseTriggerUserAuthConfig(legacy)).toEqual(parseTriggerUserAuthConfig(asObject));
+    });
+
+    it('still refuses a machine-login fallback written as a string', () => {
+      expect(() => parseTriggerUserAuthConfig('{"enabled":true,"fallback":"device"}'))
+        .toThrow(/fallback must be one of/);
+    });
+
+    it('still refuses an unknown tool written as a string', () => {
+      expect(() => parseTriggerUserAuthConfig('{"enabled":true,"tools":["lark-cli","nope"]}'))
+        .toThrow(/unknown entries: nope/);
+    });
+
+    it('treats blank text as "not configured", not as an error', () => {
+      expect(parseTriggerUserAuthConfig('')).toBeNull();
+      expect(parseTriggerUserAuthConfig('   ')).toBeNull();
+    });
+
+    it('rejects a string whose JSON is not an object', () => {
+      // Tolerance is only for "an object that got stringified" — a bare array,
+      // null or scalar is still a malformed policy.
+      for (const bad of ['[]', 'null', '42', '"lark-cli"']) {
+        expect(() => parseTriggerUserAuthConfig(bad)).toThrow(TriggerUserAuthConfigError);
+      }
+    });
+  });
 });
 
 describe('triggerUserAuthApplies', () => {

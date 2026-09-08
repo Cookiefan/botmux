@@ -32,7 +32,7 @@ describe('dashboard bot payload helpers', () => {
       'substituteMode', 'feedback', 'replyStyle',
       'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen',
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
-      'envelopeInjection', 'codexAuthSync',
+      'envelopeInjection', 'codexAuthSync', 'triggerUserAuth',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
       'maxLiveWorkers', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
       'nativeSubagentRuntime',
@@ -59,6 +59,31 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, {})).toMatchObject({ codexAuthSync: 'shared' });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { codexAuthSync: 'isolated' }))
       .toMatchObject({ codexAuthSync: 'isolated' });
+  });
+
+  /**
+   * The panel reads its whole state out of this row, and every detail control
+   * (tool checkboxes, the unauthorized-fallback select, the two boundary
+   * advisories) is gated on the toggle. So a row that drops the policy does not
+   * render a half-filled panel — it renders a bot with the feature OFF, for a
+   * bot that has it ON. Nothing errors; the setting is simply invisible, and
+   * turning the toggle to "on" to see it would overwrite the real policy.
+   */
+  it('carries the trigger-user auth policy so the panel can read it back', () => {
+    const triggerUserAuth = {
+      enabled: true,
+      tools: ['lark-cli', 'bytedcli'],
+      fallback: 'bot-identity',
+    };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth }))
+      .toMatchObject({ triggerUserAuth });
+    // Unset stays null rather than undefined: the panel distinguishes "off" from
+    // "this daemon did not report it", and null is the reported-off answer.
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).triggerUserAuth).toBeNull();
+    // A legacy string is NOT a policy the panel can edit — the object form is
+    // what the daemon now reports, so a stringified one must not be echoed.
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: JSON.stringify(triggerUserAuth) }).triggerUserAuth)
+      .toBeNull();
   });
 
   it('exposes feedback policy only in private Bot Defaults payloads', () => {

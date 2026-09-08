@@ -1720,6 +1720,119 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
   });
 });
 
+describe('trigger-user auth over IPC — save, then read back', () => {
+  /**
+   * The write door and the read-back are separate code paths, and only one of
+   * them was broken. `PUT` stored the policy correctly while the payload behind
+   * the panel never carried it, so on every reload the dashboard drew a bot with
+   * the feature OFF even though `bots.json` said ON — and the tool checkboxes,
+   * the fallback select and the two boundary advisories all stayed hidden,
+   * because each is gated on that toggle.
+   *
+   * A save-only assertion cannot see that: it passed the whole time. So this
+   * goes through the real IPC server and asserts on what the panel actually
+   * reads — the GET — after a PUT.
+   */
+  it('reports a saved policy back in the payload the panel reads', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-auth-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-trigger-user-auth-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // Off to begin with: the panel must be able to tell "not configured".
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.triggerUserAuth ?? null).toBeNull();
+
+      const policy = { enabled: true, tools: ['lark-cli'], fallback: 'none' };
+      const put = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ triggerUserAuth: policy }),
+      });
+      expect(put.status).toBe(200);
+      expect(await put.json()).toMatchObject({ ok: true });
+
+      // Stored as an OBJECT. As text it would round-trip through this assertion
+      // fine but make `bots.json` unparseable for every bot in the file.
+      const persisted = JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth;
+      expect(typeof persisted).toBe('object');
+      expect(persisted).toEqual(policy);
+
+      // The assertion the original bug failed: the panel's own payload.
+      const readBack = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(readBack.triggerUserAuth).toEqual(policy);
+
+      // Turning it off must clear it, not leave a stale policy on display.
+      const cleared = await fetch(`${base}/api/bot-trigger-user-auth`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ triggerUserAuth: null }),
+      });
+      expect(cleared.status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth).toBeUndefined();
+      const afterClear = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(afterClear.triggerUserAuth ?? null).toBeNull();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a policy the chat door refuses, and writes nothing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-trigger-auth-bad-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-trigger-user-auth-bad-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      // "Borrow the machine login" is refused on purpose — the dashboard must not
+      // be a second door that installs what `/botconfig set` rejects.
+      for (const bad of [
+        { enabled: true, fallback: 'device' },
+        { enabled: true, tools: ['lark-cli', 'nope'] },
+      ]) {
+        const res = await fetch(`${base}/api/bot-trigger-user-auth`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ triggerUserAuth: bad }),
+        });
+        expect(res.status).toBe(400);
+        expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].triggerUserAuth).toBeUndefined();
+      }
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   it('is default-off and persists explicit on/off changes immediately', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-clean-'));

@@ -6747,6 +6747,40 @@ dialog.onboarding-dialog::backdrop {
    operator must not skim past "the agent can read other people's tokens". */
 .bd-inline-check { display: inline-flex; align-items: center; gap: 6px; margin-right: 14px; font-size: 12px; }
 .bd-inline-check input { margin: 0; }
+/* `.bot-defaults-page .bd-body .bd-row :where(label, .bd-field)` 把行内**所有** label
+   变成 display:grid（特异性 0,3,0，:where() 本身计 0，但三个祖先类照样盖过上面那条
+   `.bd-inline-check` 的 0,1,0）。这些工具复选框正是 .bd-row 里的 label，于是勾选框被
+   拉成整行栅格项、居中排在文字**上面**一行，「应用到 lark-cli / bytedcli」看着就是错位的。
+   显式覆盖回 inline-flex（与本文件 .bd-sg-repair-all / .bd-sg-tag-name 同一套写法），
+   并让整行自己横排折行，而不是继承 .bd-row 的竖排栅格。 */
+.bot-defaults-page .bd-body .bd-row .bd-inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+/* 行本身：「应用到」这一行要横着走（标题 + 两个复选框），所以就地取消 .bd-row 的
+   竖排 grid。用 data 属性挂钩，避免影响其它 .bd-row。 */
+.bot-defaults-page .bd-body .bd-row[data-trigger-user-auth-tools] {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+/* 该行的「应用到」标题不再是栅格里的独立一行，跟复选框同一基线横排。 */
+.bot-defaults-page .bd-body .bd-row[data-trigger-user-auth-tools] > span {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+/* 复选框内的工具名是普通行内文字，不要继承 .bd-row 里 label > span 的「小标题」
+   样式（那条会把它加粗成段标题，正是截图里 lark-cli / bytedcli 显示成粗体标题的原因）。 */
+.bot-defaults-page .bd-body .bd-row .bd-inline-check > span {
+  color: var(--fg);
+  font-weight: 400;
+  font-size: 12px;
+}
 .bd-section-note[data-trigger-user-auth-token-advisory],
 .bd-section-note[data-trigger-user-auth-mcp-advisory] {
   margin-top: 8px;
