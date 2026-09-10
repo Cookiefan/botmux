@@ -9,7 +9,7 @@
  */
 
 import { config } from '../../config.js';
-import { formatUrlHost } from '../../core/dashboard-url.js';
+import { buildV3RunDetailUrl, buildV3TerminalUrl } from '../../core/dashboard-url.js';
 import type { V3ProgressView } from '../../workflows/v3/progress-projection.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
 
@@ -28,7 +28,7 @@ export interface V3ProgressCardOptions {
 const MAX_INLINE_IDS = 5;
 
 export function v3ProgressRunDetailUrl(runId: string): string {
-  return `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return buildV3RunDetailUrl(runId, { host: config.dashboard.externalHost, port: config.dashboard.port });
 }
 
 /** Render one complete Feishu card body from the safe v3 progress projection. */
@@ -39,6 +39,13 @@ export function buildV3ProgressCard(
   const chrome = statusChrome(view.status);
   const completed = view.counts.done + view.counts.skipped + view.counts.cancelled;
   const webDetailUrl = options.webDetailUrl ?? v3ProgressRunDetailUrl(view.runId);
+  const terminalUrl = view.terminal
+    ? buildV3TerminalUrl(view.terminal.sessionId, {
+        host: config.dashboard.externalHost,
+        webPort: view.terminal.webPort,
+        viewToken: view.terminal.viewToken,
+      })
+    : null;
   const source = sourceLabel(view.source);
   const elements: Array<Record<string, unknown>> = [
     {
@@ -146,6 +153,25 @@ export function buildV3ProgressCard(
           text: { tag: 'plain_text', content: '保存到本群' },
           type: 'primary',
           value: options.saveActions.chat,
+        },
+      ],
+    });
+  }
+
+  if (terminalUrl) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '终端（手机可看）' },
+          type: 'primary',
+          multi_url: {
+            url: terminalUrl,
+            pc_url: terminalUrl,
+            android_url: terminalUrl,
+            ios_url: terminalUrl,
+          },
         },
       ],
     });

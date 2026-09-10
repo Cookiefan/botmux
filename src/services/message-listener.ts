@@ -123,6 +123,30 @@ export function extractListenerMessageText(message: any): string {
   return '';
 }
 
+/**
+ * Refresh a card match's observed text/title from the (now-resolved) message.
+ *
+ * The listener match is computed during filtering, off the SIMPLIFIED card the
+ * WS/history API first delivers — that view drops button jump URLs and lazy
+ * sub-card bodies. The live delivery path (daemon handleNewTopic) later runs
+ * resolveNonsupportMessage(data), merging the card's two representations
+ * (server-rendered + structured body.elements, incl. button open_url) into
+ * `message.content` — the same depth the direct-@bot path uses. Re-extracting
+ * here lets the model receive the button links, not the lossy match-time
+ * snapshot. Only interactive cards can differ (plain text/post already carried
+ * full content at match time). Fail-safe: a resolver miss (cross-tenant, REST
+ * unavailable) leaves `message.content` as the simplified view and yields the
+ * SAME text as match time, so guarding on a non-empty result never blanks a
+ * match — it only ever upgrades. Mutates `match` in place.
+ */
+export function refreshListenerCardTextFromResolved(match: MessageListenerMatch, message: any): void {
+  if (match.msgType !== 'interactive') return;
+  const text = extractListenerMessageText(message);
+  if (text.trim()) match.messageText = text;
+  const title = extractListenerMessageTitle(message);
+  if (title?.trim()) match.messageTitle = title;
+}
+
 function contains(list: readonly string[] | undefined, value: string | undefined): boolean {
   return !!value && !!list && list.includes(value);
 }
@@ -133,6 +157,30 @@ function senderTypeAllowed(listener: MessageListenerConfig, type: MessageListene
     return false;
   }
   if (policy?.excludeSenderTypes?.includes(type)) return false;
+  return true;
+}
+
+/**
+ * An exclusion entry can "collide" with an unverified bot sender when we cannot
+ * prove the sender is NOT that entry. `ou_` vs `cli_` STRING inequality does not
+ * prove ENTITY inequality — the same bot is `cli_x` in the polled history and
+ * `ou_y` in config. So we classify each exclusion by its persisted sender KIND,
+ * not by id prefix:
+ *   - kind 'user'         → a human; an unverified BOT sender can never be it.
+ *   - kind 'bot'/'unknown'→ could be this unverified bot → fail closed.
+ *   - no kind recorded (legacy config, or an id in app_id/cli_ form) → treat as
+ *     a possible bot and fail closed conservatively. Prefix is only ever used to
+ *     UPGRADE an unknown entry to "definitely a bot", never to downgrade to user.
+ */
+function exclusionMayBeUnverifiedBot(
+  id: string,
+  kinds: Readonly<Record<string, 'user' | 'bot'>> | undefined,
+): boolean {
+  const kind = kinds?.[id];
+  if (kind === 'user') return false;
+  if (kind === 'bot') return true;
+  // No recorded kind: an app_id/cli_ form is certainly a bot; an ou_ (or any
+  // other) form is ambiguous under legacy configs, so stay conservative.
   return true;
 }
 
@@ -149,13 +197,15 @@ function senderOpenIdAllowed(
     // include list, so it simply does not match — already fail-safe.
     return contains(policy?.includeSenderOpenIds, openId);
   }
-  // all_except_excluded: an unverified sender defeats an open_id-based
-  // exclusion (the excluded open_id would never equal an app_id form), so a
-  // blocked bot would leak through on the polled backfill path. Fail closed:
-  // when the operator has ANY open_id exclusion we cannot evaluate for this
-  // sender, refuse rather than assume "not excluded". An empty exclude list
-  // makes no open_id decision, so "listen to all (except self)" still works.
-  if (identityUnverified && (policy?.excludeSenderOpenIds?.length ?? 0) > 0) {
+  // all_except_excluded: an unverified bot sender (reported by app_id, not
+  // canonicalized to an open_id) defeats an exclusion when we cannot prove the
+  // sender is NOT that excluded entry. Decide by the exclusion's persisted
+  // sender KIND, never by id prefix: only user-kind exclusions are provably
+  // disjoint from an unverified bot. Any bot/unknown/legacy exclusion fails
+  // closed. When EVERY exclusion is a known user, nothing is being bypassed, so
+  // "listen to all bots, just mute these users" keeps working. Empty list too.
+  const excludes = policy?.excludeSenderOpenIds ?? [];
+  if (identityUnverified && excludes.some(id => exclusionMayBeUnverifiedBot(id, policy?.excludeSenderKinds))) {
     return false;
   }
   return !contains(policy?.excludeSenderOpenIds, openId);
@@ -165,6 +215,40 @@ function msgTypeAllowed(listener: MessageListenerConfig, msgType: string): boole
   const include = listener.messagePolicy?.includeMsgTypes;
   if (!include || include.length === 0) return msgType === 'text' || msgType === 'post';
   return include.includes(msgType);
+}
+
+export type MessageListenerContentPolicy = NonNullable<MessageListenerConfig['contentPolicy']>;
+
+/**
+ * Pure keyword pre-filter for listener messages. SHARED by every leg that
+ * feeds evaluateMessageListener (realtime delivery, polled backfill, dashboard
+ * preview) so they can never diverge on content matching.
+ *
+ * - Absent policy, or one with no keywords → match everything (legacy
+ *   behavior: every non-mention text message woke the Agent).
+ * - Keywords: case-insensitive substring match (Chinese-friendly; both sides
+ *   lowercased, plain `includes`). Substring search is linear-time, so an
+ *   attacker-controlled group message cannot stall the daemon main loop.
+ * - matchMode 'any' (default): at least one keyword hits.
+ * - matchMode 'all': every keyword must hit.
+ *
+ * V1 deliberately has NO regex support: a JS regex with catastrophic
+ * backtracking (e.g. the 6-char `(a+)+$`) runs on the daemon's main event
+ * loop for every inbound AND backfilled message, so a ~30-char payload lying
+ * in listener-group history could freeze this single-daemon, multi-bot
+ * process for tens of seconds every poll round. A pattern-length cap does not
+ * bound backtracking. Regex can return later behind a linear-time engine.
+ */
+export function matchesContentPolicy(text: string, policy: MessageListenerContentPolicy | undefined): boolean {
+  if (!policy) return true;
+  const keywords = (policy.includeKeywords ?? []).filter(keyword => keyword.length > 0);
+  if (keywords.length === 0) return true;
+  const haystack = text.toLowerCase();
+  const keywordHits = (keyword: string): boolean => haystack.includes(keyword.toLowerCase());
+  if (policy.matchMode === 'all') {
+    return keywords.every(keywordHits);
+  }
+  return keywords.some(keywordHits);
 }
 
 export function findMessageListenerForChat(bot: BotState, chatId: string): MessageListenerConfig | undefined {
@@ -224,6 +308,11 @@ export function evaluateMessageListener(input: {
   const messageText = extractListenerMessageText(input.message);
   if (!messageText && (msgType === 'text' || msgType === 'post')) return undefined;
   const messageTitle = extractListenerMessageTitle(input.message);
+
+  // Daemon-side keyword/regex pre-filter: the shared choke point for the
+  // realtime, polled-backfill and dashboard-preview legs. A configured policy
+  // that does not hit means the message never wakes the Agent (no model call).
+  if (!matchesContentPolicy(messageText, listener.contentPolicy)) return undefined;
 
   return {
     name: listener.name,

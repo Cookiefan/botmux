@@ -10,33 +10,72 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
-vi.mock('node:child_process', () => ({
-  execSync: vi.fn(),
-}));
+// Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's
+// `vi` shim has no `importActual`, and the real module must be SPREAD IN because bun
+// links named exports for real — a factory returning only the overridden keys fails
+// the whole file with "Export named 'X' not found in module '…'" (measured: `fork`,
+// imported by src/core/self-spawn.ts on the transitive graph).
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    execSync: vi.fn(),
+    // ⚠️ `execFileSync` MUST be stubbed, even though no test configures it.
+    // `readProcessStartTime()` falls back to `execFileSync('ps', ['-o','lstart=' …])`
+    // when /proc parsing yields nothing. Before the spread was added, this factory
+    // returned ONLY `execSync`, so that call threw and `startedAt` stayed undefined —
+    // the "should not include sessionId for non-claude CLI types" and "metadata file
+    // not found" cases silently depended on that OMISSION. Spreading the real module
+    // (required: bun links named exports for real) handed the fallback a working `ps`,
+    // which returned a genuine timestamp and failed both `toBeUndefined()` assertions.
+    // Throwing here preserves the original behaviour explicitly instead of by accident.
+    execFileSync: vi.fn(() => { throw new Error('execFileSync not stubbed for this test'); }),
+  };
+});
 
-vi.mock('node:fs', () => ({
-  existsSync: vi.fn(() => false),
-  readdirSync: vi.fn(() => []),
-  readFileSync: vi.fn(),
-  readlinkSync: vi.fn(),
-}));
+vi.mock('node:fs', () => {
+  const actual = require('node:fs') as typeof import('node:fs');
+  return {
+    ...actual,
+    existsSync: vi.fn(() => false),
+    readdirSync: vi.fn(() => []),
+    readFileSync: vi.fn(),
+    readlinkSync: vi.fn(),
+  };
+});
 
-vi.mock('node:os', () => ({
-  homedir: () => '/home/testuser',
-  // session-discovery 用 platform() 决定 Linux /proc 快路径 vs macOS ps/lsof 兜底。
-  // 既有 mock 数据全部按 Linux 形态准备，所以这里固定为 'linux'。
-  // macOS 兜底路径的覆盖见 test/session-discovery.smoke.test.ts。
-  platform: () => 'linux',
-}));
+vi.mock('node:os', () => {
+  const actual = require('node:os') as typeof import('node:os');
+  return {
+    ...actual,
+    homedir: () => '/home/testuser',
+    // session-discovery 用 platform() 决定 Linux /proc 快路径 vs macOS ps/lsof 兜底。
+    // 既有 mock 数据全部按 Linux 形态准备，所以这里固定为 'linux'。
+    // macOS 兜底路径的覆盖见 test/session-discovery.smoke.test.ts。
+    platform: () => 'linux',
+  };
+});
 
 import { execSync } from 'node:child_process';
-import { readFileSync, readlinkSync, existsSync, readdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   discoverAdoptableSessions,
   discoverAdoptableSessionByTarget,
   validateAdoptTarget,
   isBareShellComm,
   bareShellLaunchKind,
+  bareShellLaunchGuidance,
   settleLaunchComm,
 } from '../src/core/session-discovery.js';
 import type { CliId } from '../src/adapters/cli/types.js';
@@ -94,6 +133,23 @@ describe('settleLaunchComm()', () => {
     }
   });
 
+  it('does not classify a fish launch wrapper as failed when it execs the CLI shortly afterward', async () => {
+    vi.useFakeTimers();
+    try {
+      const reads = ['fish', 'codex'];
+      const settled = settleLaunchComm(
+        () => reads.shift() ?? 'codex',
+        { timeoutMs: 2_000, pollMs: 100 },
+      );
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(await settled).toBe('codex');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('returns a persistent bare shell after the bounded launch grace period', async () => {
     vi.useFakeTimers();
     try {
@@ -108,6 +164,38 @@ describe('settleLaunchComm()', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('returns a persistent fish shell after the bounded launch grace period', async () => {
+    vi.useFakeTimers();
+    try {
+      const settled = settleLaunchComm(
+        () => 'fish',
+        { timeoutMs: 300, pollMs: 100 },
+      );
+
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(await settled).toBe('fish');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('bareShellLaunchGuidance()', () => {
+  it('points fish trampoline diagnostics at config.fish and fish-compatible guards', () => {
+    const guidance = bareShellLaunchGuidance('zsh', 'fish');
+
+    expect(guidance.rcFileHint).toBe('~/.config/fish/config.fish');
+    expect(guidance.manualTerminalGuard).toBe('status is-interactive; and isatty stdout; and not set -q BOTMUX_MANAGED_SHELL; and exec zsh');
+  });
+
+  it('preserves POSIX rc and guard guidance for bash/zsh launches', () => {
+    const guidance = bareShellLaunchGuidance('fish', 'zsh');
+
+    expect(guidance.rcFileHint).toBe('~/.zshrc');
+    expect(guidance.manualTerminalGuard).toBe('[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec fish');
   });
 });
 
@@ -371,6 +459,88 @@ describe('discoverAdoptableSessions', () => {
     expect(results[1]!.cliId).toBe('aiden');
     expect(results[1]!.paneCols).toBe(200);
     expect(results[1]!.paneRows).toBe(50);
+  });
+
+  it('matches a configured Codex-compatible executable exactly without hiding legacy defaults', () => {
+    const fixture = {
+      paneLines: 'fork:0.0 1000\nofficial:0.0 2000\nclaude:0.0 3000\n',
+      commMap: { 1000: 'zsh', 1001: 'vendorCodex', 2000: 'codex', 3000: 'claude' },
+      childMap: { 1000: [1001] },
+      cwdMap: { 1001: '/workspace/fork', 2000: '/workspace/official', 3000: '/workspace/claude' },
+      dimsMap: {
+        'fork:0.0': '100 30',
+        'official:0.0': '120 40',
+        'claude:0.0': '140 50',
+      },
+    };
+    setupMocks(fixture);
+
+    const custom = discoverAdoptableSessions('codex', '/opt/Vendor Codex/vendorCodex');
+    expect(custom).toHaveLength(1);
+    expect(custom[0]).toMatchObject({ tmuxTarget: 'fork:0.0', cliPid: 1001, cliId: 'codex' });
+
+    // Omitting the executable takes the untouched static path: official Codex
+    // and Claude are still classified normally, while the unknown fork is not.
+    setupMocks(fixture);
+    expect(discoverAdoptableSessions().map(s => [s.tmuxTarget, s.cliId])).toEqual([
+      ['official:0.0', 'codex'],
+      ['claude:0.0', 'claude-code'],
+    ]);
+  });
+
+  it('discovers a configured Codex-compatible executable in a known Node launcher slot', () => {
+    setupMocks({
+      paneLines: 'fork:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'node' },
+      childMap: { 1000: [1001] },
+      cmdlineMap: {
+        1001: ['node', '--enable-source-maps', '/opt/vendorCodex'],
+      },
+      cwdMap: { 1001: '/workspace/fork' },
+      dimsMap: { 'fork:0.0': '100 30' },
+    });
+
+    expect(discoverAdoptableSessions('codex', '/opt/vendorCodex')).toEqual([
+      expect.objectContaining({
+        tmuxTarget: 'fork:0.0',
+        cliPid: 1001,
+        cliId: 'codex',
+        cwd: '/workspace/fork',
+      }),
+    ]);
+  });
+
+  it('does not adopt a generic launcher when the custom executable appears only in program argv', () => {
+    setupMocks({
+      paneLines: 'unrelated:0.0 1000\n',
+      commMap: { 1000: 'zsh', 1001: 'node' },
+      childMap: { 1000: [1001] },
+      cmdlineMap: { 1001: ['node', '/srv/unrelated.js', '/opt/vendorCodex'] },
+      cwdMap: { 1001: '/workspace/unrelated' },
+      dimsMap: { 'unrelated:0.0': '100 30' },
+    });
+
+    expect(discoverAdoptableSessions('codex', '/opt/vendorCodex')).toEqual([]);
+  });
+
+  it('uses the same exact executable filter in the single-pane confirm path', () => {
+    setupMocks({
+      paneLines: 'fork:0.0 1000\nofficial:0.0 2000\n',
+      commMap: { 1000: 'vendorCodex', 2000: 'codex' },
+      cwdMap: { 1000: '/workspace/fork', 2000: '/workspace/official' },
+      dimsMap: { 'fork:0.0': '100 30', 'official:0.0': '120 40' },
+    });
+
+    expect(discoverAdoptableSessionByTarget(
+      'fork:0.0',
+      'codex',
+      '/opt/vendorCodex',
+    )).toMatchObject({ cliPid: 1000, cliId: 'codex' });
+    expect(discoverAdoptableSessionByTarget(
+      'official:0.0',
+      'codex',
+      '/opt/vendorCodex',
+    )).toBeUndefined();
   });
 
   it('should bind a Codex rollout opened by the native child below its Node launcher', () => {
@@ -837,26 +1007,47 @@ describe('discoverAdoptableSessions', () => {
   // the ~/.trae/cli/sessions layout.
 
   it('detects a TRAE (traex) CLI process and captures sessionId from the open rollout fd', () => {
-    setupMocks({
-      paneLines: 'work:0.0 9000\n',
-      commMap: { 9000: 'bash', 9001: 'traex' },
-      childMap: { 9000: [9001] },
-      cwdMap: { 9001: '/workspace/proj' },
-      dimsMap: { 'work:0.0': '120 30' },
-      procFdMap: {
-        9001: [
-          '/dev/null',
-          '/home/testuser/.trae/cli/sessions/2026/06/11/rollout-2026-06-11T10-00-00-8db7d911-96f3-4764-a310-e42ae4cb626f.jsonl',
-        ],
+    const sessionId = '8db7d911-96f3-4764-a310-e42ae4cb626f';
+    const root = mkdtempSync(join(tmpdir(), 'botmux-traex-discovery-'));
+    const rolloutDir = join(root, '.trae', 'cli', 'sessions', '2026', '06', '11');
+    const rolloutPath = join(
+      rolloutDir,
+      `rollout-2026-06-11T10-00-00-${sessionId}.jsonl`,
+    );
+    mkdirSync(rolloutDir, { recursive: true });
+    writeFileSync(rolloutPath, `${JSON.stringify({
+      timestamp: '2026-06-11T10:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        id: sessionId,
+        timestamp: '2026-06-11T10:00:00.000Z',
+        cwd: '/workspace/proj',
+        source: 'cli',
+        thread_source: 'user',
       },
-    });
+    })}\n`);
 
-    const results = discoverAdoptableSessions();
+    try {
+      setupMocks({
+        paneLines: 'work:0.0 9000\n',
+        commMap: { 9000: 'bash', 9001: 'traex' },
+        childMap: { 9000: [9001] },
+        cwdMap: { 9001: '/workspace/proj' },
+        dimsMap: { 'work:0.0': '120 30' },
+        procFdMap: {
+          9001: ['/dev/null', rolloutPath],
+        },
+      });
 
-    expect(results).toHaveLength(1);
-    expect(results[0]!.cliId).toBe('traex');
-    expect(results[0]!.cwd).toBe('/workspace/proj');
-    expect(results[0]!.sessionId).toBe('8db7d911-96f3-4764-a310-e42ae4cb626f');
+      const results = discoverAdoptableSessions();
+
+      expect(results).toHaveLength(1);
+      expect(results[0]!.cliId).toBe('traex');
+      expect(results[0]!.cwd).toBe('/workspace/proj');
+      expect(results[0]!.sessionId).toBe(sessionId);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('returns traex discovery without sessionId when no rollout fd is open', () => {
@@ -1079,6 +1270,24 @@ describe('validateAdoptTarget', () => {
 
     const result = validateAdoptTarget(tmuxTarget('mysession:0.0', 1001));
     expect(result).toBe(true);
+  });
+
+  it('revalidates a custom Codex runtime by exact executable basename', () => {
+    setupMocks({
+      paneLines: 'fork:0.0 1000\nofficial:0.0 2000\n',
+      commMap: { 1000: 'vendorCodex', 2000: 'codex' },
+      cwdMap: {},
+      dimsMap: {},
+    });
+
+    expect(validateAdoptTarget(
+      tmuxTarget('fork:0.0', 1000, 'codex'),
+      '/opt/vendorCodex',
+    )).toBe(true);
+    expect(validateAdoptTarget(
+      tmuxTarget('official:0.0', 2000, 'codex'),
+      '/opt/vendorCodex',
+    )).toBe(false);
   });
 
   it('should return false when pane no longer exists', () => {

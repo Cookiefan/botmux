@@ -23,6 +23,20 @@ import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
+/** Reasoning levels a task may pin. Mirrors CODEX_REASONING_EFFORTS; spelled out
+ *  here because this module is the storage layer and must not depend on the CLI
+ *  adapter services. */
+export type ScheduleReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+
+const SCHEDULE_REASONING_EFFORTS: readonly ScheduleReasoningEffort[] = [
+  'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+];
+
+export function isScheduleReasoningEffort(value: unknown): value is ScheduleReasoningEffort {
+  return typeof value === 'string'
+    && SCHEDULE_REASONING_EFFORTS.includes(value as ScheduleReasoningEffort);
+}
+
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
 
 /**
@@ -79,6 +93,7 @@ export function canonicalScheduleInput(t: {
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatIds?: readonly string[];
   chatType?: 'group' | 'p2p' | 'topic_group';
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
@@ -88,7 +103,11 @@ export function canonicalScheduleInput(t: {
   repeat?: { times: number | null; completed?: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  followActive?: boolean;
+  model?: string;
+  reasoningEffort?: ScheduleReasoningEffort;
 }): unknown {
+  const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
     name: t.name,
     schedule: t.schedule,
@@ -105,7 +124,11 @@ export function canonicalScheduleInput(t: {
       : undefined,
     prompt: t.prompt,
     workingDir: t.workingDir,
-    chatId: t.chatId,
+    chatId: targets.chatId,
+    // Keep this absent for old and single-chat tasks. `computeInputHash`
+    // drops the undefined property, preserving their historical canonical
+    // JSON and hash byte-for-byte; multi-chat routing remains canonical input.
+    chatIds: targets.chatIds,
     // This changes how the future worker session replies (especially P2P), so
     // it is provider input rather than advisory display metadata.
     chatType: t.chatType,
@@ -121,7 +144,58 @@ export function canonicalScheduleInput(t: {
     // `silent: false`/absent normalizes to undefined (dropped by
     // computeInputHash) so pre-existing tasks keep their canonical hash.
     silent: t.silent === true ? true : undefined,
+    followActive: t.followActive === true ? true : undefined,
+    // Which model this task's runs ask for is caller input, not runtime state.
+    // Absent on every pre-existing task, so `computeInputHash` drops both slots
+    // and their canonical JSON stays byte-for-byte what it was.
+    model: t.model?.trim() || undefined,
+    reasoningEffort: t.reasoningEffort,
   };
+}
+
+export interface ScheduleChatTargets {
+  chatId: string;
+  chatIds?: string[];
+}
+
+/** Normalize caller-controlled schedule targets without changing the legacy
+ * single-chat storage shape. When `chatIds` is supplied it is authoritative:
+ * values are trimmed and deduplicated in order, and its first entry becomes
+ * the compatibility `chatId`. `null` explicitly collapses an update to its
+ * supplied/fallback `chatId`. */
+export function normalizeScheduleChatTargets(input: {
+  chatId: string;
+  chatIds?: readonly string[] | null;
+}): ScheduleChatTargets {
+  if (input.chatIds === undefined || input.chatIds === null) {
+    if (typeof input.chatId !== 'string' || !input.chatId.trim()) {
+      throw new TypeError('chat_id_required');
+    }
+    return { chatId: input.chatId.trim() };
+  }
+
+  if (!Array.isArray(input.chatIds)) throw new TypeError('invalid_chat_ids');
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input.chatIds) {
+    if (typeof raw !== 'string' || !raw.trim()) throw new TypeError('invalid_chat_ids');
+    const chatId = raw.trim();
+    if (seen.has(chatId)) continue;
+    seen.add(chatId);
+    unique.push(chatId);
+  }
+  if (unique.length === 0) throw new TypeError('chat_id_required');
+  return unique.length === 1
+    ? { chatId: unique[0] }
+    : { chatId: unique[0], chatIds: unique };
+}
+
+/** Effective dispatch targets for both legacy/single-chat and multi-chat rows. */
+export function effectiveScheduleChatIds(
+  task: Pick<ScheduledTask, 'chatId' | 'chatIds'>,
+): string[] {
+  const targets = normalizeScheduleChatTargets({ chatId: task.chatId, chatIds: task.chatIds });
+  return targets.chatIds ? [...targets.chatIds] : [targets.chatId];
 }
 
 // ─── Per-bot store scope ─────────────────────────────────────────────────────
@@ -238,15 +312,35 @@ function migrate(raw: any): ScheduledTask | null {
       : raw.deliver === 'new-topic'
         ? 'new-topic'
         : undefined;
+  let targets: ScheduleChatTargets;
+  try {
+    targets = normalizeScheduleChatTargets({
+      chatId: raw.chatId,
+      chatIds: raw.chatIds,
+    });
+  } catch (error) {
+    // `chatIds` is additive metadata. A malformed manually-written value must
+    // not make one row empty the entire schedules file; retain the legacy
+    // primary target when that field is still usable.
+    targets = normalizeScheduleChatTargets({ chatId: raw.chatId });
+    logger.warn(
+      `[schedule-store] Ignoring invalid chatIds for task ${String(raw.id)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 
   return {
     id: raw.id,
+    preconditionRef: typeof raw.preconditionRef === 'string' && raw.preconditionRef
+      ? raw.preconditionRef
+      : undefined,
     name: raw.name,
     schedule: raw.schedule,
     parsed,
     prompt: raw.prompt,
     workingDir: raw.workingDir,
-    chatId: raw.chatId,
+    chatId: targets.chatId,
+    chatIds: targets.chatIds,
     rootMessageId: raw.rootMessageId,
     scope: raw.scope === 'thread' || raw.scope === 'chat' ? raw.scope : undefined,
     executionPosition,
@@ -258,6 +352,13 @@ function migrate(raw: any): ScheduledTask | null {
     creatorChatId: raw.creatorChatId,
     creatorRootMessageId: raw.creatorRootMessageId,
     creatorLarkAppId: raw.creatorLarkAppId,
+    // Creator identity is rebuilt field-by-field like everything else here, so
+    // it has to be listed explicitly: without these two lines `createTask`
+    // persists them but every reload (daemon restart, external `schedule add`
+    // bumping the file version) drops them, and the task silently degrades to
+    // "no creator".
+    ownerOpenId: raw.ownerOpenId,
+    ownerUnionId: raw.ownerUnionId,
     enabled: raw.enabled !== false,
     createdAt: raw.createdAt,
     lastRunAt: raw.lastRunAt,
@@ -268,6 +369,14 @@ function migrate(raw: any): ScheduledTask | null {
     repeat: raw.repeat,
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
+    followActive: raw.followActive === true ? true : undefined,
+    // Rebuilt explicitly like every other field here: omitting them would let
+    // `createTask` persist a per-task model and then have the next reload drop
+    // it, so the task silently degrades back to the bot's model (the exact way
+    // `ownerOpenId` broke once). A hand-edited junk value is dropped rather
+    // than carried to fire time, where it could only produce a CLI error.
+    model: typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : undefined,
+    reasoningEffort: isScheduleReasoningEffort(raw.reasoningEffort) ? raw.reasoningEffort : undefined,
   };
 }
 
@@ -455,12 +564,14 @@ function load(appId?: string): void {
  */
 export function createTask(params: {
   id?: string;
+  preconditionRef?: string;
   name: string;
   schedule: string;
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatIds?: readonly string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
@@ -470,11 +581,17 @@ export function createTask(params: {
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
+  ownerOpenId?: string;
+  ownerUnionId?: string;
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  followActive?: boolean;
+  model?: string;
+  reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
+  const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
   // Route to the OWNING bot's file: a task explicitly created for another bot
   // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
   // its daemon (the only one that executes it) can see it. Sandboxed callers
@@ -508,12 +625,14 @@ export function createTask(params: {
     while (!params.id && working.has(id)) id = randomUUID().substring(0, 8);
     const task: ScheduledTask = {
       id,
+      preconditionRef: params.preconditionRef,
       name: params.name,
       schedule: params.schedule,
       parsed: params.parsed,
       prompt: params.prompt,
       workingDir: params.workingDir,
-      chatId: params.chatId,
+      chatId: targets.chatId,
+      chatIds: targets.chatIds,
       rootMessageId: params.rootMessageId,
       scope: params.scope,
       executionPosition: params.executionPosition,
@@ -523,6 +642,8 @@ export function createTask(params: {
       creatorChatId: params.creatorChatId,
       creatorRootMessageId: params.creatorRootMessageId,
       creatorLarkAppId: params.creatorLarkAppId,
+      ownerOpenId: params.ownerOpenId,
+      ownerUnionId: params.ownerUnionId,
       enabled: true,
       createdAt: new Date().toISOString(),
       nextRunAt: params.nextRunAt,
@@ -531,6 +652,9 @@ export function createTask(params: {
       // explicit executionPosition field before reaching the store.
       deliver: params.deliver === 'local' ? 'local' : 'origin',
       silent: params.silent === true ? true : undefined,
+      followActive: params.followActive === true ? true : undefined,
+      model: params.model?.trim() || undefined,
+      reasoningEffort: params.reasoningEffort,
     };
     working.set(task.id, task);
     return { result: task, changed: true };
@@ -554,19 +678,51 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir'
-  >>,
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+  >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): void {
   mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    const targetUpdate = updates.chatId !== undefined || updates.chatIds !== undefined;
+    const targets = targetUpdate
+      ? normalizeScheduleChatTargets({
+          chatId: updates.chatId ?? task.chatId,
+          // Supplying only chatId preserves the old single-target update
+          // meaning and therefore collapses any previous multi-chat list.
+          chatIds: updates.chatIds !== undefined ? updates.chatIds : null,
+        })
+      : undefined;
+    const { chatIds: _chatIds, ...ordinaryUpdates } = updates;
     Object.assign(
       task,
-      updates.deliver === 'new-topic' ? { ...updates, deliver: 'origin' as const } : updates,
+      updates.deliver === 'new-topic'
+        ? { ...ordinaryUpdates, deliver: 'origin' as const }
+        : ordinaryUpdates,
     );
+    if (targets) {
+      task.chatId = targets.chatId;
+      if (targets.chatIds) task.chatIds = targets.chatIds;
+      else delete task.chatIds;
+    }
     return { result: undefined, changed: true };
   }, appId);
+}
+
+/** Record a skipped check without consuming a run or disabling a one-shot. */
+export function markSkipped(id: string, nextRunAt?: string): void {
+  mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: undefined, changed: false };
+
+    task.lastRunAt = new Date().toISOString();
+    task.lastStatus = 'skipped';
+    task.lastError = undefined;
+    task.lastDeliveryError = undefined;
+    if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
+    return { result: undefined, changed: true };
+  });
 }
 
 /**
@@ -722,9 +878,17 @@ export function startExternalWriteWatcher(): void {
         for (const [id, t] of state.tasks) {
           const prev = before.get(id);
           if (!prev) {
-            dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: t } });
+            const { preconditionRef: _preconditionRef, ...schedule } = t;
+            dashboardEventBus.publish({
+              type: 'schedule.created',
+              body: { schedule: { ...schedule, hasPrecondition: !!t.preconditionRef } },
+            });
           } else if (JSON.stringify(prev) !== JSON.stringify(t)) {
-            dashboardEventBus.publish({ type: 'schedule.updated', body: { id, patch: t } });
+            const { preconditionRef: _preconditionRef, ...patch } = t;
+            dashboardEventBus.publish({
+              type: 'schedule.updated',
+              body: { id, patch: { ...patch, hasPrecondition: !!t.preconditionRef } },
+            });
           }
         }
         for (const id of before.keys()) {

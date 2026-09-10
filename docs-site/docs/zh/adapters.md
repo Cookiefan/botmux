@@ -3,7 +3,7 @@
 botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选择，一键切换。**本地适配器各自运行进程**（默认 tmux 后端下可 `tmux attach` 进真进程；显式 pty/zellij/herdr 后端另说）；也有少数通过 API / 远端接入的 Agent（如 Mira、riff），不是本地进程。
 
 **适用**：想换底层 CLI、或接一个新工具时查 `cliId` 和它是否吃 `model` 参数。
-**不适用**：套 wrapper / 网关（ccr、aiden x claude 等）不需要新适配器——见下方 [套 wrapper / 网关接入](#套-wrapper--网关接入)。
+**不适用**：严格兼容 Codex 的独立发行版、或套 wrapper / 网关（ccr、aiden x claude 等）不需要新适配器——分别见下方 [Codex 兼容发行版](#codex-兼容发行版) 与 [套 wrapper / 网关接入](#套-wrapper--网关接入)。
 
 ## 支持的 CLI / Agent
 
@@ -17,6 +17,7 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `gemini` | Gemini | 本地进程 | ✅ |
 | `cursor` | Cursor（cursor-agent） | 本地进程 | ✅ |
 | `opencode` | OpenCode | 本地进程 | ✅ |
+| `opencode2` | OpenCode 2（beta，`opencode2`） | 本地进程 | |
 | `antigravity` | Antigravity（agy） | 本地进程 | |
 | `copilot` | GitHub Copilot | 本地进程 | ✅ |
 | `grok` | Grok（grok-cli） | 本地进程 | ✅ |
@@ -35,8 +36,25 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 | `mira` | Mira APP | API / 远端 | |
 | `mir` | Mir CLI（本地 mircli + MCP bridge） | 本地进程 | |
 | `riff` | riff | 云 Agent（API） | |
+| `dsh` | DeepSeek Harness（dsh CLI） | 本地进程（SDK JSON-RPC） | ✅ |
 
 > `model` 字段只对支持模型参数的适配器生效，其它忽略。Mir CLI 的额外前置（登录 / miramcp）见下方专节。
+
+## DeepSeek Harness（dsh）
+
+`cliId: "dsh"` 通过内置 runner 驱动本机的 `dsh` CLI（[deepseek-harness](https://github.com/deepseekai/deepseek-harness)），走 `dsh --profile <name>` 的 SDK JSON-RPC 协议。前置条件：
+
+1. `dsh` 在 PATH 上（或用 `cliPathOverride` 指定路径）。**升级注意**：这里需要的是 npm 包 `@deepseek-ai/dsh` 提供的 `dsh` 命令；早期版本依赖的是 Python wheel 里的 `dsh-jsonrpc-agent`，若 PATH 上只有旧命令，升级后会报「找不到命令」。
+2. 已通过原生 `dsh` CLI 完成配置（默认 `$DSH_HOME/settings.yaml` + `$DSH_HOME/.credentials.yaml`；未设置 `DSH_HOME` 时为 `~/.dsh/...`）。
+3. 目标 profile（默认 `botmux`，可用 per-bot 的 `dshProfile` 覆盖）位于 `$DSH_HOME/profiles/<name>/`（默认 `~/.dsh/profiles/<name>/`）。**首次使用无需手工创建**：profile 不存在时 botmux 会落盘骨架（`package.json` + 空 `cordis.yml` + `cordis.patch.yml`）并调 `dsh plugin add` 安装依赖。要增删社区插件或换 LLM provider，直接编辑该 profile 的 `cordis.patch.yml`——botmux 只在文件缺失时创建，不会覆盖已有内容。`DSH_HOME` 只能在 daemon 进程环境配置，per-bot `env.DSH_HOME` 会被拒绝，避免 profile 路径分裂。
+
+runner 读取 `$DSH_HOME/settings.yaml` 的 `agent-default-model`（provider + model）传给 initialize RPC；插件组合由 profile 的 `cordis.patch.yml` 完全控制，runner 不再生成 cordis.yml。
+
+编辑 `cordis.patch.yml` 时注意两种条目语义不同：`- insert: [...]` 是**插入**新插件；裸 `- id: X`（没有 `insert`）是覆盖**已存在**插件的配置，目标 id 不存在时会被静默跳过。botmux 生成的默认 patch 只 insert `dsh-base` 缺少的 `sdk-jsonrpc-server`，其余能力沿用 `dsh-base`，并 disable 掉 headless 下会阻塞启动的 Web GUI 插件。
+
+会话 JSONL 落在 `$DSH_HOME/sessions/botmux/`（默认 `~/.dsh/sessions/botmux/`）；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。`dshRuntime: "tui"` 的 TUI 自身状态仍使用 `~/.dsh-tui`。
+
+`ask_user_question` 通过 botmux 生成的临时 DSH profile patch 接入飞书 ask 卡片：official runner 直接注入 bridge；`dshRuntime: "tui"` 通过 dsh-tui wrapper patch 包住原生 question provider，优先飞书作答、不可表示时回退原生 TUI。若线上需要关闭，可设置 `BOTMUX_DSH_ASK_BRIDGE=0` 后重启会话。
 
 ## Mir CLI 与 MCP Bridge
 
@@ -71,6 +89,14 @@ mircli mcp status
 ```bash
 MIRCLI_AUTO_START_MIRAMCP=0 botmux start
 ```
+
+## Codex 兼容发行版
+
+BotMux 把“协议能力”和“发行版身份”分开：`cliId: "codex"` 选择 Codex 协议适配器，`cliRuntime` 选择真正运行、独立发版的二进制。这样兼容分支可以复用模型参数、resume、空闲检测与受控 RPC，而不会被当成官方 Codex 检查版本。
+
+适合 `cliRuntime` 的 CLI 必须是**严格兼容分支**：接受 BotMux 传给 Codex 的参数，保留相同的交互状态和 rollout / resume 语义，并使用兼容的认证 / home 布局。如果它修改了参数、TUI 状态机、会话存储或协议，就应贡献一个真实适配器，而不是声明兼容。
+
+完整配置与更新 provider 说明见 [`bots.json` 的 Codex 兼容发行版章节](/bots-json#codex-兼容发行版)。Dashboard 的 Bot 默认设置也可以配置并预检 runtime。旧 `cliPathOverride` 继续兼容，但不会自动开启需要明确兼容声明的 Codex RPC 能力。
 
 ## 套 wrapper / 网关接入
 

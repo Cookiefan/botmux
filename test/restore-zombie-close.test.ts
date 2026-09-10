@@ -1,21 +1,26 @@
 /**
- * Restore-time zombie-close decision for persistent backends (tmux/zellij/herdr/zmx).
+ * Restore-time close decision for persistent backends (tmux/zellij/herdr/zmx).
  *
  * On daemon restart, restoreActiveSessions() re-registers every persisted active
  * session and then, for persistent backends, probes whether the backing
- * pane/agent survived. PR #98 made a *missing* backing session trigger a
- * permanent closeSession(). The hazard the gate caught: a transient probe
- * failure (herdr server slow-start / list timeout / CLI hiccup) used to fold
- * into the same `false` as "genuinely gone", so one flaky probe could close a
- * still-alive session for good (context lost, pane leaked, store row closed →
- * no lazy recovery).
+ * pane/agent survived. A *missing* backing is NEVER an auto-close trigger: the
+ * CLI transcript on disk is still resumable, so the row is kept worker-less and
+ * cold-resumes on the next message (mirrors pty, which has no backend to probe,
+ * and zmx). This is the fix for the host-reboot mass-close bug — botmux shares
+ * the default tmux socket with the operator's own terminal, so an earlier
+ * serverState()-based gate that tried to tell a solo zombie apart from a reboot
+ * was defeated by a co-tenant reviving the server, closing 239 live sessions
+ * after one reboot. Only three things leave the active set on restore:
  *
- * The fix upgrades the probe to tri-state (exists | missing | unknown). These
- * tests pin the decision boundary:
- *   - missing  → closeSession (Map eviction + store closed), no fork
- *   - unknown  → keep the active record (no close, no fork) for lazy recovery
+ *   - missing  → KEEP the active record (no close, no fork) for lazy cold-resume
+ *   - unknown  → KEEP the active record (no close, no fork) for lazy recovery
  *   - exists   → auto-fork to re-attach, no close
- *   - CLI mismatch → closeSession, so a worker-less old session cannot lazy-resume
+ *   - CLI mismatch → closeSession, so a worker-less old session cannot cold-resume
+ *                    the wrong (config-switched) CLI. Orthogonal to backing state.
+ *
+ * (A real `/close` marks the store row 'closed' up front, so it is never in this
+ * `active` restore set; a provably-exited adopt target is closed in the adopt
+ * branch. Neither is exercised here.)
  *
  * Heavy collaborators are mocked at the module boundary; the session-store runs
  * for real against a temp dir, and the worker-pool mock faithfully reproduces
@@ -25,7 +30,7 @@
  * Run:  pnpm vitest run test/restore-zombie-close.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -38,13 +43,12 @@ const zmxSnapshot = vi.hoisted(() => ({
   sessions: [] as string[],
   unhealthySessions: [] as string[],
 }));
-// Mutable tmux-SERVER liveness the mocked TmuxBackend returns this test run.
-// Default 'running' so a bare 'missing' is read as a solo zombie (server up).
-const server = vi.hoisted(() => ({ state: 'running' as 'running' | 'down' | 'unknown' }));
 const herdrProbe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'unknown' }));
 // Mutable bot-side wrapperCli for the wrapper-axis mismatch tests.
 const bot = vi.hoisted(() => ({
   cliId: 'claude-code' as import('../src/adapters/cli/types.js').CliId,
+  cliRuntime: undefined as import('../src/adapters/cli/runtime.js').CliRuntimeConfig | undefined,
+  cliPathOverride: undefined as string | undefined,
   wrapperCli: undefined as string | undefined,
 }));
 
@@ -96,11 +100,59 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
     if (prev && prev !== ds) {
-      for (const [k, v] of map) { if (v === prev) { map.delete(k); break; } }
+      const prevPending = (prev.session?.codexAppDispatchLedger?.length ?? 0) > 0;
+      const incomingPending = (ds.session?.codexAppDispatchLedger?.length ?? 0) > 0;
+      if (prevPending && incomingPending) {
+        return {
+          accepted: false,
+          reason: 'both_pending',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      const closeUnregistered = async (loser: any) => {
+        for (const [k, v] of map) {
+          if (v === loser) { map.delete(k); break; }
+        }
+        const store = await import('../src/services/session-store.js');
+        const persisted = store.getSession(loser.session.sessionId);
+        if (persisted && persisted.status !== 'closed') {
+          store.closeSession(loser.session.sessionId);
+        }
+      };
+      if (prevPending) {
+        await closeUnregistered(ds);
+        return {
+          accepted: false,
+          reason: 'kept_pending_owner',
+          keptSessionId: prev.session.sessionId,
+          closedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      await closeUnregistered(prev);
     }
+    map.set(key, ds);
+    return {
+      accepted: true,
+      ...(prev && prev !== ds ? { closedSessionId: prev.session.sessionId } : {}),
+    };
+  }),
+  // Faithful SYNCHRONOUS compare-and-set (mirrors production setActiveSessionIfActive):
+  // resumeSession calls this inside withActiveSessionKeyLock, so it must not re-lock.
+  // Inactive incoming drops its own stale entry → false; a different live occupant
+  // wins → false; otherwise set → true.
+  setActiveSessionIfActive: vi.fn((map: Map<string, any>, key: string, ds: any) => {
+    if (ds?.session?.status !== 'active') {
+      if (map.get(key) === ds) map.delete(key);
+      return false;
+    }
+    const current = map.get(key);
+    if (current && current !== ds) return false;
     map.set(key, ds);
     return true;
   }),
@@ -117,14 +169,28 @@ vi.mock('../src/core/worker-pool.js', () => ({
     }
     const store = await import('../src/services/session-store.js');
     const s = store.getSession(sid);
-    if (s && s.status !== 'closed') store.closeSession(sid);
-    return { ok: true, alreadyClosed: false };
+    if (s && s.status !== 'closed') {
+      store.closeSession(sid, {
+        ...(s.mojoCloseJournal?.phase === 'prepared'
+          ? { clearRiffParentTaskId: true }
+          : {}),
+      });
+    }
+    return { ok: true, outcome: 'closed', alreadyClosed: false };
   }),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', cliId: bot.cliId, wrapperCli: bot.wrapperCli, workingDir: '~', workingDirs: ['~'] },
+    config: {
+      larkAppId: 'app_test',
+      cliId: bot.cliId,
+      cliRuntime: bot.cliRuntime,
+      cliPathOverride: bot.cliPathOverride,
+      wrapperCli: bot.wrapperCli,
+      workingDir: '~',
+      workingDirs: ['~'],
+    },
     botName: 'TestBot',
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
@@ -160,7 +226,6 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
     sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
     probeSession: vi.fn(() => probe.result),
     hasSession: vi.fn(() => probe.result === 'exists'),
-    serverState: vi.fn(() => server.state),
     killSession: vi.fn(),
   },
 }));
@@ -186,7 +251,6 @@ vi.mock('../src/adapters/backend/zmx-backend.js', () => ({
       raw: '',
     } : { ok: false }),
     hasSession: vi.fn(() => probe.result === 'exists'),
-    serverState: vi.fn(() => server.state),
     killSession: vi.fn(),
     killManagedSession: vi.fn(),
   },
@@ -203,12 +267,15 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, closeCliMismatchedSessionsForBot } from '../src/core/session-manager.js';
+import { restoreActiveSessions, closeCliMismatchedSessionsForBot, resumeSession,
+} from '../src/core/session-manager.js';
+import { getAllBots, getBot } from '../src/bot-registry.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 import {
   closeSession,
+  ensureOrdinaryTurnRecoveryAttached,
   forkAdoptWorker,
   forkWorker,
   setActiveSessionSafe,
@@ -230,12 +297,14 @@ beforeEach(() => {
   zmxSnapshot.ok = true;
   zmxSnapshot.sessions = [];
   zmxSnapshot.unhealthySessions = [];
-  server.state = 'running';
   herdrProbe.result = 'exists';
   bot.cliId = 'claude-code';
+  bot.cliRuntime = undefined;
+  bot.cliPathOverride = undefined;
   bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
+  vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(announceSessionRow).mockClear();
   vi.mocked(ZmxBackend.probeSessions).mockClear();
   vi.mocked(ZmxBackend.killManagedSession).mockReset();
@@ -269,6 +338,78 @@ function makeUnstartedSession(rootMessageId: string) {
   return s;
 }
 
+describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', () => {
+  // The module-level bot-registry mock serves every other describe; stash its
+  // implementations so these tests can swap in their own without leaking.
+  let origGetAllBots: (() => unknown) | undefined;
+  let origGetBot: (() => unknown) | undefined;
+  beforeEach(() => {
+    origGetAllBots = vi.mocked(getAllBots).getMockImplementation();
+    origGetBot = vi.mocked(getBot).getMockImplementation();
+  });
+  afterEach(() => {
+    vi.mocked(getAllBots).mockImplementation(origGetAllBots as never);
+    vi.mocked(getBot).mockImplementation(origGetBot as never);
+  });
+
+  it('never guesses a tenant for a legacy row without larkAppId when several bots are registered', async () => {
+    // Pre-fix, restore fell back to getAllBots()[0]: with a mojo bot in slot 0,
+    // an unattributed legacy row (no backendType/cliId stamped) was classified
+    // mojo AGAINST THAT BOT — its riff lineage parked into
+    // mojoQuarantinedLineage and bot[0]'s tenant identity frozen on. The freeze
+    // is idempotent, so one wrong boot locked the misbinding in durably.
+    vi.mocked(getAllBots).mockReturnValue([
+      { config: { larkAppId: 'app_mojo', backendType: 'mojo', mojo: { cloud: true } } },
+      { config: { larkAppId: 'app_test', cliId: 'claude-code' } },
+    ] as never);
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_mojo', backendType: 'mojo', mojo: { cloud: true } },
+      botName: 'MojoBot', botOpenId: 'ou_mojo', resolvedAllowedUsers: [],
+    } as never);
+    const s = sessionStore.createSession('oc_chat1', 'om_legacy_no_app', 'Topic', 'group');
+    // A pre-larkAppId row: nothing stamped, only a remote lineage left behind.
+    s.larkAppId = undefined;
+    s.backendType = undefined;
+    s.cliId = undefined;
+    s.riffParentTaskId = 'legacy-task-1';
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    const after = sessionStore.getSession(s.sessionId);
+    // Unfrozen (`undefined` keeps meaning "predates this field"), lineage kept.
+    expect(after?.mojoIdentity).toBeUndefined();
+    expect(after?.mojoQuarantinedLineage).toBeUndefined();
+    expect(after?.riffParentTaskId).toBe('legacy-task-1');
+  });
+
+  it('still freezes via the single registered bot when attribution is unambiguous', async () => {
+    vi.mocked(getAllBots).mockReturnValue([
+      { config: { larkAppId: 'app_mojo', backendType: 'mojo', mojo: { cloud: true } } },
+    ] as never);
+    vi.mocked(getBot).mockReturnValue({
+      config: { larkAppId: 'app_mojo', backendType: 'mojo', mojo: { cloud: true } },
+      botName: 'MojoBot', botOpenId: 'ou_mojo', resolvedAllowedUsers: [],
+    } as never);
+    const s = sessionStore.createSession('oc_chat1', 'om_legacy_single_bot', 'Topic', 'group');
+    s.larkAppId = undefined;
+    s.backendType = undefined;
+    s.cliId = undefined;
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // One bot means the row can only belong to it: frozen, not left migratable.
+    expect(sessionStore.getSession(s.sessionId)?.mojoIdentity).toEqual({ cloud: true });
+  });
+});
+
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
   it('closes unstarted TraeX initialization drafts because their card state is runtime-only', async () => {
     bot.cliId = 'traex';
@@ -282,6 +423,232 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(sessionStore.getSession(draft.sessionId)?.status).toBe('closed');
     expect(closeSession).not.toHaveBeenCalledWith(draft.sessionId);
     expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('finishes a durable prepared Mojo close without registering or re-cancelling', async () => {
+    const s = makeActivePersistentSession('om_mojo_prepared_recovery');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-prepared-id';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'close-before-crash',
+      taskId: 'mojo-prepared-id',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({ status: 'closed' });
+    expect(sessionStore.getSession(s.sessionId)?.riffParentTaskId).toBeUndefined();
+    expect(sessionStore.getSession(s.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('does NOT downgrade a COMMIT-ONLY prepared close into an uncertain fence', async () => {
+    // Liveness guard for a load-bearing branch ORDER. The `phase === 'prepared'`
+    // branch must run BEFORE the catch-all that rebuilds any remaining journal as
+    // `uncertain` + fenced. If the two are ever reordered, an irreversible
+    // teardown (remote side already gone, only the local commit outstanding) is
+    // rewritten as "needs manual reconciliation" and its local commit can never
+    // complete again -- the session is wedged open forever, still holding its
+    // device-isolation blocker.
+    const s = makeActivePersistentSession('om_mojo_commit_only_recovery');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-commit-only-id';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'close-before-crash',
+      taskId: 'mojo-commit-only-id',
+      recovery: 'irreversible',
+      admission: 'fenced',
+      commitOnly: true,
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // The local commit ran: row closed, journal cleared, nothing re-cancelled.
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({ status: 'closed' });
+    const after = sessionStore.getSession(s.sessionId);
+    expect(after?.mojoCloseJournal).toBeUndefined();
+    // And specifically NOT the downgrade the catch-all would have written.
+    expect(after?.mojoCloseJournal?.phase).not.toBe('uncertain');
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('keeps a prepared close quarantined when a parked residual still needs a user surface', async () => {
+    const s = makeActivePersistentSession('om_mojo_prepared_residual');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-active-cancelled';
+    s.mojoQuarantinedLineage = 'mojo-parked-manual';
+    s.mojoQuarantineNoticePending = true;
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'close-before-crash',
+      taskId: 'mojo-active-cancelled',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.size).toBe(0);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      restoreQuarantinedAt: expect.any(String),
+      mojoQuarantinedLineage: 'mojo-parked-manual',
+      mojoCloseJournal: { phase: 'prepared' },
+    });
+  });
+
+  it('quarantines an interrupted Mojo prepare and never registers or forks it', async () => {
+    const s = makeActivePersistentSession('om_mojo_uncertain_recovery');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-uncertain-id';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'preparing',
+      requestId: 'close-interrupted',
+      taskId: 'mojo-uncertain-id',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      restoreQuarantinedAt: expect.any(String),
+      mojoCloseJournal: {
+        phase: 'uncertain',
+        requestId: 'close-interrupted',
+        taskId: 'mojo-uncertain-id',
+      },
+    });
+  });
+
+  it('registers a row whose close failed cleanly-retryable instead of quarantining it (P1-2)', async () => {
+    // recovery 'retryable' + admission 'restorable' is the durable record of a
+    // prepare that failed BEFORE anything irreversible happened, with writes
+    // already legal again. Downgrading it to `uncertain` + quarantine made the
+    // persisted `retryable` dead-code: the row was never registered again and
+    // every later /close was refused, so "retryable" was a promise the daemon
+    // could not keep.
+    const s = makeActivePersistentSession('om_mojo_retryable_recovery');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-retryable-id';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'preparing',
+      requestId: 'close-failed-retryable',
+      taskId: 'mojo-retryable-id',
+      recovery: 'retryable',
+      admission: 'restorable',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    // Registered as an ordinary row — the anchor stays usable and the close
+    // stays retryable — with the journal preserved exactly as persisted.
+    expect(map.size).toBe(1);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      mojoCloseJournal: {
+        phase: 'preparing',
+        requestId: 'close-failed-retryable',
+        recovery: 'retryable',
+        admission: 'restorable',
+      },
+    });
+    expect(sessionStore.getSession(s.sessionId)?.restoreQuarantinedAt).toBeUndefined();
+  });
+
+  it('quarantines a Mojo journal stamped onto another backend instead of closing it', async () => {
+    const s = makeActivePersistentSession('om_invalid_mojo_journal', 'riff');
+    s.riffParentTaskId = 'riff-task-must-survive';
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: 'invalid-cross-backend-proof',
+      taskId: 'riff-task-must-survive',
+      updatedAt: new Date().toISOString(),
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      backendType: 'riff',
+      riffParentTaskId: 'riff-task-must-survive',
+      restoreQuarantinedAt: expect.any(String),
+      mojoCloseJournal: { phase: 'uncertain' },
+    });
+  });
+
+  it('quarantines a malformed prepared journal instead of treating it as proof', async () => {
+    const s = makeActivePersistentSession('om_malformed_mojo_journal');
+    s.backendType = 'mojo';
+    s.riffParentTaskId = 'mojo-must-not-be-cleared';
+    s.mojoIdentity = { cloud: true };
+    s.mojoCloseJournal = {
+      phase: 'prepared',
+      requestId: '',
+      taskId: 'mojo-must-not-be-cleared',
+      updatedAt: '',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(map.size).toBe(0);
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-must-not-be-cleared',
+      restoreQuarantinedAt: expect.any(String),
+      mojoCloseJournal: { phase: 'prepared', requestId: '' },
+    });
   });
 
   it('shared Herdr restore probes the recorded managed agent, not a derived bmx-* session', async () => {
@@ -330,7 +697,13 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('ownership probe unavailable'));
   });
 
-  it('"missing" → closes the zombie (Map eviction + store closed), does not fork', async () => {
+  it('"missing" → keeps the active record for lazy cold-resume, does NOT close', async () => {
+    // A missing backing pane is never an auto-close trigger for a managed
+    // session: whether one pane crashed or the whole server is gone, the CLI
+    // transcript on disk is still resumable, so the worker-less active record is
+    // kept and the next message cold-resumes it. Mirrors pty (never probed) and
+    // zmx (missing always kept). Only a real /close, a provably-exited adopt
+    // target, or a CLI-config mismatch leaves the active set.
     probe.result = 'missing';
     const s = makeActivePersistentSession('om_missing');
     const map = new Map<string, DaemonSession>();
@@ -342,19 +715,24 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(announceSessionRow).toHaveBeenCalledWith(expect.objectContaining({
       session: expect.objectContaining({ sessionId: s.sessionId }),
     }));
-    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
-    expect([...map.values()].some(v => v.session.sessionId === s.sessionId)).toBe(false);
-    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    expect(closeSession).not.toHaveBeenCalled();
+    const ds = map.get(sessionKey('om_missing', 'app_test'));
+    expect(ds).toBeDefined();              // active record retained…
+    expect(ds!.worker).toBeNull();         // …worker-less, cold-resumes on next message
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('"missing" + server DOWN (host reboot) → keeps the active record, does NOT close', async () => {
-    // The reboot bug: tmux server is gone, so every bmx-* pane probes 'missing'.
-    // Closing them all wiped a full dashboard. With the server-state gate, a
-    // down server means "keep for lazy resume" (CLI transcript on disk is still
-    // resumable), exactly like a pty session.
+  it('"missing" after a host reboot (server gone) → keeps the active record, does NOT close', async () => {
+    // The reboot bug this whole fix targets: a host reboot wipes the tmux
+    // server, so every bmx-* pane probes 'missing' at once. Because botmux
+    // shares the default tmux socket with the operator's own terminal, a
+    // co-tenant reviving the server before restore ran made the old
+    // serverState() gate read the reboot as N solo zombies → mass-close (239
+    // sessions after one reboot). Now 'missing' is never an auto-close: the
+    // CLI transcript on disk is still resumable, so the row is kept worker-less
+    // and cold-resumes on the next message, exactly like a pty session.
     probe.result = 'missing';
-    server.state = 'down';
     const s = makeActivePersistentSession('om_reboot');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
@@ -372,7 +750,6 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
   it('missing ZMX session stays lazy-recoverable even when another ZMX daemon is running', async () => {
     probe.result = 'missing';
-    server.state = 'running';
     const s = makeActivePersistentSession('om_zmx_missing', 'zmx');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
@@ -400,13 +777,14 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('CLI mismatch on restore → closes the active record even when the backend server is down', async () => {
+  it('CLI mismatch on restore → closes the active record even though a missing backing is normally kept', async () => {
     // This is the config-switch case: the bot now points at a different CLI,
-    // but an old active session still has its original cliId frozen. If restore
-    // kept it worker-less for lazy resume, the next @mention would resurrect the
-    // old CLI instead of creating a clean session with the current bot config.
+    // but an old active session still has its original cliId frozen. A missing
+    // backing is normally kept for lazy resume, but a mismatch must still close:
+    // otherwise the next @mention would cold-resume the OLD CLI instead of
+    // creating a clean session with the current bot config. Mismatch-close is
+    // orthogonal to whether the backing pane survived.
     probe.result = 'missing';
-    server.state = 'down';
     const s = makeActivePersistentSession('om_cli_mismatch');
     s.cliId = 'codex';
     sessionStore.updateSession(s);
@@ -420,6 +798,33 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_cli_mismatch', 'app_test'))).toBeUndefined();
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('CLI mismatch on restore preserves and reattaches an unsettled Codex App ledger', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_cli_mismatch_pending');
+    s.cliId = 'codex-app';
+    s.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-pending',
+      turnId: 'turn-pending',
+      state: 'prepared',
+      content: 'prompt',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      codexAppDispatchLedger: [{ dispatchId: 'dispatch-pending' }],
+    });
+    const restored = map.get(sessionKey('om_cli_mismatch_pending', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
   });
 
   it('isolates a failed ZMX mismatch teardown and continues closing later sessions', async () => {
@@ -507,7 +912,6 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     // A frozen wrapper snapshot that differs from the bot's current wrapper is
     // the same config-switch case as a cliId change and must close too.
     probe.result = 'missing';
-    server.state = 'down';
     const s = makeActivePersistentSession('om_wrapper_mismatch');
     s.wrapperCli = 'aiden x claude';
     s.agentFrozen = true;
@@ -524,9 +928,45 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('quarantines a restore whose CLI-mismatch close was REFUSED (not thrown)', async () => {
+    // A refused close is a returned {ok:false}, so it never reaches the catch that
+    // quarantines a thrown one. Without an explicit branch the row stays active on
+    // disk yet is never registered — an owner that IM /close cannot reach, while a
+    // later inbound on the same anchor mints a second session and the old remote
+    // one keeps running.
+    probe.result = 'missing';
+    const blocked = makeActivePersistentSession('om_close_refused');
+    blocked.wrapperCli = 'aiden x claude';
+    blocked.agentFrozen = true;
+    sessionStore.updateSession(blocked);
+    const survivor = makeActivePersistentSession('om_restore_after_refusal', 'tmux');
+    sessionStore.updateSession(survivor);
+    vi.mocked(closeSession).mockResolvedValueOnce({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_cancel_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    } as never);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+
+    expect(closeSession).toHaveBeenCalledWith(blocked.sessionId);
+    // Row kept active AND quarantined, so it is visible as a problem rather than
+    // silently invisible.
+    expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(blocked.sessionId)?.restoreQuarantinedAt)
+      .toEqual(expect.any(String));
+    expect(map.get(sessionKey('om_close_refused', 'app_test'))).toBeUndefined();
+    // Unrelated rows still restore.
+    expect(map.get(sessionKey('om_restore_after_refusal', 'app_test'))?.session.sessionId)
+      .toBe(survivor.sessionId);
+  });
+
   it('frozen wrapper matching the bot wrapper → NOT a mismatch, session kept', async () => {
     probe.result = 'missing';
-    server.state = 'down';
     bot.wrapperCli = 'aiden x claude';
     const s = makeActivePersistentSession('om_wrapper_match');
     s.wrapperCli = 'aiden x claude';
@@ -548,7 +988,6 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     // exactly what the bot is configured for — closing it would be a false
     // positive.
     probe.result = 'missing';
-    server.state = 'down';
     bot.wrapperCli = 'aiden x claude';
     const s = makeActivePersistentSession('om_wrapper_legacy');
     sessionStore.updateSession(s);
@@ -562,9 +1001,8 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
   });
 
-  it('"missing" + server DOWN → keeps ALL sessions (no mass-close after reboot)', async () => {
+  it('"missing" for every session (host reboot) → keeps ALL of them (no mass-close)', async () => {
     probe.result = 'missing';
-    server.state = 'down';
     const a = makeActivePersistentSession('om_reboot_a');
     const b = makeActivePersistentSession('om_reboot_b');
     const c = makeActivePersistentSession('om_reboot_c');
@@ -582,14 +1020,12 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
-  it('"missing" + server UP but session was cap-suspended → keeps active for cold-resume (NOT a zombie)', async () => {
+  it('"missing" for a cap-suspended session → keeps active for cold-resume', async () => {
     // The idle-worker sweeper deliberately kills a session's backing pane + CLI
-    // over the per-bot cap. The server stays up (only one pane was killed), so
-    // without the suspend-intent marker this looks exactly like a solo zombie
-    // and would be wrongly closed — losing a session that should lazily
-    // cold-resume on the next message.
+    // over the per-bot cap, leaving suspendedColdResume set. Its backing probes
+    // 'missing' on restart; like every other missing managed backing it is kept
+    // worker-less and cold-resumes from the transcript on the next message.
     probe.result = 'missing';
-    server.state = 'running';
     const s = makeActivePersistentSession('om_cap_suspended');
     s.suspendedColdResume = true;
     sessionStore.updateSession(s);
@@ -603,20 +1039,6 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(ds).toBeDefined();              // active record retained…
     expect(ds!.worker).toBeNull();         // …worker-less, cold-resumes on next message
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active'); // NOT closed
-    expect(forkWorker).not.toHaveBeenCalled();
-  });
-
-  it('"missing" + server state UNKNOWN → closes (conservative, server may be up)', async () => {
-    probe.result = 'missing';
-    server.state = 'unknown';
-    const s = makeActivePersistentSession('om_missing_unknown_server');
-    const map = new Map<string, DaemonSession>();
-    wp.registry = map;
-
-    await restoreActiveSessions(map);
-
-    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
-    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
@@ -722,6 +1144,185 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
     expect(sessionStore.getSession(s.sessionId)?.lastCodexAppInput).toEqual(expected);
   });
+
+  it('isolates a same-anchor pending collision without aborting startup and preserves both rows', async () => {
+    probe.result = 'exists';
+    bot.cliId = 'codex-app';
+    const first = makeActivePersistentSession('om_pending_collision');
+    first.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-first',
+      turnId: 'turn-first',
+      state: 'prepared',
+      content: 'first owned output',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(first);
+    const second = makeActivePersistentSession('om_pending_collision');
+    second.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-second',
+      turnId: 'turn-second',
+      state: 'prepared',
+      content: 'second owned output',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(second);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+
+    expect(sessionStore.getSession(first.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(second.sessionId)?.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
+    const canonical = map.get(sessionKey('om_pending_collision', 'app_test'))!;
+    expect(canonical.session.sessionId).toBe(first.sessionId);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(canonical, '', true);
+  });
+});
+
+// ─── Preview-target lifecycle across a worker generation change ──────────────
+//
+// `previewTarget` is the literal loopback (host, port) an agent registers with
+// `botmux preview <port>`; the dashboard proxy dials it by host/port alone.
+// It is scoped to the worker that was live at registration time. A daemon
+// restart opens a NEW generation (every restored row is rebuilt with
+// worker:null and killStalePids has reaped the previous run's CLI processes),
+// so the process that owned the port is gone and the OS may have handed the
+// number to an unrelated local server. Carrying the old target back would
+// proxy a user's preview into that stranger's service.
+describe('restoreActiveSessions — stale preview target cleanup', () => {
+  const staleTarget = {
+    host: '127.0.0.1' as const,
+    port: 4173,
+    registeredAt: '2026-08-11T12:00:00.000Z',
+    // 上一代留下的完整持有证明：即便形状完全合法，也不能跨 restore 继续使用。
+    owner: { pid: 4242, procStart: '918273', inode: '556677' },
+    workerGeneration: 3,
+  };
+
+  it('does not carry a previous generation\'s preview target into the restored row', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_preview_restore');
+    s.previewTarget = { ...staleTarget };
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // The row is restored normally — cleanup must not close or skip it.
+    const restored = map.get(sessionKey('om_preview_restore', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(restored!.session.sessionId).toBe(s.sessionId);
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    // Runtime row (what composeRowFromActive / the SSE patch read) is clean…
+    expect(restored!.session.previewTarget).toBeUndefined();
+    // …and so is the announced dashboard row.
+    const announced = vi.mocked(announceSessionRow).mock.calls
+      .map(([ds]) => ds)
+      .find(ds => ds.session.sessionId === s.sessionId);
+    expect(announced).toBeDefined();
+    expect(announced!.session.previewTarget).toBeUndefined();
+  });
+
+  it('drops the stale target durably, so it stays dead across a store reload', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_preview_durable');
+    s.previewTarget = { ...staleTarget };
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // Re-read from disk: a target that survived the write would come back on
+    // the next restart (or through any offline row reader).
+    sessionStore.init();
+    expect(sessionStore.getSession(s.sessionId)?.previewTarget).toBeUndefined();
+  });
+
+  it('drops the target on an adopt restore too — a live adopted CLI is no proof its dev server survived', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_preview_adopt');
+    s.title = 'Adopt: proj';
+    s.adoptedFrom = {
+      source: 'tmux', tmuxTarget: 'ext:0.0', originalCliPid: 111, cliId: 'claude-code', cwd: '/tmp/proj',
+    } as any;
+    s.previewTarget = { ...staleTarget };
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    // Genuine adopt restore (validateAdoptTargetState is mocked to 'alive').
+    expect(vi.mocked(forkAdoptWorker).mock.calls
+      .some(([ds]) => ds.session.sessionId === s.sessionId)).toBe(true);
+    const restored = map.get(sessionKey('om_preview_adopt', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(restored!.adoptedFrom).toBeDefined();
+    expect(restored!.session.previewTarget).toBeUndefined();
+    expect(sessionStore.getSession(s.sessionId)?.previewTarget).toBeUndefined();
+  });
+
+  it('leaves rows without a registered preview target untouched', async () => {
+    probe.result = 'exists';
+    const s = makeActivePersistentSession('om_preview_absent');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    const restored = map.get(sessionKey('om_preview_absent', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(restored!.session.previewTarget).toBeUndefined();
+    expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+  });
+});
+
+describe('resumeSession — disk-only legacy anchor collision', () => {
+  it('refuses a legacy unscoped real owner instead of ghosting it', async () => {
+    const target = makeActivePersistentSession('om_resume_legacy_conflict');
+    sessionStore.closeSession(target.sessionId);
+    const legacyOwner = makeActivePersistentSession('om_resume_legacy_conflict');
+    legacyOwner.larkAppId = undefined;
+    legacyOwner.lastCliInput = 'existing conversation';
+    sessionStore.updateSession(legacyOwner);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const result = await resumeSession(target.sessionId, map);
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'anchor_occupied',
+      activeSessionId: legacyOwner.sessionId,
+    });
+    expect(sessionStore.getSession(target.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(legacyOwner.sessionId)?.status).toBe('active');
+    expect(map.size).toBe(0);
+  });
+
+  it('closes a disk-only legacy scratch before reactivating the requested session', async () => {
+    const target = makeActivePersistentSession('om_resume_legacy_scratch');
+    sessionStore.closeSession(target.sessionId);
+    const legacyScratch = makeActivePersistentSession('om_resume_legacy_scratch');
+    legacyScratch.larkAppId = undefined;
+    legacyScratch.cliId = undefined;
+    legacyScratch.lastCliInput = undefined;
+    sessionStore.updateSession(legacyScratch);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const result = await resumeSession(target.sessionId, map);
+
+    expect(result.ok).toBe(true);
+    expect(sessionStore.getSession(legacyScratch.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(target.sessionId)?.status).toBe('active');
+    expect(map.get(sessionKey('om_resume_legacy_scratch', 'app_test'))?.session.sessionId)
+      .toBe(target.sessionId);
+  });
 });
 
 // ─── Runtime hot-switch sweep (closeCliMismatchedSessionsForBot) ─────────────
@@ -766,7 +1367,7 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     const closed = await closeCliMismatchedSessionsForBot('app_test');
 
-    expect(closed).toBe(1);
+    expect(closed).toMatchObject({ closed: 1 });
     expect(closeSession).toHaveBeenCalledWith(stale.sessionId);
     expect(sessionStore.getSession(stale.sessionId)!.status).toBe('closed');
     expect(wp.registry!.get(sessionKey('om_rt_stale', 'app_test'))).toBeUndefined();
@@ -781,8 +1382,164 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     sessionStore.updateSession(s);
     registerDs(s);
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('counts a close that left an uncancelled remote session', async () => {
+    // A hot CLI/backend switch can hit an old mojo row carrying a parked lineage.
+    // This sweep has no interactive surface, so the count is the only way the
+    // dashboard can avoid reporting those as fully torn down.
+    const s = makeActivePersistentSession('om_rt_residual');
+    s.wrapperCli = 'aiden x claude';
+    s.agentFrozen = true;
+    sessionStore.updateSession(s);
+    registerDs(s);
+    vi.mocked(closeSession).mockResolvedValueOnce({
+      ok: true,
+      outcome: 'closed_with_residual',
+      residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+      alreadyClosed: false,
+      known: true,
+    } as never);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1, residual: 1 });
+  });
+
+  it('does NOT count a refused close as closed, and keeps the row + owner', async () => {
+    // closeSession models a refused close as a RETURNED {ok:false}, not a throw.
+    // Counting it as `closed` reported a green "closed N" for a row that is still
+    // active — and whose remote session may still be running.
+    const s = makeActivePersistentSession('om_rt_refused');
+    s.wrapperCli = 'aiden x claude';
+    s.agentFrozen = true;
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    vi.mocked(closeSession).mockResolvedValueOnce({
+      ok: false,
+      alreadyClosed: false,
+      error: 'mojo_cancel_failed',
+      retryable: true,
+      taskId: 'mojo-sid-123',
+    } as never);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0, residual: 0, failed: 1 });
+    // The row stays active and keeps its owner so the close can be retried.
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+    expect(wp.registry?.size ?? 0).toBeGreaterThan(0);
+    void ds;
+  });
+
+  it('counts a THROWN close as failed and keeps sweeping later rows', async () => {
+    // The catch used to swallow the error without counting it, so a sweep that
+    // threw on every row still reported a clean "closed 0, failed 0".
+    const boom = makeActivePersistentSession('om_rt_throw');
+    boom.wrapperCli = 'aiden x claude';
+    boom.agentFrozen = true;
+    sessionStore.updateSession(boom);
+    registerDs(boom);
+    const later = makeActivePersistentSession('om_rt_after_throw');
+    later.wrapperCli = 'aiden x claude';
+    later.agentFrozen = true;
+    sessionStore.updateSession(later);
+    registerDs(later);
+    vi.mocked(closeSession).mockRejectedValueOnce(new Error('ownership probe unavailable'));
+
+    const result = await closeCliMismatchedSessionsForBot('app_test');
+
+    expect(result.failed).toBe(1);
+    // The sweep continued: the second row was still closed.
+    expect(result.closed).toBe(1);
+    expect(closeSession).toHaveBeenCalledWith(later.sessionId);
+  });
+
+  it('closes runtime identity mismatches and describes both distributions in the warning', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'current-codex',
+      displayName: 'Current Codex',
+      executable: '/opt/current-codex',
+      update: { provider: 'none' },
+    };
+    bot.cliPathOverride = '/opt/current-codex';
+    const s = makeActivePersistentSession('om_rt_runtime_mismatch');
+    s.agentFrozen = true;
+    s.cliRuntime = {
+      id: 'frozen-codex',
+      displayName: 'Frozen Codex',
+      executable: '/opt/frozen-codex',
+      source: 'configured',
+      update: { provider: 'self' },
+    };
+    s.cliPathOverride = '/opt/frozen-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    const warnings = vi.mocked(logger.warn).mock.calls.flat().join('\n');
+    expect(warnings).toContain('session=Frozen Codex');
+    expect(warnings).toContain('bot=Current Codex');
+  });
+
+  it('closes an old frozen path when its source differs from a configured runtime with the same id', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'vendor-codex',
+      displayName: 'VendorCodex',
+      executable: '/opt/new-location/vendor-codex',
+      update: { provider: 'self' },
+    };
+    bot.cliPathOverride = '/opt/new-location/vendor-codex';
+    const s = makeActivePersistentSession('om_rt_legacy_runtime_match');
+    s.agentFrozen = true;
+    s.cliPathOverride = '/opt/old-location/vendor-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('does not treat a legacy executable named codex as the official runtime', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = undefined;
+    bot.cliPathOverride = undefined;
+    const s = makeActivePersistentSession('om_rt_legacy_codex');
+    s.agentFrozen = true;
+    s.cliPathOverride = 'codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('does not compare runtime identity before a legacy session is agentFrozen', async () => {
+    bot.cliId = 'codex';
+    bot.cliRuntime = {
+      id: 'current-codex',
+      executable: '/opt/current-codex',
+      update: { provider: 'none' },
+    };
+    bot.cliPathOverride = '/opt/current-codex';
+    const s = makeActivePersistentSession('om_rt_unfrozen_runtime');
+    s.cliPathOverride = '/opt/legacy-codex';
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0 });
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
   });
 
   it('defers a CLI-mismatch close during relay and resweeps after the gate settles', async () => {
@@ -792,7 +1549,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     const ds = registerDs(s);
     transferState.active.add(ds);
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0 });
     expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
 
@@ -827,7 +1585,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     sessionStore.updateSession(otherBot);
     registerDs(otherBot, 'app_other');
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0 });
     expect(closeSession).not.toHaveBeenCalled();
     for (const s of [queued, adopt, otherBot]) {
       expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
@@ -845,7 +1604,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     (ds as any).worker = { killed: false };
     vi.mocked(TmuxBackend.killSession).mockClear();
 
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
     expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(TmuxBackend.killSession).not.toHaveBeenCalled();
   });
@@ -863,7 +1623,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
       .mockImplementationOnce(() => { throw new Error('ownership probe unavailable'); })
       .mockImplementationOnce(() => undefined);
 
-    await expect(closeCliMismatchedSessionsForBot('app_test')).resolves.toBe(1);
+    await expect(closeCliMismatchedSessionsForBot('app_test'))
+      .resolves.toMatchObject({ closed: 1 });
 
     expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
     expect(wp.registry!.get(sessionKey('om_rt_zmx_blocked', 'app_test'))?.session.sessionId).toBe(blocked.sessionId);
@@ -875,6 +1636,8 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
   it('returns 0 when the registry is not initialized', async () => {
     wp.registry = null;
-    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 0 });
   });
+
 });

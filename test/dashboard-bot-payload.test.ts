@@ -1,39 +1,146 @@
 import { describe, expect, it } from 'vitest';
-import { botDefaultsPayload, botSummaryPayload } from '../src/dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
   it('keeps every editable Bot Defaults field in the aggregated /api/bots row', () => {
     const row = botDefaultsPayload(
-      { larkAppId: 'app_contract', botName: 'BotContract', cliId: 'codex', model: 'gpt-5' },
+      {
+        larkAppId: 'app_contract',
+        botName: 'BotContract',
+        cliId: 'codex',
+        cliRuntime: { id: 'vendor-codex', executable: 'vendor-codex' },
+        model: 'gpt-5',
+        modelBackendVariant: 'max',
+        nativeSubagentRuntime: { model: { mode: 'custom', value: 'GPT-5.6-Sol' } },
+      },
       {},
     );
     const editableFields = [
-      'agentSelectionKey', 'autoGrantRequestCards', 'autoStartOnGroupJoin',
-      'autoStartOnGroupJoinPrompt', 'autoStartOnNewTopic', 'backendType',
-      'botToBotSameDir', 'brandLabel', 'canTalkDaemonCommands', 'codexAppCleanInput',
-      'customPassthroughCommands', 'defaultOncall', 'defaultWorkingDir',
-      'defaultWorkingDirAutoWorktree', 'disableStreamingCard', 'docSubscribeDefaultMode',
-      'env', 'launchShell', 'maxLiveWorkers', 'messageQuotaDefaultLimit', 'model',
-      'overloadAlert', 'p2pMode', 'privateCard', 'regularGroupMentionMode',
-      'regularGroupReplyMode', 'restrictGrantCommands', 'riff', 'sandbox', 'sandboxPaths',
-      'silentTurnReactions', 'skillInjection', 'startupCommands', 'substituteMode',
-      'summaryRange', 'writableTerminalLinkInCard',
+      'larkAppId', 'botName', 'cliId', 'cliRuntime', 'model', 'modelBackendVariant', 'agentSelectionKey', 'online',
+      'displayName', 'larkBotName',
+      'defaultOncall', 'defaultWorkingDir', 'defaultWorkingDirAutoWorktree',
+      'autoboundChatCount', 'brandLabel',
+      'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType',
+      'usageDisplay', 'usageSupported',
+      'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
+      'codexAppCleanInput', 'writableTerminalLinkInCard', 'privateCard',
+      'thinkingCard', 'thinkingCardToolResult', 'senderTag', 'overloadAlert', 'botToBotSameDir', 'quotaFallbackBot',
+      'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
+      'autoStartOnNewTopic',
+      'summaryRange', 'summaryMemory', 'summaryMemoryPath',
+      'regularGroupReplyMode', 'regularGroupMentionMode', 'docSubscribeDefaultMode',
+      'substituteMode', 'feedback', 'replyStyle',
+      'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen',
+      'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
+      'envelopeInjection', 'codexAuthSync',
+      'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
+      'maxLiveWorkers', 'logicalSessionCount', 'residentSessionCount', 'dormantSessionCount',
+      'nativeSubagentRuntime',
+      'sessionOwnerReminder',
+      'startupCommands', 'customPassthroughCommands', 'canTalkDaemonCommands', 'launchShell', 'env',
+      'riff', 'skills',
     ];
     expect(Object.keys(row)).toEqual(expect.arrayContaining(editableFields));
   });
 
-  it('includes authoritative cliId in group roster bot summaries', () => {
-    expect(botSummaryPayload({
-      larkAppId: 'cli_traex',
-      botName: 'TraeX',
-      botAvatarUrl: 'https://example.test/avatar.png',
-      cliId: 'traex',
-    })).toEqual({
-      larkAppId: 'cli_traex',
-      botName: 'TraeX',
-      botAvatarUrl: 'https://example.test/avatar.png',
-      cliId: 'traex',
+  it('exposes native subagent policy only in private Bot Defaults payloads', () => {
+    const nativeSubagentRuntime = {
+      model: { mode: 'custom' as const, value: 'GPT-5.6-Sol' },
+      reasoningEffort: { mode: 'custom' as const, value: 'ultra' as const },
+    };
+    const descriptor = { larkAppId: 'app_traex', cliId: 'traex', nativeSubagentRuntime };
+
+    expect(botDefaultsPayload(descriptor, {})).toMatchObject({ nativeSubagentRuntime });
+    expect(botDefaultsPayload(descriptor, undefined, 'offline')).toMatchObject({ nativeSubagentRuntime });
+    expect(botSummaryPayload(descriptor)).not.toHaveProperty('nativeSubagentRuntime');
+  });
+
+  it('normalizes the Codex auth policy to the upgrade-compatible shared default', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {})).toMatchObject({ codexAuthSync: 'shared' });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { codexAuthSync: 'isolated' }))
+      .toMatchObject({ codexAuthSync: 'isolated' });
+  });
+
+  it('exposes feedback policy only in private Bot Defaults payloads', () => {
+    const feedback = { enabled: true, audience: 'requester' };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { feedback })).toMatchObject({ feedback });
+    expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('feedback');
+  });
+
+  it('normalizes quota fallback only in the private Bot Defaults payload', () => {
+    const quotaFallbackBot = { enabled: true, targetAppId: 'cli_backup', kinds: ['rate'], message: ' Take over. ' };
+    expect(botDefaultsPayload({ larkAppId: 'cli_source' }, { quotaFallbackBot }))
+      .toMatchObject({ quotaFallbackBot: { ...quotaFallbackBot, message: 'Take over.' } });
+    expect(botDefaultsPayload({ larkAppId: 'cli_source' }, { quotaFallbackBot: { ...quotaFallbackBot, targetAppId: 'ou_wrong' } }))
+      .toMatchObject({ quotaFallbackBot: null });
+    expect(botSummaryPayload({ larkAppId: 'cli_source' })).not.toHaveProperty('quotaFallbackBot');
+  });
+
+  it('exposes only the normalized sparse reply style in private Bot Defaults payloads', () => {
+    const replyStyle = {
+      recipes: false,
+      theme: 'vivid',
+      recipePrompt: '  先说风险  ',
+      layoutColors: { result: 'green', blocked: 'laser', unknown: 'blue' },
+      layoutTags: { result: '', risk: '请确认', progress: 42 },
+    };
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { replyStyle })).toMatchObject({
+      replyStyle: {
+        recipes: false,
+        theme: 'vivid',
+        recipePrompt: '先说风险',
+        layoutColors: { result: 'green' },
+        layoutTags: { result: '', risk: '请确认' },
+      },
     });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { replyStyle: 'secret-looking-invalid' }))
+      .toMatchObject({ replyStyle: null });
+    expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('replyStyle');
+  });
+
+  it('keeps executable runtime details out of public group roster summaries', () => {
+    const cliRuntime = {
+      id: 'vendor-codex',
+      displayName: 'Vendor Codex',
+      executable: 'vendor-codex',
+      update: { provider: 'auto' as const },
+    };
+    expect(botSummaryPayload({
+      larkAppId: 'cli_vendor',
+      botName: 'Vendor Bot',
+      botAvatarUrl: 'https://example.test/avatar.png',
+      cliId: 'codex',
+      cliRuntime,
+      cliPathOverride: '/private/legacy/vendor-codex',
+    })).toEqual({
+      larkAppId: 'cli_vendor',
+      botName: 'Vendor Bot',
+      botAvatarUrl: 'https://example.test/avatar.png',
+      cliId: 'codex',
+    });
+  });
+
+  it('carries a legacy path only in the private Bot Defaults payload', () => {
+    const daemon = {
+      larkAppId: 'cli_legacy',
+      cliId: 'codex',
+      cliPathOverride: '/private/legacy/vendor-codex',
+    };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      cliPathOverride: '/private/legacy/vendor-codex',
+    });
+    expect(botSummaryPayload(daemon)).toEqual({
+      larkAppId: 'cli_legacy',
+      botName: undefined,
+      cliId: 'codex',
+    });
+  });
+
+  it('keeps cliRuntime in both success and degraded Bot Defaults rows', () => {
+    const cliRuntime = { id: 'vendor-codex', executable: 'vendor-codex' };
+    const daemon = { larkAppId: 'cli_vendor', cliId: 'codex', cliRuntime };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ cliRuntime });
+    expect(botDefaultsPayload(daemon, undefined, 'offline')).toMatchObject({ cliRuntime, error: 'offline' });
   });
 
   it('includes authoritative cliId in /api/bots success and error rows', () => {
@@ -130,6 +237,30 @@ describe('dashboard bot payload helpers', () => {
       .toMatchObject({ codexAppCleanInput: true });
   });
 
+  it('projects pinStreamingCard as an explicit default-off boolean', () => {
+    const daemon = { larkAppId: 'app_pin', botName: 'Pin', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ pinStreamingCard: false });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: true }))
+      .toMatchObject({ pinStreamingCard: true });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: false }))
+      .toMatchObject({ pinStreamingCard: false });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: 'true' }))
+      .toMatchObject({ pinStreamingCard: false });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: 1 }))
+      .toMatchObject({ pinStreamingCard: false });
+    expect(botDefaultsPayload(daemon, { pinStreamingCard: null }))
+      .toMatchObject({ pinStreamingCard: false });
+  });
+
+  it('projects hook envelope injection so the dashboard preserves it after refresh', () => {
+    const daemon = { larkAppId: 'app_claude', botName: 'Claude', cliId: 'claude-code' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ envelopeInjection: 'off' });
+    expect(botDefaultsPayload(daemon, { envelopeInjection: 'auto' }))
+      .toMatchObject({ envelopeInjection: 'auto' });
+    expect(botDefaultsPayload(daemon, { envelopeInjection: 'invalid' }))
+      .toMatchObject({ envelopeInjection: 'off' });
+  });
+
   it('projects the usage-display mode, defaulting to streaming and honoring legacy/off', () => {
     const daemon = { larkAppId: 'app_usage', botName: 'Usage', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({ usageDisplay: 'streaming' });
@@ -211,6 +342,29 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload(daemon, { defaultWorkingDir: 123 }).defaultWorkingDir).toBeNull();
   });
 
+  it('passes through workingDir (string) and normalizes missing to null', () => {
+    // 克隆弹窗靠这一行判断源 Bot 是 card 还是 fixed 目录形态。少了它，
+    // 只有 workingDir 的源会被按 fixed 预填，目标带上 defaultWorkingDir:'~'，
+    // 在后端 `defaultWorkingDir ?? workingDir` 里把源目录静默遮蔽掉。
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, { workingDir: '/repo/my-project' })).toMatchObject({
+      workingDir: '/repo/my-project',
+    });
+    // Missing / non-string → null（fixed 形态的 bot 不带 workingDir）。
+    expect(botDefaultsPayload(daemon, {}).workingDir).toBeNull();
+    expect(botDefaultsPayload(daemon, { workingDir: 123 }).workingDir).toBeNull();
+  });
+
+  it('projects the daemon schedule working directory as a non-empty string or null', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: '/srv/botmux' })).toMatchObject({
+      scheduleWorkingDir: '/srv/botmux',
+    });
+    expect(botDefaultsPayload(daemon, {}).scheduleWorkingDir).toBeNull();
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: 123 }).scheduleWorkingDir).toBeNull();
+    expect(botDefaultsPayload(daemon, { scheduleWorkingDir: '   ' }).scheduleWorkingDir).toBeNull();
+  });
+
   it('defaults auto grant request cards on and preserves explicit off', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({
@@ -218,6 +372,17 @@ describe('dashboard bot payload helpers', () => {
     });
     expect(botDefaultsPayload(daemon, { autoGrantRequestCards: false })).toMatchObject({
       autoGrantRequestCards: false,
+    });
+  });
+
+  it('projects only supported default grant durations', () => {
+    const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
+    expect(botDefaultsPayload(daemon, {})).toMatchObject({ grantDefaultDurationMs: null });
+    expect(botDefaultsPayload(daemon, { grantDefaultDurationMs: 8 * 60 * 60 * 1000 })).toMatchObject({
+      grantDefaultDurationMs: 8 * 60 * 60 * 1000,
+    });
+    expect(botDefaultsPayload(daemon, { grantDefaultDurationMs: 2 * 60 * 60 * 1000 })).toMatchObject({
+      grantDefaultDurationMs: null,
     });
   });
 
@@ -240,6 +405,8 @@ describe('dashboard bot payload helpers', () => {
   it('projects dashboard summary range for /api/bots', () => {
     const daemon = { larkAppId: 'app_a', botName: 'BotA', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, {})).toMatchObject({
+      summaryMemory: false,
+      summaryMemoryPath: 'summary.md',
       summaryRange: {
         limit: 50,
         sinceHours: 24,
@@ -247,7 +414,11 @@ describe('dashboard bot payload helpers', () => {
     });
     expect(botDefaultsPayload(daemon, {
       summaryRange: { limit: 12, sinceHours: 6 },
+      summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
     })).toMatchObject({
+      summaryMemory: true,
+      summaryMemoryPath: '/tmp/botmux-summary.md',
       summaryRange: {
         limit: 12,
         sinceHours: 6,
@@ -271,5 +442,41 @@ describe('dashboard bot payload helpers', () => {
         sinceHours: 0,
       },
     });
+  });
+
+  it('emits brand in the group roster summary only when set (so the console link picks the right host)', () => {
+    // 国际版 lark bot：brand 带出,前端据此拼 open.larksuite.com/app/...。
+    expect(botSummaryPayload({ larkAppId: 'cli_lark', botName: 'LarkBot', cliId: 'codex', brand: 'lark' }))
+      .toMatchObject({ larkAppId: 'cli_lark', brand: 'lark' });
+    // feishu bot(缺省)：不下发 brand,前端 normalizeBrand 兜底 feishu.cn。
+    expect(botSummaryPayload({ larkAppId: 'cli_feishu', botName: 'FeishuBot', cliId: 'codex' }))
+      .not.toHaveProperty('brand');
+  });
+
+  it('emits brand in Bot Defaults rows (success + degraded) so the config-page link picks the right host', () => {
+    const lark = { larkAppId: 'cli_lark', botName: 'LarkBot', cliId: 'codex', brand: 'lark' };
+    expect(botDefaultsPayload(lark, {})).toMatchObject({ brand: 'lark' });
+    expect(botDefaultsPayload(lark, undefined, 'http_503')).toMatchObject({ brand: 'lark', error: 'http_503' });
+    // feishu(缺省)：不带 brand,前端兜底 feishu。
+    expect(botDefaultsPayload({ larkAppId: 'cli_feishu', botName: 'FeishuBot', cliId: 'codex' }, {}))
+      .not.toHaveProperty('brand');
+  });
+
+  it('brandMapByAppId maps appId→brand and fails safe to an empty map when config is unreadable', () => {
+    // 正常：按 appId 建 brand 映射（feishu bot 的 brand 为 undefined，仍入表）。
+    const map = brandMapByAppId(() => [
+      { larkAppId: 'cli_lark', brand: 'lark' },
+      { larkAppId: 'cli_feishu' },
+    ]);
+    expect(map.get('cli_lark')).toBe('lark');
+    expect(map.get('cli_feishu')).toBeUndefined();
+    expect(map.size).toBe(2);
+
+    // ⭐失败安全：loadBotConfigs 在 bots.json 未建 / 不可读 / BOTS_CONFIG 缺失时
+    // 会抛——必须吞掉返回空 Map,让冷缓存 /api/groups 与 /api/bots 仍基于
+    // DaemonRegistry 走降级 roster（前端 normalizeBrand 兜底 feishu),而非 500。
+    const empty = brandMapByAppId(() => { throw new Error('bots.json not found'); });
+    expect(empty.size).toBe(0);
+    expect(empty.get('cli_anything')).toBeUndefined();
   });
 });

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CLI_SELECT_OPTIONS,
   CLI_SELECT_TREE,
+  CLI_SELECTION_ALIASES,
   resolveCliSelection,
   lookupCliSelection,
   selectionKeyForBot,
@@ -62,15 +63,28 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(resolveCliSelection('codex-app')).toEqual({ cliId: 'codex-app' });
   });
 
-  it('cascades TRAE (CoCo) into one submenu of coco + traex (no top-level coco/traex)', () => {
+  it('cascades TRAE CLI into a current-first submenu without changing adapter ids', () => {
     const trae = CLI_SELECT_TREE.find((g) => g.key === 'trae');
-    expect(trae?.label).toBe('TRAE (CoCo)');
-    expect(trae?.children?.map((c) => c.key)).toEqual(['coco', 'traex']);
+    expect(trae?.label).toBe('TRAE CLI');
+    expect(trae?.children?.map((c) => c.key)).toEqual(['traex', 'coco']);
+    expect(trae?.children?.map((c) => c.label)).toEqual([
+      'TRAE CLI 2.0（推荐；traex / traecli）',
+      'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
+    ]);
     expect(trae?.option).toBeUndefined();
     expect(CLI_SELECT_TREE.find((g) => g.key === 'coco')).toBeUndefined();
     expect(CLI_SELECT_TREE.find((g) => g.key === 'traex')).toBeUndefined();
     expect(resolveCliSelection('coco')).toEqual({ cliId: 'coco' });
     expect(resolveCliSelection('traex')).toEqual({ cliId: 'traex' });
+    const flatKeys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(flatKeys.indexOf('traex')).toBe(flatKeys.indexOf('coco') - 1);
+  });
+
+  it('keeps traecli as an input-only alias of the TRAE CLI 2.0 adapter', () => {
+    expect(CLI_SELECTION_ALIASES).toMatchObject({ traecli: 'traex' });
+    expect(CLI_SELECT_OPTIONS.map((o) => o.key)).not.toContain('traecli');
+    expect(lookupCliSelection('traecli')).toBe(lookupCliSelection('traex'));
+    expect(resolveCliSelection('traecli')).toEqual({ cliId: 'traex' });
   });
 
   it('keeps Pi and Oh My Pi as adjacent top-level leaves', () => {
@@ -86,8 +100,22 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(flatKeys[fi + 1]).toBe('oh-my-pi');
   });
 
-  it('cascades Mira into one submenu of Mira App + Mir CLI (no top-level mir)', () => {
-    const mira = CLI_SELECT_TREE.find((g) => g.key === 'mira');
+  it('cascades OpenCode into one submenu of OpenCode + OpenCode 2 (no top-level opencode2)', () => {
+    const opencode = CLI_SELECT_TREE.find((g) => g.key === 'opencode');
+    expect(opencode?.label).toBe('OpenCode');
+    expect(opencode?.children?.map((c) => c.key)).toEqual(['opencode', 'opencode2']);
+    expect(opencode?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'opencode2')).toBeUndefined();
+    expect(resolveCliSelection('opencode')).toEqual({ cliId: 'opencode' });
+    expect(resolveCliSelection('opencode2')).toEqual({ cliId: 'opencode2' });
+    // flat list: both resolvable, opencode2 folded right under opencode
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('opencode');
+    expect(keys).toContain('opencode2');
+    expect(keys.indexOf('opencode2')).toBe(keys.indexOf('opencode') + 1);
+  });
+
+  it('cascades Mira into one submenu of Mira App + Mir CLI (no top-level mir)', () => {    const mira = CLI_SELECT_TREE.find((g) => g.key === 'mira');
     expect(mira?.children?.map((c) => c.key)).toEqual(['mira', 'mir']);
     expect(mira?.option).toBeUndefined();
     // mir is no longer a separate top-level entry — it lives under the Mira group.
@@ -245,6 +273,18 @@ describe('stripWrapperUnsafeArgs', () => {
     ])).toEqual(['--session-id', 'x', '--model', 'm']);
   });
 
+  // Regression: aiden's own launcher injects codex's --dangerously-bypass-hook-trust,
+  // so botmux passing it too made codex's clap see it twice → "cannot be used multiple
+  // times" and spawn aborted. Strip botmux's redundant copy for aiden wrappers.
+  it('strips the codex --dangerously-bypass-hook-trust flag (aiden injects its own)', () => {
+    expect(stripWrapperUnsafeArgs([
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
+      '--no-alt-screen',
+      '--model', 'm',
+    ])).toEqual(['--dangerously-bypass-approvals-and-sandbox', '--no-alt-screen', '--model', 'm']);
+  });
+
   it('leaves args untouched when nothing is unsafe', () => {
     expect(stripWrapperUnsafeArgs(['resume', 'cid', '--model', 'm'])).toEqual(['resume', 'cid', '--model', 'm']);
   });
@@ -307,6 +347,33 @@ describe('buildWrappedLaunch', () => {
   it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
     const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
     expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
+  });
+
+  // Regression: aiden's launcher injects codex's --dangerously-bypass-hook-trust itself,
+  // so botmux's copy (codex.ts buildArgs, gated by bypassCodexHookTrust) reaching the
+  // launcher made codex see the flag twice → `error: the argument
+  // '--dangerously-bypass-hook-trust' cannot be used multiple times` and spawn aborted.
+  // The approval/sandbox bypass is a distinct flag aiden does NOT inject → kept.
+  it('strips the codex --dangerously-bypass-hook-trust for aiden x codex (aiden injects its own)', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual([
+      'x',
+      'codex',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
   // Regression (only reproduces on cjadk codex): cjadk's `code` subcommand defines

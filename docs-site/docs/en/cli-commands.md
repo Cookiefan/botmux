@@ -5,9 +5,9 @@ Manage the daemon and sessions from the terminal.
 | Command | Description |
 |------|------|
 | `botmux setup` | Interactive configuration (first run / add / edit / delete a bot) |
-| `botmux start` | Start the daemon (managed by PM2) |
+| `botmux start [--companion-secret-file <path> --companion-bot <appId>]` | Start the daemon. Supplying both companion options enables the closed local API for exactly one isolated test Bot; see [Local Companion API](/en/companion-api) |
 | `botmux stop` | Stop the daemon |
-| `botmux restart [--include-pm2]` | Restart the daemon (automatically restores active sessions); `--include-pm2` also restarts botmux's PM2 God daemon |
+| `botmux restart [--companion-secret-file <path> --companion-bot <appId>]` | Restart the daemon and restore active sessions; accepts the same closed Companion API options as `start` |
 | `botmux logs [--lines N]` | View logs |
 | `botmux status` | View daemon status |
 | `botmux upgrade` | Upgrade to the latest version |
@@ -15,7 +15,7 @@ Manage the daemon and sessions from the terminal.
 | `botmux delete <id>` (aliases `del`/`rm`) | Close the specified session, with ID prefix matching |
 | `botmux delete all` | Close all active sessions |
 | `botmux delete stopped` | Clean up zombie sessions whose processes have exited |
-| `botmux dashboard` | Print a Web Dashboard URL once (refreshes the token each time) |
+| `botmux dashboard [current\|rotate]` | Get the current Dashboard login URL, creating the first token if absent; `rotate` explicitly replaces an existing token |
 
 When the daemon is online, `botmux delete` first asks the owning daemon to run
 the same lifecycle teardown as `/close`: evict the in-memory active session,
@@ -45,7 +45,9 @@ Session info is inferred automatically from ancestor-process markers, so the age
 | Command | Description |
 |------|------|
 | `botmux send [content]` | Send a message to the current topic (stdin / heredoc / `--content-file`; `--images`/`--files`/`--videos`/`--card-file`/`--card-json`/`--mention`) |
-| `botmux bots list` | List the bots in the current group (including open_id) |
+| `botmux card patch --message-id <om_xxx> (--card-file <path> \| --card-json <json>)` | Update a previously sent custom card in place (no new message; the messageId comes from the send output) |
+| `botmux bots list` | List the bots in the current group (including open_id); `--scope team [--team <id>]` discovers same-team, opted-in agents across machines (by specialty) |
+| `botmux bots invite --chat <chatId> --team <id> --agent <appId>...` | Add same-team agents + their owners into a group you're already in (auto-adds the platform app first if absent) |
 | `botmux history [--limit N]` | Pull the session history (JSON) |
 | `botmux quoted <message_id>` | Pull a single quoted message (JSON) |
 | `botmux schedule add/list/remove/pause/resume/run` | Manage scheduled tasks |

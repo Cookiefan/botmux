@@ -60,6 +60,29 @@ describe('mergeQueuedCliInput', () => {
     })).toBe(false);
   });
 
+  it('never merges a turn that carries an automatic native title', () => {
+    const pending = [{
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      nativeSessionTitlePrompt: 'first task',
+      turnId: 't1',
+    }];
+
+    expect(mergeQueuedCliInput(pending, { content: 'second task', turnId: 't2' })).toBe(false);
+    expect(pending).toEqual([{
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      nativeSessionTitlePrompt: 'first task',
+      turnId: 't1',
+    }]);
+
+    expect(mergeQueuedCliInput([{ content: 'ordinary', turnId: 't1' }], {
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      turnId: 't2',
+    })).toBe(false);
+  });
+
   it('never merges queued explicit meeting IM turns or batches them on one live origin', () => {
     const pending = [{ content: 'human A', turnId: 'im-1', vcMeetingImTurnOrigin: imOrigin }];
     expect(mergeQueuedCliInput(pending, {
@@ -142,11 +165,16 @@ describe('initial prompt args deferral', () => {
 });
 
 describe('durable turn queue boundary', () => {
-  it('routes an args-baked cold durable prompt through the owned queue', () => {
+  it('routes an args-baked cold durable prompt through the owned queue by default', () => {
     expect(shouldDeferArgsBakedDurablePrompt({
       passesInitialPromptViaArgs: true,
       adoptMode: false,
       dispatchAttempt: 1,
+    })).toBe(true);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      adoptMode: false,
+      queuedActivationToken: 'activation',
     })).toBe(true);
     expect(shouldDeferArgsBakedDurablePrompt({
       passesInitialPromptViaArgs: true,
@@ -161,6 +189,21 @@ describe('durable turn queue boundary', () => {
       passesInitialPromptViaArgs: true,
       adoptMode: true,
       dispatchAttempt: 1,
+    })).toBe(false);
+  });
+
+  it('keeps a fresh durable prompt on argv only for an adapter that guarantees it', () => {
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      durableInitialPromptViaArgs: true,
+      adoptMode: false,
+      dispatchAttempt: 1,
+    })).toBe(false);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      durableInitialPromptViaArgs: true,
+      adoptMode: false,
+      queuedActivationToken: 'activation',
     })).toBe(false);
   });
 

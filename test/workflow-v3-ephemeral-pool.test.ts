@@ -16,11 +16,65 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wf-v3-pool-'));
 });
 
-afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+afterEach(async () => {
+  // The pool deliberately fire-and-forgets its diagnostic log writes
+  // (`void appendLine(...)` in ephemeral-pool.ts — each one mkdir+append into
+  // the attempt dir). A straggler landing after runNode resolves can RECREATE
+  // a directory the recursive delete just emptied, which rmSync's internal
+  // maxRetries never wins: they retry the same rmdir, they do not re-walk.
+  // An outer retry restarts the whole recursive walk from a fresh readdir, and
+  // the writers all finish within milliseconds, so a couple of spaced re-walks
+  // are deterministic where a single walk (however many inner retries) is not.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt >= 4 || (code !== 'ENOTEMPTY' && code !== 'EBUSY')) throw err;
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
 });
 
 describe('v3 ephemeral pool', () => {
+  it('honors the host-neutral attempt lease before resolving credentials or spawning', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const controller = new AbortController();
+    controller.abort('lease-cancelled');
+    const req = request();
+    req.attemptLease = { attemptId: req.attemptId, signal: controller.signal };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => {
+        throw new Error('must not resolve credentials for an aborted lease');
+      },
+    });
+
+    await expect(pool.runNode(req)).resolves.toMatchObject({
+      status: 'cancelled',
+      cancelReason: 'lease-cancelled',
+    });
+    expect(factory.lastOpts).toBeUndefined();
+  });
+
+  it('rejects an attempt lease whose durable id disagrees with the request', async () => {
+    const req = request();
+    req.attemptLease = {
+      attemptId: 'different/attempts/001',
+      signal: new AbortController().signal,
+    };
+    const pool = createEphemeralPool({
+      factory: factoryFor(new ScriptedWorker()),
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    await expect(pool.runNode(req)).rejects.toThrow(/attempt lease .* does not match request/);
+  });
+
   it('spawns a goal-mode worker with frozen bot snapshot and resolves after final_output', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);
@@ -36,7 +90,7 @@ describe('v3 ephemeral pool', () => {
     await waitFor(() => factory.lastOpts !== undefined);
     expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'active' });
     await worker.waitForInit();
-    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok', viewToken: 'view-tok' });
     expect(worker.rawInputs).toEqual([]);
     worker.emitMessage({ type: 'prompt_ready' });
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
@@ -55,7 +109,7 @@ describe('v3 ephemeral pool', () => {
     expect(result).toMatchObject({
       status: 'ok',
       manifestPath: join(req.attemptDir, 'manifest.json'),
-      sessionInfo: { webPort: 3001, token: 'tok' },
+      sessionInfo: { webPort: 3001, token: 'tok', viewToken: 'view-tok' },
     });
     expect(factory.lastOpts?.cwd).toBe('/work/repo');
     expect(factory.lastOpts?.env[GOAL_ENV.V3_MARKER]).toBe('1');
@@ -64,6 +118,41 @@ describe('v3 ephemeral pool', () => {
     expect(worker.init?.larkAppSecret).toBe('secret');
     expect(worker.init?.prompt).toBe('');
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
+  });
+
+  it('does not carry the PM2 graceful-exit sentinel into the ephemeral worker env', async () => {
+    // The v3 ephemeral worker forks straight from the daemon (not via
+    // workerForkEnv), so the daemon's PM2 graceful-exit sentinel would ride
+    // process.env into it unless stripped. Harmless today (the worker doesn't
+    // read the graceful helper) but the "only daemon/dashboard carry it"
+    // invariant must hold — pin it so a refactor can't silently reintroduce it.
+    const { PM2_GRACEFUL_EXIT_CODE_ENV } = await import('../src/pm2-graceful-exit.js');
+    const prev = process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
+    process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = '90';
+    try {
+      const worker = new ScriptedWorker();
+      const factory = factoryFor(worker);
+      const pool = createEphemeralPool({
+        factory,
+        workerPath: '/tmp/worker.js',
+        quiesceMs: 1,
+        resolveLarkAppSecret: () => 'secret',
+      });
+      const promise = pool.runNode(request());
+      await waitFor(() => factory.lastOpts !== undefined);
+      expect(factory.lastOpts?.env[PM2_GRACEFUL_EXIT_CODE_ENV]).toBeUndefined();
+      // Teardown so the run promise resolves and doesn't leak a timer.
+      await worker.waitForInit();
+      worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+      worker.emitMessage({ type: 'prompt_ready' });
+      worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+      await waitFor(() => worker.kills.includes('SIGTERM'));
+      worker.emitExit(0);
+      await promise;
+    } finally {
+      if (prev === undefined) delete process.env[PM2_GRACEFUL_EXIT_CODE_ENV];
+      else process.env[PM2_GRACEFUL_EXIT_CODE_ENV] = prev;
+    }
   });
 
   it('threads the run chat binding into worker init so CLI children get real BOTMUX_* identity env', async () => {
@@ -182,11 +271,12 @@ describe('v3 ephemeral pool', () => {
     await worker.waitForInit();
     expect(readyInfos).toEqual([]);
 
-    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok', viewToken: 'view-tok' });
     expect(readyInfos).toEqual([{
       sessionId: expect.any(String),
       webPort: 3001,
       token: 'tok',
+      viewToken: 'view-tok',
       ptyLogPath: join(req.attemptDir, 'pty.log'),
     }]);
     expect(factory.lastOpts?.env.BOTMUX_WORKFLOW_PTY_LOG_PATH).toBe(join(req.attemptDir, 'pty.log'));
@@ -363,7 +453,7 @@ describe('v3 ephemeral pool', () => {
     expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.GOAL_PATH}`);
     expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.MANIFEST_PATH}`);
     expect(worker.rawInputs[0]).not.toContain(GOAL_ENV.INPUTS_PATH);
-    expect(worker.rawInputs[0]).not.toContain(GOAL_ENV.OUTPUT_DIR);
+    expect(worker.rawInputs[0]).toContain(`$${GOAL_ENV.OUTPUT_DIR}`);
     worker.emitExit(0);
     await promise;
   });
@@ -453,7 +543,9 @@ describe('v3 ephemeral pool', () => {
     const cmd = buildGoalCommand(request());
     expect(cmd.startsWith(`${GOAL_COMMAND} `)).toBe(true);
     expect(cmd).toContain(`$${GOAL_ENV.GOAL_PATH}`);
+    expect(cmd).toContain(`$${GOAL_ENV.OUTPUT_DIR}`);
     expect(cmd).toContain(`$${GOAL_ENV.MANIFEST_PATH}`);
+    expect(cmd).toContain('manifest paths are relative to output dir');
     expect(cmd).not.toContain(request().env[GOAL_ENV.GOAL_PATH]);
     expect(cmd).not.toContain('schemaVersion');
     expect(cmd).not.toContain('status:"ok"');

@@ -1,4 +1,4 @@
-import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
+import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
 
 export interface PendingCliInput {
   content: string;
@@ -7,9 +7,41 @@ export interface PendingCliInput {
    * receives `content`. */
   logicalContent?: string;
   turnId?: string;
+  replyTurnId?: string;
   dispatchAttempt?: number;
+  codexAppDispatchId?: string;
+  /** Explicit positive steer authorization copied from the daemon ledger entry
+   * (plain-human-interactive turns only). Missing/false ⇒ forced serial. */
+  codexAppSteerable?: true;
+  queuedActivationToken?: string;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+  trustedCaller?: TrustedCaller;
   codexAppInput?: CodexAppTurnInput;
+  /** Best-effort CLI-native title to apply after this exact user input has
+   * reached the CLI. Used by terminal Codex-family CLIs so their resume picker
+   * does not fall back to Botmux's injected routing envelope. */
+  nativeSessionTitle?: string;
+  /** Source text for Codex App semantic title generation. Plain TUI adapters
+   * keep only nativeSessionTitle and ignore this prompt. */
+  nativeSessionTitlePrompt?: string;
+  /**
+   * mojo only: the credential snapshot that arrived WITH this turn.
+   *
+   * Carried on the queue item rather than applied at IPC-receive time because the
+   * two are not simultaneous — a turn can sit queued while later messages arrive.
+   * Applying on receipt made two queued credential turns collapse: queueing B then
+   * C executed as A → C → C instead of A → B → C, because both patches landed
+   * before either turn ran.
+   */
+  mojoLivePatch?: import('../adapters/backend/mojo-types.js').MojoLivePatch;
+  /** Per-item at-most-once marker: an input carrying this must NEVER be replayed
+   *  onto an auto-restarted CLI — excluded from both the pendingMessages drain and
+   *  the InflightInputTracker carry-over (codex #776 round-7 finding #1). Set on
+   *  the KEYED idempotency-lease init prompt (from init.atMostOnce); scoped
+   *  per-item so a later PLAIN follow-up turn folded into the same http_async_
+   *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
+   *  predicate and pending-drop both honor it. */
+  noReplay?: boolean;
 }
 
 /**
@@ -66,8 +98,12 @@ export function mergeQueuedCliInput(
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
   if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
+    || tail.codexAppDispatchId || next.codexAppDispatchId
+    || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
+    || tail.nativeSessionTitle || next.nativeSessionTitle
+    || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
     || tail.logicalContent || next.logicalContent) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
   tail.turnId = next.turnId ?? tail.turnId;
@@ -95,12 +131,15 @@ export function pendingInputAllowsTypeAhead(
  * launch-argument path; adopt observes an already-running process. */
 export function shouldDeferArgsBakedDurablePrompt(opts: {
   passesInitialPromptViaArgs: boolean;
+  durableInitialPromptViaArgs?: boolean;
   adoptMode: boolean;
   dispatchAttempt?: number;
+  queuedActivationToken?: string;
 }): boolean {
   return opts.passesInitialPromptViaArgs
+    && !opts.durableInitialPromptViaArgs
     && !opts.adoptMode
-    && opts.dispatchAttempt !== undefined;
+    && (opts.dispatchAttempt !== undefined || !!opts.queuedActivationToken);
 }
 
 /** Some backends (tmux in particular) reject long launch command strings before
@@ -206,6 +245,8 @@ export function shouldStopPendingBatch(
 ): boolean {
   return written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
+    || !!written.queuedActivationToken
+    || !!next?.queuedActivationToken
     || !!written.vcMeetingImTurnOrigin
     || !!next?.vcMeetingImTurnOrigin;
 }
