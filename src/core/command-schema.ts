@@ -48,18 +48,12 @@ export interface CommandSpec {
   readonly aliases?: readonly string[];
   readonly sessionPolicy: CommandSessionPolicy;
   /**
-   * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器。
-   * `newTopic` / `thread` 各自记录在哪一段：`before-passthrough` = 透传闸之前；
-   * `in-daemon-block` = `DAEMON_COMMANDS` 块内（透传闸之后）；缺席 = 该入口没有特判，
-   * 走通用 daemon 分支。`/card` `/cot` 在 PR-2 收敛成两条入口一致（此前 thread 入口无特判，
-   * 无会话时会预建幽灵会话，§9 有意变化）；`/term` 在 thread 入口仍在 DAEMON 块内（透传闸之后），
-   * 差异只在「`/term` 同时进了透传集」这个被 normalizePassthroughCommand 排除的形状上可观测。
+   * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器，从不建会话。
+   * 两条入口同一张表（`/card` `/cot` 在 PR-2 收敛：此前 thread 入口无特判、无会话时会预建
+   * 幽灵会话，§9 有意变化；`/term` 此前在 thread 入口位于透传闸之后，但透传集与 daemon 命令
+   * 恒不相交，先后不可观测，故不再区分位置）。
    */
-  readonly special?: {
-    readonly handler: CommandSpecialHandler;
-    readonly newTopic?: 'before-passthrough' | 'in-daemon-block';
-    readonly thread?: 'before-passthrough' | 'in-daemon-block';
-  };
+  readonly special?: CommandSpecialHandler;
   /** 允许多行正文（`parseSlashCommandInvocation` 的多行豁免）。 */
   readonly multiline?: boolean;
   readonly argShape: CommandArgShape;
@@ -130,18 +124,18 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: '/card', sessionPolicy: 'default', argShape: 'subcommand',
     subcommands: ['show', 'on', 'off', 'pin on', 'pin off', 'pin status'], help: ['help.card'],
-    special: { handler: 'card', newTopic: 'before-passthrough', thread: 'before-passthrough' },
-    notes: '两条入口同一张表（PR-2 收敛：thread 入口原先没有特判，无会话时会预建幽灵会话）；`pin off` 类子命令按整串全等比较',
+    special: 'card',
+    notes: 'PR-2 收敛：thread 入口原先没有特判，无会话时会预建幽灵会话；`pin off` 类子命令按整串全等比较',
   },
   {
     name: '/cot', sessionPolicy: 'default', argShape: 'subcommand',
     subcommands: ['status', 'on', 'off', 'show'], help: ['help.cot'],
-    special: { handler: 'cot', newTopic: 'before-passthrough', thread: 'before-passthrough' },
-    notes: '两条入口同一张表（PR-2 收敛：thread 入口原先没有特判）',
+    special: 'cot',
+    notes: 'PR-2 收敛：thread 入口原先没有特判',
   },
   {
     name: '/term', sessionPolicy: 'default', argShape: 'none', help: ['help.term'],
-    special: { handler: 'term', newTopic: 'before-passthrough', thread: 'in-daemon-block' },
+    special: 'term',
   },
   { name: '/list-slash-command', aliases: ['/slash'], sessionPolicy: 'sessionless', argShape: 'none', help: ['help.list_slash'] },
   {
@@ -160,7 +154,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: '/vc-auth', sessionPolicy: 'sessionless', argShape: 'subcommand',
     subcommands: ['help', 'list', 'revoke', 'rm', 'remove', 'grant', 'add'], help: ['help.vc_auth'],
-    special: { handler: 'vc-auth', newTopic: 'before-passthrough', thread: 'before-passthrough' },
+    special: 'vc-auth',
     notes: '唯一没有 handleCommand case 的命令：只存在于两条入口的前置特判',
   },
   {
@@ -169,7 +163,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   {
     name: '/sessions', sessionPolicy: 'sessionless', argShape: 'none', help: ['help.sessions'],
-    special: { handler: 'sessions', newTopic: 'before-passthrough', thread: 'before-passthrough' },
+    special: 'sessions',
     notes: '授权在 canTalk 级（canTalkForGroupSessions），不是 canOperate',
   },
   {
@@ -219,7 +213,7 @@ export const MULTILINE_COMMANDS: Set<string> = new Set(
   COMMANDS.filter(s => s.multiline).flatMap(namesOf),
 );
 
-/** 路由入口前置特判：命令 → 处理器与两条入口各自的位置。 */
-export const ROUTE_SPECIAL_COMMANDS: ReadonlyMap<string, NonNullable<CommandSpec['special']>> = new Map(
+/** 路由入口前置特判：命令 → 处理器。 */
+export const ROUTE_SPECIAL_COMMANDS: ReadonlyMap<string, CommandSpecialHandler> = new Map(
   COMMANDS.filter(s => s.special).flatMap(s => namesOf(s).map(n => [n, s.special!] as const)),
 );

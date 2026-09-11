@@ -390,6 +390,11 @@ describe('parseTopicHeader —— /repo wt <目标> [分支]', () => {
       expected: { ok: false, kind: 'duplicate_directive', directive: 'repo' },
     },
     {
+      row: 'wt 形式之后的未知 /xxx 同样 fail closed（与普通 /repo 形式一致）',
+      input: '/t /repo wt botmux /goal 干活',
+      expected: { ok: false, kind: 'unknown_directive', token: '/goal' },
+    },
+    {
       row: 'wt 大小写不敏感',
       input: '/t /repo WT botmux ci/x',
       expected: { title: undefined, directives: {}, worktree: { target: 'botmux', branch: 'ci/x' }, prompt: '' },

@@ -12,6 +12,7 @@ import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync, lstatSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { withFileLock } from '../utils/file-lock.js';
 
@@ -558,7 +559,8 @@ export async function removeRepoWorktree(repo: string, worktreePath: string): Pr
 export async function isValidBranchName(name: string): Promise<boolean> {
   const trimmed = name.trim();
   if (!trimmed || trimmed.startsWith('-')) return false;
-  return (await tryGit(['check-ref-format', '--branch', trimmed], process.cwd())) !== null;
+  // cwd 用 tmpdir：check-ref-format 不需要仓库，而 daemon 的 cwd 可能已被删除（ENOENT）。
+  return (await tryGit(['check-ref-format', '--branch', trimmed], tmpdir())) !== null;
 }
 
 /**

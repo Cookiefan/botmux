@@ -70,8 +70,23 @@ function toOraclePhase(phase: SessionPhase): OraclePhase | null {
   }
 }
 
+/**
+ * 决策形状的两处**有意**差异（不是行为差异），比较前归一：
+ *   - oracle 的 passthrough.delivery 四值里 existing / reject_needs_session / reject_needs_active_cli
+ *     只是转写口径（执行段按 ds.worker 实时判，两条入口文案不同），路由器收成 to_session；
+ *   - 路由器给 unknown_slash 的 forward 带上 cmd（入口的 grant 限制闸要查它），oracle 没有。
+ */
+function normalizeLegacy(d: OracleDecision): unknown {
+  if (d.kind === 'passthrough' && d.delivery !== 'cold_start') return { ...d, delivery: 'to_session' };
+  return d;
+}
+function normalizeNext(d: SlashRouteDecision): unknown {
+  if (d.kind === 'forward' && d.reason === 'unknown_slash') return { kind: 'forward', reason: 'unknown_slash' };
+  return d;
+}
+
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
-const INTENTIONAL: Array<(input: SlashRouteInput, legacy: OracleDecision, next: SlashRouteDecision) => boolean> = [
+const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
   // PR-2：thread 入口的 /card /cot 与新话题入口对齐为前置特判（原先走 daemon 分支，无会话时预建幽灵会话）。
   (input, legacy, next) =>
     input.context === 'thread'
@@ -107,8 +122,8 @@ describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
               senderIsBot: sender.senderIsBot, acceptSlashFromBots: sender.acceptSlashFromBots,
             };
             const oracleInput: OracleInput = { ...input, phase: oraclePhase };
-            const legacy = legacySlashRoute(oracleInput);
-            const next = classifySlash(input);
+            const legacy = normalizeLegacy(legacySlashRoute(oracleInput));
+            const next = normalizeNext(classifySlash(input));
             evaluated += 1;
             if (JSON.stringify(legacy) !== JSON.stringify(next)) {
               if (INTENTIONAL.some(rule => rule(input, legacy, next))) continue;
@@ -141,8 +156,8 @@ describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
     for (const c of cases) {
       const cfg = PASSTHROUGH_CONFIGS[0]!;
       const input: SlashRouteInput = { ...c, passthrough: cfg.passthrough, coldStartPassthrough: cfg.coldStart, senderIsBot: false, acceptSlashFromBots: true };
-      const legacy = legacySlashRoute({ ...input, phase: toOraclePhase(c.phase)! });
-      const next = classifySlash(input);
+      const legacy = normalizeLegacy(legacySlashRoute({ ...input, phase: toOraclePhase(c.phase)! }));
+      const next = normalizeNext(classifySlash(input));
       if (INTENTIONAL.some(rule => rule(input, legacy, next))) continue; // 登记过的有意变化（PR-3 级联）
       expect(next, c.text).toEqual(legacy);
     }

@@ -19471,57 +19471,83 @@ async function runPassthroughCascade(args: {
   const { ds, items, anchor, larkAppId, data, ctx, parsed } = args;
   const loc = localeForBot(larkAppId);
   const tag8 = anchor.substring(0, 12);
-  let timedOut = false;
-  for (let i = 0; i < items.length; i += 1) {
-    const item = items[i]!;
-    const last = i === items.length - 1;
-    if (!timedOut) {
-      const idle = await waitForCliIdle(ds);
-      if (idle === 'gone') {
-        logger.warn(`[${tag8}] cascade stopped: worker gone before item ${i + 1}/${items.length}`);
-        await sessionReply(anchor, tr('daemon.cascade_worker_gone', { n: items.length - i }, loc), 'text', larkAppId);
-        return;
-      }
-      if (idle === 'timeout') {
-        timedOut = true;
-        logger.warn(`[${tag8}] cascade: CLI not idle within ${cascadeTiming.idleTimeoutMs}ms, delivering remaining ${items.length - i} item(s) busy`);
-        await sessionReply(anchor, tr('daemon.cascade_timeout', { seconds: Math.round(cascadeTiming.idleTimeoutMs / 1000), n: items.length - i }, loc), 'text', larkAppId);
-      }
+  // 提示是 best-effort：飞书抖动不能中断剩余条目的投递。
+  const notify = async (text: string): Promise<void> => {
+    try { await sessionReply(anchor, text, 'text', larkAppId); } catch (e) {
+      logger.warn(`[${tag8}] cascade notice failed: ${e instanceof Error ? e.message : String(e)}`);
     }
-    if (item.kind === 'passthrough') {
-      const sentAt = ds.cliReadyGeneration ?? 0;
-      deliverPassthroughToExistingSession(ds, item.cmd, item.content, anchor, larkAppId, {
-        messageId: parsed.messageId,
-        replyRootId: args.replyRootId,
-        senderOpenId: args.senderOpenId,
-        senderIsBot: args.senderIsBot,
-        substitute: args.substitute,
-        inThread: !!parsed.threadId,
-        // 最后一条沿用真实 messageId（与单条透传逐字相同）；之前的用派生 id。
-        ...(last ? {} : { turnId: `${parsed.messageId}#c${i + 1}` }),
-      });
-      logger.info(`[${tag8}] cascade ${i + 1}/${items.length}: ${item.cmd}`);
-      if (!last && !timedOut) {
-        const settled = await waitForCommandSettled(ds, sentAt);
-        if (settled === 'gone') {
-          await sessionReply(anchor, tr('daemon.cascade_worker_gone', { n: items.length - i - 1 }, loc), 'text', larkAppId);
+  };
+  const remainingAfter = (i: number) => items.length - i;
+  let delivered = 0;
+  let timedOut = false;
+  try {
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i]!;
+      const last = i === items.length - 1;
+      if (!timedOut) {
+        const idle = await waitForCliIdle(ds);
+        if (idle === 'gone') {
+          logger.warn(`[${tag8}] cascade stopped: worker gone before item ${i + 1}/${items.length}`);
+          await notify(tr('daemon.cascade_worker_gone', { n: remainingAfter(i) }, loc));
           return;
         }
-        if (settled === 'timeout') {
+        if (idle === 'timeout' || idle === 'blocked') {
+          // 超时或限流/卡住：按今天的 busy delivery 语义把剩余条目直接发出。
           timedOut = true;
-          await sessionReply(anchor, tr('daemon.cascade_timeout', { seconds: Math.round(cascadeTiming.idleTimeoutMs / 1000), n: items.length - i - 1 }, loc), 'text', larkAppId);
+          logger.warn(`[${tag8}] cascade: CLI ${idle} before item ${i + 1}/${items.length}, delivering remaining busy`);
+          await notify(tr('daemon.cascade_timeout', { seconds: Math.round(cascadeTiming.idleTimeoutMs / 1000), n: remainingAfter(i) }, loc));
         }
       }
-      continue;
+      if (item.kind === 'passthrough') {
+        const sentAt = ds.cliReadyGeneration ?? 0;
+        deliverPassthroughToExistingSession(ds, item.cmd, item.content, anchor, larkAppId, {
+          messageId: parsed.messageId,
+          replyRootId: args.replyRootId,
+          senderOpenId: args.senderOpenId,
+          senderIsBot: args.senderIsBot,
+          substitute: args.substitute,
+          inThread: !!parsed.threadId,
+          // 最后一条沿用真实 messageId（与单条透传逐字相同）；之前的用派生 id。
+          ...(last ? {} : { turnId: `${parsed.messageId}#c${i + 1}` }),
+        });
+        delivered += 1;
+        logger.info(`[${tag8}] cascade ${i + 1}/${items.length}: ${item.cmd}`);
+        if (!last && !timedOut) {
+          const settled = await waitForCommandSettled(ds, sentAt);
+          if (settled === 'gone') {
+            await notify(tr('daemon.cascade_worker_gone', { n: remainingAfter(i + 1) }, loc));
+            return;
+          }
+          if (settled === 'timeout' || settled === 'blocked') {
+            timedOut = true;
+            await notify(tr('daemon.cascade_timeout', { seconds: Math.round(cascadeTiming.idleTimeoutMs / 1000), n: remainingAfter(i + 1) }, loc));
+          }
+        }
+        continue;
+      }
+      // 正文：以同一条消息（同 messageId → 同 turn / 引用目标）重新进入 thread 入口，正文里
+      // 没有命令 token，路由器判 forward，走与普通消息完全相同的转发链。ctx 原样透传——同一条
+      // inbound 共享同一个接纳状态（入口已 markIngressAdmitted，失败提示不再诱导整条重发）；
+      // cascadeBodyReentry 让入口跳过已跑过的一次性副作用，并绕过级联在飞的推迟闸。
+      const bodyData = {
+        ...data,
+        message: { ...(data?.message ?? {}), content: JSON.stringify({ text: item.text }), message_type: 'text' },
+      };
+      logger.info(`[${tag8}] cascade ${i + 1}/${items.length}: body (${item.text.length} chars)`);
+      await handleThreadReply(bodyData, { ...ctx, cascadeBodyReentry: true });
+      delivered += 1;
     }
-    // 正文：以同一条消息（同 messageId → 同 turn / 引用目标）重新进入 thread 入口，正文里
-    // 没有命令 token，路由器判 forward，走与普通消息完全相同的转发链。
-    const bodyData = {
-      ...data,
-      message: { ...(data?.message ?? {}), content: JSON.stringify({ text: item.text }), message_type: 'text' },
-    };
-    logger.info(`[${tag8}] cascade ${i + 1}/${items.length}: body (${item.text.length} chars)`);
-    await handleThreadReply(bodyData, { ...ctx, ingressAdmission: undefined });
+  } catch (err) {
+    logger.error(`[${tag8}] cascade failed after ${delivered}/${items.length}: ${err instanceof Error ? err.message : String(err)}`);
+    await notify(tr('daemon.cascade_failed', { done: delivered, remaining: items.length - delivered }, loc));
+  } finally {
+    // 定序器收尾：解除在飞标记，把等待期间到达的同话题消息按到达顺序重入。
+    ds.cascadeInFlight = false;
+    const deferred = ds.cascadeDeferred ?? [];
+    ds.cascadeDeferred = undefined;
+    for (const d of deferred) {
+      await handleThreadReply(d.data, d.ctx as RoutingContext);
+    }
   }
 }
 
@@ -20368,6 +20394,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     senderIsBot: senderIsBotForSlashGate,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
   });
+  // grant 限制闸对**认不出**的 `/xxx` 同样要查（改造前 parseSlashCommandInvocation 成功即查，
+  // 与命令是否注册无关）：受限成员的 CLI 自定义斜杠命令不能绕过这道闸进 CLI。
+  if (slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
+    const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, slashDecision.cmd);
+    if (restrictedText) {
+      await commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId })
+        .sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
+  }
   if (isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
@@ -21034,6 +21070,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
+    // 头部只交代规格、没写任务（`/t /repo wt X` 这类）：commitRepoSelection 判"有没有开场输入"时
+    // 把 `pendingCodexAppText !== undefined` 也算在内，而这里它是空串——不清掉就会烧一个空的
+    // `<user_message>` 开场且不打 initialUserTurnPending。清成 undefined 让它走 emptyStart：
+    // 空 prompt fork + 下一条真实消息才是开场，与 pinned 分支的 forkReservedIdleSession 同义。
+    if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) ds.pendingCodexAppText = undefined;
     startAutoWorktreePending(ds, {
       anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId,
       force: forceTopicMode === 'worktree' || !!headerWorktree,
@@ -21811,7 +21852,7 @@ async function handleThreadReplyAdmitted(
     resources.push(...extraResources);
   }
 
-  if (!prepared) learnFromMentions(larkAppId, parsed.mentions);
+  if (!prepared && !ctx.cascadeBodyReentry) learnFromMentions(larkAppId, parsed.mentions);
 
   // 语音消息转写：必须排在会话群自愈命名之前，让转写文本（而非 '[语音]'
   // 占位符）喂给标题生成。prepared 重投路径下 content 已带前缀时幂等跳过。
@@ -21889,7 +21930,7 @@ async function handleThreadReplyAdmitted(
     + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
-  if (!prepared) {
+  if (!prepared && !ctx.cascadeBodyReentry) {
     const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
     emitHookEvent('thread.reply', {
       larkAppId,
@@ -22130,6 +22171,20 @@ async function handleThreadReplyAdmitted(
       && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
     hasAttachments: resources.length > 0,
   });
+  // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
+  // botmux 自己的命令（/close /status …）照常放行。正文项的重入自带 cascadeBodyReentry 标记。
+  if (existingDs?.cascadeInFlight && !ctx.cascadeBodyReentry) {
+    if (slashDecision.kind === 'cascade' || slashDecision.kind === 'cascade_unsupported') {
+      await sessionReply(anchor, tr('daemon.cascade_busy', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+      return;
+    }
+    if (slashDecision.kind === 'forward' || slashDecision.kind === 'passthrough') {
+      (existingDs.cascadeDeferred ??= []).push({ data, ctx: { ...ctx, ingressAdmission: undefined } });
+      markIngressAdmitted(ctx);
+      logger.info(`[${anchor.substring(0, 12)}] deferred ${parsed.messageId.substring(0, 12)} behind an in-flight cascade`);
+      return;
+    }
+  }
   if (slashDecision.kind === 'cascade' || slashDecision.kind === 'cascade_unsupported') {
     const cascadeDs = existingDs!; // 路由器只在活 worker 的相位上给出级联决策
     const cascadeDeps = commandDepsForInvocation({
@@ -22163,6 +22218,7 @@ async function handleThreadReplyAdmitted(
     }
     // 消息已被 detached 的定序器接管：之后的失败由它自己在话题里提示，不再诱导重发。
     markIngressAdmitted(ctx);
+    cascadeDs.cascadeInFlight = true;
     void runPassthroughCascade({
       ds: cascadeDs,
       items: slashDecision.items,
@@ -22179,6 +22235,15 @@ async function handleThreadReplyAdmitted(
       logger.error(`[${anchor.substring(0, 12)}] cascade failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     return;
+  }
+  // grant 限制闸对认不出的 `/xxx` 同样要查（与新话题入口、改造前一致）。
+  if (slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
+    const restrictedText = grantRestrictedSlashCommandText(larkAppId, existingDs?.chatId ?? threadChatId, threadSenderOpenId, slashDecision.cmd);
+    if (restrictedText) {
+      await commandDepsForInvocation({ scope, chatId: ctxChatId, anchor, messageId: parsed.messageId, replyRootId })
+        .sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
   }
   if (isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
@@ -22245,6 +22310,12 @@ async function handleThreadReplyAdmitted(
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'cot') {
       await handleCotCommand(anchor, larkAppId, effectiveThreadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      return;
+    }
+    // /term only hands out a writable link for an ALREADY-live session — it must never
+    // pre-create one; its own canOperate gate (inside the handler) is the sole authority.
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'term') {
+      await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
       return;
     }
     if (slashDecision.kind === 'passthrough') {
@@ -22328,18 +22399,7 @@ async function handleThreadReplyAdmitted(
       else void invocationDeps.sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
-    if (slashDecision.kind === 'daemon' || (slashDecision.kind === 'special' && slashDecision.handler === 'term')) {
-      // /term only hands out a writable link for an ALREADY-live session — it must
-      // never pre-create one. Special-case it before the canOperate gate + the
-      // pre-create block below (mirrors the new-topic route + /card). Its own
-      // canOperate gate (inside the handler) is the sole authority; without this,
-      // /term in a thread with no existingDs would spawn a worker:null phantom
-      // session and pollute the dashboard before replying not_ready/owner_only.
-      // （thread 入口只有 /term 一条 in-daemon-block 特判，见 schema special.thread。）
-      if (slashDecision.kind === 'special') {
-        await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
-        return;
-      }
+    if (slashDecision.kind === 'daemon') {
       // canOperate gate for thread-reply daemon commands — required in every chat
       // (see spawn-path gate above). Denies chat-granted users management commands.
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
@@ -22861,7 +22921,7 @@ async function handleThreadReplyAdmitted(
       markIngressAdmitted(ctx);
       const pendingReplyKey = ds.worktreeCreating
         ? 'daemon.worktree_building_wait'
-        : 'daemon.choose_repo_first';
+        : ds.repoCardMessageId ? 'daemon.choose_repo_first' : 'daemon.choose_repo_no_card';
       await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
@@ -22925,9 +22985,10 @@ async function handleThreadReplyAdmitted(
     // Auto-worktree pending (worktreeCreating) has no repo card to point at — the
     // message IS buffered (folded on commit), so just say "hold on, building worktree"
     // instead of the misleading "pick a repo from the card above".
+    // 头部 `/repo wt` 失败后会停在 pendingRepo 但从没发过选仓卡：别指着一张不存在的卡。
     const pendingReplyKey = (ds.worktreeCreating || ds.pendingRepoCommitInFlight)
       ? 'daemon.worktree_building_wait'
-      : 'daemon.choose_repo_first';
+      : ds.repoCardMessageId ? 'daemon.choose_repo_first' : 'daemon.choose_repo_no_card';
     await sessionReply(anchor, tr(pendingReplyKey, undefined, localeForBot(larkAppId)), 'text', larkAppId);
     return;
   }

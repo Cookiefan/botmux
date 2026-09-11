@@ -7,9 +7,10 @@
  * 里，路由器只回答"是什么"，不做效果。
  *
  * PR-2 的约定：**决策与今天逐字一致**（零语义变化），差分由 test/legacy-oracle 的冻结 oracle
- * 穷举验证。今天两条入口的不一致（thread 里 `/card` `/cot` 没有前置特判、`/term` 在透传闸
- * 之后）通过 schema 的 `special.newTopic / special.thread` 两个字段如实保留；收敛它们是 §9
- * 里 PR-2 的一条有意变化，改的是那两个数据值，不是这里的代码。
+ * 穷举验证；唯一的有意变化（thread 入口 `/card` `/cot` 收敛为前置特判）登记在差分测试的
+ * INTENTIONAL 名单。相位在这里只用两个谓词：有没有会话（sessionPolicy 的 precreate/existing）、
+ * 有没有活 worker（级联识别闸）；"透传送不送得进去"由执行段按 `ds.worker` 实时判，不在这里
+ * 按相位重复猜——§5 矩阵里 worktreeCreating / queued 两格的"拒"因此**没有**被编码。
  *
  * 纯函数：不读配置、不碰会话表。透传集由调用方按入口口径求值（新话题按 live bot 配置；
  * thread 按冻结的 `cliLaunchSnapshot.cliId`，见 R2）后传入。
@@ -99,12 +100,15 @@ export type CascadeItem =
   | { kind: 'body'; text: string };
 
 export type SlashRouteDecision =
-  /** 交给 CLI 当普通消息：没有命令 token / 讨论文本 / bot 发送方被门掉 / 认不出的 `/xxx`。 */
-  | { kind: 'forward'; reason: 'no_slash' | 'discussion' | 'bot_gated' | 'unknown_slash' }
+  /** 交给 CLI 当普通消息：没有命令 token / 讨论文本 / bot 发送方被门掉 / 认不出的 `/xxx`
+   *  （后者带上 `cmd`：入口的 grant 限制闸对认不出的斜杠命令同样要查，与改造前一致）。 */
+  | { kind: 'forward'; reason: 'no_slash' | 'discussion' | 'bot_gated' }
+  | { kind: 'forward'; reason: 'unknown_slash'; cmd: string }
   /** 路由入口的前置特判处理器，不进 handleCommand、不建会话。 */
   | { kind: 'special'; cmd: string; content: string; handler: CommandSpecialHandler }
-  /** 透传给 CLI：冷启动拉起会话 / 送进已有 worker / 两种拒绝（文案不同，如实保留）。 */
-  | { kind: 'passthrough'; cmd: string; content: string; delivery: 'cold_start' | 'existing' | 'reject_needs_session' | 'reject_needs_active_cli' }
+  /** 透传给 CLI：`cold_start` = 无会话但允许冷启动拉起会话；`to_session` = 交给执行段——有活 worker 就
+   *  送 raw_input，否则回"需要活跃 CLI"（执行段按 `ds.worker` 实时判，路由器不重复按相位猜）。 */
+  | { kind: 'passthrough'; cmd: string; content: string; delivery: 'cold_start' | 'to_session' }
   /** botmux 自己的命令，带无会话时的会话政策。 */
   | { kind: 'daemon'; cmd: string; content: string; sessionPolicy: 'sessionless' | 'existing_only' | 'precreate' | 'existing' }
   /** runtime 级联（PR-3）：≥1 条透传命令行 + 可选正文，按书写顺序逐条等 CLI 空闲后送出（§6）。 */
@@ -144,7 +148,7 @@ export function parseRuntimeCascade(text: string, passthrough: ReadonlySet<strin
 }
 
 /** 带 cmd/content 的三类决策（special / passthrough / daemon）——入口里按命令执行的那一段只认这三类。 */
-export type SlashCommandDecision = Extract<SlashRouteDecision, { cmd: string }>;
+export type SlashCommandDecision = Extract<SlashRouteDecision, { cmd: string; content: string }>;
 
 export function isCommandDecision(decision: SlashRouteDecision): decision is SlashCommandDecision {
   return decision.kind === 'special' || decision.kind === 'passthrough' || decision.kind === 'daemon';
@@ -169,48 +173,31 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
     return { kind: 'forward', reason: 'discussion' };
   }
   const { cmd, content } = invocation;
+  // ③ 前置特判（不进 handleCommand、不建会话）。在透传闸之前判，与透传集恒不相交，
+  //    所以先后顺序不可观测。
   const special = ROUTE_SPECIAL_COMMANDS.get(cmd);
-  const entry = input.context === 'new-topic' ? special?.newTopic : special?.thread;
-
-  // ③ 透传闸之前的前置特判。
-  if (special && entry === 'before-passthrough') {
-    return { kind: 'special', cmd, content, handler: special.handler };
-  }
+  if (special) return { kind: 'special', cmd, content, handler: special };
 
   // ④ 透传闸（先于 DAEMON_COMMANDS；两集合恒不相交，顺序因此不可观测）。
   if (input.passthrough.has(cmd)) {
-    const hasSession = input.context === 'thread' && phaseHasSession(input.phase);
+    const hasSession = phaseHasSession(input.phase);
     if (!hasSession && input.coldStartPassthrough.has(cmd)) {
       return { kind: 'passthrough', cmd, content, delivery: 'cold_start' };
     }
-    if (hasSession) {
-      return {
-        kind: 'passthrough', cmd, content,
-        delivery: phaseHasLiveWorker(input.phase) ? 'existing' : 'reject_needs_active_cli',
-      };
-    }
-    // 无会话且不能冷启动：两条入口今天的文案不同，如实区分。
-    return {
-      kind: 'passthrough', cmd, content,
-      delivery: input.context === 'new-topic' ? 'reject_needs_session' : 'reject_needs_active_cli',
-    };
+    return { kind: 'passthrough', cmd, content, delivery: 'to_session' };
   }
 
   // ⑤ DAEMON_COMMANDS。
   if (DAEMON_COMMANDS.has(cmd)) {
-    if (special && entry === 'in-daemon-block') {
-      return { kind: 'special', cmd, content, handler: special.handler };
-    }
     if (isSessionlessCommandInvocation(cmd, content)) {
       return { kind: 'daemon', cmd, content, sessionPolicy: 'sessionless' };
     }
     if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
       return { kind: 'daemon', cmd, content, sessionPolicy: 'existing_only' };
     }
-    const hasSession = input.context === 'thread' && phaseHasSession(input.phase);
-    return { kind: 'daemon', cmd, content, sessionPolicy: hasSession ? 'existing' : 'precreate' };
+    return { kind: 'daemon', cmd, content, sessionPolicy: phaseHasSession(input.phase) ? 'existing' : 'precreate' };
   }
 
-  // ⑥ 认出是 `/xxx` 但不属于任何集合 → 当普通消息转发。
-  return { kind: 'forward', reason: 'unknown_slash' };
+  // ⑥ 认出是 `/xxx` 但不属于任何集合 → 当普通消息转发（cmd 留给入口的 grant 限制闸）。
+  return { kind: 'forward', reason: 'unknown_slash', cmd };
 }

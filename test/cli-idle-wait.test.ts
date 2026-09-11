@@ -27,6 +27,12 @@ describe('waitForCliIdle', () => {
     ds.cliReady = true; ds.cliReadyGeneration = 1;
     expect(await p).toBe('idle');
   });
+  it('limited / stalled 立即返回 blocked，不白等上限；analyzing 算忙', async () => {
+    expect(await waitForCliIdle(view({ lastScreenStatus: 'limited' }))).toBe('blocked');
+    expect(await waitForCliIdle(view({ lastScreenStatus: 'stalled' }))).toBe('blocked');
+    expect(await waitForCommandSettled(view({ lastScreenStatus: 'limited' }), 1)).toBe('blocked');
+    expect(await waitForCliIdle(view({ lastScreenStatus: 'analyzing' }))).toBe('timeout');
+  });
   it('屏幕从 working 回到 idle 即空闲；未知状态按空闲', async () => {
     const ds = view({ lastScreenStatus: 'working' });
     const p = waitForCliIdle(ds);

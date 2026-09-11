@@ -3728,6 +3728,39 @@ describe('runtime passthrough cascade (PR-3)', () => {
     expect(repliedText()).toContain('分条发送');
   });
 
+  it('级联在飞时后到的单条透传排在定序器之后重入（保序），第二条级联 fail closed', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc5');
+    await handleThreadReply(
+      makeEventData('om_casc_5', '/compact 只留登录上下文\n/clear', 'om_root_casc5'),
+      makeCtx('om_root_casc5', 'om_casc_5'),
+    );
+    await tick(15);
+    ds.lastScreenStatus = 'working'; // 第一条真忙
+    await handleThreadReply(makeEventData('om_casc_5b', '/model opus', 'om_root_casc5'), makeCtx('om_root_casc5', 'om_casc_5b'));
+    await handleThreadReply(makeEventData('om_casc_5c', '/model haiku\n/clear', 'om_root_casc5'), makeCtx('om_root_casc5', 'om_casc_5c'));
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文']);
+    expect(repliedText()).toContain('上一条级联还在执行');
+    ds.cliReadyGeneration = 2;
+    ds.lastScreenStatus = 'idle';
+    await tick(120);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear', '/model opus']);
+    expect(ds.cascadeInFlight).toBe(false);
+    expect(ds.cascadeDeferred).toBeUndefined();
+  });
+
+  it('限流（limited）时不白等：剩余条目直接发出并提示', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc6');
+    ds.lastScreenStatus = 'limited';
+    await handleThreadReply(
+      makeEventData('om_casc_6', '/model opus\n/clear', 'om_root_casc6'),
+      makeCtx('om_root_casc6', 'om_casc_6'),
+    );
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus', '/clear']);
+    expect(repliedText()).toContain('直接发出');
+  });
+
   it('单条透传不受影响：仍然立即以真实 messageId 送出', async () => {
     const { raws } = seedLiveThreadSession('om_root_casc4');
     await handleThreadReply(

@@ -42,19 +42,27 @@ function workerLive(ds: CliIdleView): boolean {
   return !!ds.worker && !ds.worker.killed;
 }
 
+/** `ScreenStatus` 五值里只有 `idle`（与尚未收到过 screen_update 的 undefined）算空闲；
+ *  `working` / `analyzing` 是忙，`limited` / `stalled` 是"卡住"——见 {@link screenBlocked}。 */
 function screenIdle(ds: CliIdleView): boolean {
-  // 未知（尚未收到过 screen_update）按空闲处理：`prompt_ready` 已经说明提示符就绪。
-  return ds.lastScreenStatus !== 'working';
+  return ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'idle';
+}
+
+/** 限流（`limited`，daemon 侧有 fresh usageLimit 时无条件改写）或卡住（`stalled`）：提示符
+ *  可能已就绪但轮次没有推进，等下去只会白等到上限。定序器对它们走与超时相同的 busy delivery。 */
+function screenBlocked(ds: CliIdleView): boolean {
+  return ds.lastScreenStatus === 'limited' || ds.lastScreenStatus === 'stalled';
 }
 
 /**
- * 等到 CLI 空闲：worker 活着、提示符曾就绪（cliReady）且屏幕状态不是 `working`。
- * 返回 `'idle'` / `'timeout'` / `'gone'`（worker 没了）。
+ * 等到 CLI 空闲：worker 活着、提示符曾就绪（cliReady）且屏幕状态是 `idle`（或未知）。
+ * 返回 `'idle'` / `'blocked'`（限流或卡住，立即返回）/ `'timeout'` / `'gone'`（worker 没了）。
  */
-export async function waitForCliIdle(ds: CliIdleView): Promise<'idle' | 'timeout' | 'gone'> {
+export async function waitForCliIdle(ds: CliIdleView): Promise<'idle' | 'blocked' | 'timeout' | 'gone'> {
   const started = Date.now();
   for (;;) {
     if (!workerLive(ds)) return 'gone';
+    if (screenBlocked(ds)) return 'blocked';
     if (ds.cliReady && screenIdle(ds)) return 'idle';
     if (Date.now() - started >= cascadeTiming.idleTimeoutMs) return 'timeout';
     await delay(cascadeTiming.pollMs);
@@ -70,11 +78,12 @@ export async function waitForCliIdle(ds: CliIdleView): Promise<'idle' | 'timeout
 export async function waitForCommandSettled(
   ds: CliIdleView,
   sentAtGeneration: number,
-): Promise<'settled' | 'timeout' | 'gone'> {
+): Promise<'settled' | 'blocked' | 'timeout' | 'gone'> {
   const started = Date.now();
   let busySeen = false;
   for (;;) {
     if (!workerLive(ds)) return 'gone';
+    if (screenBlocked(ds)) return 'blocked';
     const gen = ds.cliReadyGeneration ?? 0;
     if (gen > sentAtGeneration) return 'settled';
     const elapsed = Date.now() - started;

@@ -71,3 +71,11 @@ describe('classifySlash 的级联接入条件', () => {
     expect(classifySlash({ ...base, senderIsBot: true, acceptSlashFromBots: false })).toEqual({ kind: 'forward', reason: 'bot_gated' });
   });
 });
+
+describe('MULTILINE_COMMANDS 豁免（§9 补测）', () => {
+  it('/role set 的多行 Markdown 正文仍被当成一条命令（不是讨论文本）', async () => {
+    const { parseSlashCommandInvocation } = await import('../src/core/command-router.js');
+    expect(parseSlashCommandInvocation('/role set\n# 角色\n你是一个 reviewer')).toEqual({ cmd: '/role', content: '/role set\n# 角色\n你是一个 reviewer' });
+    expect(parseSlashCommandInvocation('/role set\n/清单')).toBeNull();
+  });
+});

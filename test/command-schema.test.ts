@@ -70,7 +70,9 @@ describe('command schema ↔ /help 文案', () => {
   });
   it('/help 组装用到的 help.* 键都能在 schema 里找到归属（或属于非命令的节标题/透传/元命令）', () => {
     const src = readFileSync(join(repoRoot, 'src/core/command-handler.ts'), 'utf-8');
-    const helpCase = src.slice(src.indexOf("case '/help': {"), src.indexOf("case '/help': {") + 6000);
+    const helpStart = src.indexOf("case '/help': {");
+    const helpEnd = src.indexOf("\n      case '/", helpStart + 1); // 下一个 case 之前的整个 /help 块
+    const helpCase = src.slice(helpStart, helpEnd > 0 ? helpEnd : undefined);
     const used = new Set([...helpCase.matchAll(/t\('(help\.[a-z_]+)'/g)].map(m => m[1]!));
     const owned = new Set(COMMANDS.flatMap(s => s.help));
     // 不属于任何 daemon 命令的 help 键：节标题、透传/元命令说明等，手工登记，新增时补进来。
@@ -97,12 +99,8 @@ describe('command schema ↔ handleCommand switch', () => {
       expect(cases.has(c), `schema 有 ${c} 但 switch 没有 case`).toBe(true);
     }
   });
-  it('前置特判表：五条命令、新话题全部在透传闸之前；thread 只有 /term 留在 DAEMON 块内', () => {
+  it('前置特判表：五条命令，处理器名与命令名一致', () => {
     expect(sorted(new Set(ROUTE_SPECIAL_COMMANDS.keys()))).toEqual(['/card', '/cot', '/sessions', '/term', '/vc-auth']);
-    for (const [, sp] of ROUTE_SPECIAL_COMMANDS) expect(sp.newTopic).toBe('before-passthrough');
-    for (const c of ['/sessions', '/vc-auth', '/card', '/cot']) {
-      expect(ROUTE_SPECIAL_COMMANDS.get(c)?.thread, c).toBe('before-passthrough');
-    }
-    expect(ROUTE_SPECIAL_COMMANDS.get('/term')?.thread).toBe('in-daemon-block');
+    for (const [cmd, handler] of ROUTE_SPECIAL_COMMANDS) expect(handler).toBe(cmd.slice(1));
   });
 });
