@@ -296,3 +296,21 @@ PR-1 独立有价值；PR-2 若延期，PR-1 不受影响；PR-3 依赖 PR-2 的
 - 透传参数形状（`none` / `token`）按 CLI 实测后再开，首版整行；`/effort` 与 `/fast` 的全局透传不变量不动。
 - 头部 git 运行期失败留下的 `pendingRepo` 状态，是否需要一条"取消并关闭话题"的快捷命令，用一阵再看。
 - 预设别名（`#1361` §8）在 schema 就位后成为"结构化展开"的自然扩展，本设计不做。
+
+## 15. 执行记录
+
+按分期在 `feat/command_op` 上实施时的决策与拿不准的点，供事后追溯。每期以一个标题含「收口」的 commit 作为分界，中间可以有多次提交。
+
+### PR-1 头部 `/repo wt`（2026-09-11 夜）
+
+落地形状与 §8 一致，实施中定下的细节：
+
+- **解析层**（`src/core/topic-header.ts`）：`TopicHeader` 新增 `worktree?: { target, branch? }`，与 `directives.repo` 互斥（两者都算写了 `/repo`，重复即 `duplicate_directive`）。可选分支的两条规则用 token 的 `end` 偏移判"同一行"；粗模式 `BRANCH_TOKEN_RE` 导出供 PR-2 的 schema 参数类型复用。引号包裹的 `"wt"` 是字面量仓库名。新增错误种类 `missing_worktree_target`（`/t /repo wt`、`/t /repo wt /model x`）。
+- **语义层**（`src/core/topic-spec.ts`）：`resolveTopicSpec` 改为 **async**——唯一原因是两次本地 git 查询（`check-ref-format --branch`、`worktree list --porcelain` 归一主 checkout），毫秒级、不联网。新增错误 `repo_not_git` / `branch_invalid` / `worktree_target_exists`，删除 `repo_worktree_unsupported` 及其 i18n。目标目录算法抽成 `resolveWorktreePathForBranch`（`src/services/git-worktree.ts`），并用一条测试钉住它与 `createRepoWorktree` 显式分支分支逐字一致（`test/git-worktree-header-helpers.test.ts`）。
+- **执行层**：`runAutoWorktreeCommit` 加可选 `explicitWorktree`，git 腿走新的 `createExplicitWorktree`（`src/services/default-worktree.ts`，失败即抛）；失败时回 `cmd.repo.worktree_failed`、会话停在 `pendingRepo`、不 fork、不退回基目录。daemon 新话题路径：`pinnedWorkingDir` 先钉成仓库、`pinnedFromBotDefault=false`、`autoWt` 强制为真、`stageClaimedPendingRepoSetup` 按 **`picker`** 落盘（不加 `PendingRepoSetup` 新形状；创建窗口内重启回到选仓卡）。`/t /repo wt X`（无正文）与 `/t /repo X` 同样走 pending → 空跑等下一条。
+- **没做 / 拿不准**：
+  - 头部 `wt` 目前只在**新话题**入口生效；thread 入口只用 `topicHeaderDeclaresSpec` 判"是不是在声明规格"（已含 `worktree`），已有会话里发头部 `wt` 按 D6 拒绝，与其它头部指令一致。
+  - 会话内 `/repo wt` 未动（§8 第 5 条），两处目标解析仍各一份，留给 PR-2 的 schema 消化。
+  - `worktree_target_exists` 只对显式分支查；自动命名的冲突由 `createRepoWorktree` 换下一个候选。
+  - `isValidBranchName` 通过 spawn `git check-ref-format` 实现而不是手写正则：git 的规则有十几条（`.lock` 结尾、`@{`、控制字符…），手抄必然漂移。
+  - 测试环境：本 worktree 的 `node_modules` 按仓库规范 symlink 到 canonical checkout（锁文件逐字一致，未跑 install）。

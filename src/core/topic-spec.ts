@@ -8,8 +8,11 @@
  * 人刚敲完回车的那一刻，改完重发的成本远低于半截状态，所以任一项校验失败就整条拒绝、
  * 零副作用（决策 D5）。
  *
- * 除仓库目录 `stat`（resolveRepoSelection）之外无 I/O，不读会话、不写任何状态。
+ * I/O 只有仓库目录 `stat`（resolveRepoSelection）与 `/repo wt` 的两次本地 git 查询
+ * （`check-ref-format`、`worktree list`，不联网、毫秒级）——后者是 async 的唯一原因。
+ * 不读会话、不写任何状态。
  */
+import { existsSync } from 'node:fs';
 import type { BackendType } from '../adapters/backend/types.js';
 import type { CliId } from '../adapters/cli/types.js';
 import {
@@ -18,6 +21,7 @@ import {
   isCodexReasoningEffort,
   type CodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
+import { isGitWorkTree, isValidBranchName, resolveWorktreePathForBranch } from '../services/git-worktree.js';
 import { botAcceptsLaunchModel } from './launch-model-capability.js';
 import { resolveRepoSelection } from './repo-selection.js';
 import type { TopicHeader } from './topic-header.js';
@@ -39,8 +43,12 @@ export type TopicSpecError =
   | { kind: 'repo_numeric'; arg: string }
   /** `/repo X` 没解析出任何存在的目录。 */
   | { kind: 'repo_not_found'; arg: string }
-  /** `/repo wt …` —— 建 worktree 是会话内的 `/repo wt` 子命令，头部里吃不下它的多个参数。 */
-  | { kind: 'repo_worktree_unsupported'; arg: string }
+  /** `/repo wt X`：目标解析到了，但那不是 git 仓库，建不了 worktree。 */
+  | { kind: 'repo_not_git'; arg: string }
+  /** `/repo wt X <分支>`：分支名过了粗模式，却过不了 `git check-ref-format`。 */
+  | { kind: 'branch_invalid'; arg: string }
+  /** `/repo wt X <分支>`：createRepoWorktree 会用的目标目录已经存在。 */
+  | { kind: 'worktree_target_exists'; path: string }
   /** 模型名不像模型名（含空白/非 ASCII/超长）。 */
   | { kind: 'model_invalid'; arg: string }
   /** 这个 bot 的启动路径根本带不动模型（见 launch-model-capability）。 */
@@ -51,6 +59,15 @@ export type TopicSpecError =
   | { kind: 'effort_unsupported_cli'; cliId?: CliId }
   /** 档位合法但本次要用的模型不支持它。 */
   | { kind: 'effort_unsupported_model'; effort: CodexReasoningEffort; model?: string };
+
+/** 头部 `/repo wt` 落到 daemon 的创建请求：目录在建好之后才确定，这里只带仓库与分支。 */
+export interface TopicSpecWorktree {
+  /** 已解析的仓库绝对路径（任一 checkout；createRepoWorktree 会归一到主 checkout）。 */
+  repoPath: string;
+  branch?: string;
+  /** 显式分支时预先算出的目标目录（已校验不存在）；自动命名时缺席。 */
+  targetPath?: string;
+}
 
 export interface TopicSpec {
   ok: true;
@@ -63,6 +80,9 @@ export interface TopicSpec {
   repoStartInDefaultDir?: true;
   /** 仓库展示名，用于确认回复。 */
   repoDisplayName?: string;
+  /** 头部写了 `/repo wt …`：会话以 pendingRepo 建立，由 daemon 在话题建好后建 worktree 再 fork。
+   *  与 `workingDir` / `repoStartInDefaultDir` 互斥。 */
+  worktree?: TopicSpecWorktree;
   /** 本次 spawn 的模型（落 `DaemonSession.spawnModelOverride`，内存态、不持久化）。 */
   model?: string;
   /** 推理强度（落 `session.reasoningEffort`，与 trigger 一致地持久化）。 */
@@ -82,7 +102,7 @@ export interface TopicSpecContext {
  * 校验并落实一份指令头。**收集全部错误**再一次性返回：用户一条消息里可能同时写错
  * 仓库名和模型名，一次告诉他两条比让他改一条再撞一次墙好。
  */
-export function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContext): TopicSpecResult {
+export async function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContext): Promise<TopicSpecResult> {
   const errors: TopicSpecError[] = [];
   const spec: TopicSpec = { ok: true };
   const { botCfg } = ctx;
@@ -96,18 +116,57 @@ export function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContext): To
   if (repoArg) {
     if (/^\d+$/.test(repoArg)) {
       errors.push({ kind: 'repo_numeric', arg: repoArg });
-    } else if (/^wt$/i.test(repoArg)) {
-      // 会话中途的 `/repo wt <编号|项目名> [分支]` 吃整行；头部里的 `/repo` 只吃一个
-      // token（D4/D7），于是 `wt` 会被当成仓库名。多数情况报「找不到仓库 wt」还算能懂，
-      // 但只要扫描根下恰好有个叫 `wt` 的目录，它就会**静默开在错误的目录里**。
-      // 显式拒绝，并告诉用户先开话题、再在话题内发 `/repo wt …`。
-      errors.push({ kind: 'repo_worktree_unsupported', arg: repoArg });
     } else {
       const resolved = resolveRepoSelection(repoArg, ctx.scanDirs);
       if (!resolved) errors.push({ kind: 'repo_not_found', arg: repoArg });
       else {
         spec.workingDir = resolved.path;
         spec.repoDisplayName = resolved.displayName;
+      }
+    }
+  }
+
+  // `/repo wt <目标> [分支]`：能提前查的全部 fail closed（设计 R9 / §8）——目标可解析、
+  // 是 git 仓库、分支名合法、显式分支的目标目录不存在。自动命名（无分支）遇到已存在目录
+  // 是换下一个候选，不需要前置查目录。
+  if (header.worktree) {
+    const target = header.worktree.target.trim();
+    if (/^\d+$/.test(target)) {
+      errors.push({ kind: 'repo_numeric', arg: target });
+    } else {
+      const resolved = resolveRepoSelection(target, ctx.scanDirs);
+      if (!resolved) {
+        errors.push({ kind: 'repo_not_found', arg: target });
+      } else {
+        const branch = header.worktree.branch;
+        const wt: TopicSpecWorktree = { repoPath: resolved.path, ...(branch ? { branch } : {}) };
+        let ok = true;
+        if (branch) {
+          if (!(await isValidBranchName(branch))) {
+            errors.push({ kind: 'branch_invalid', arg: branch });
+            ok = false;
+          } else {
+            try {
+              const targetPath = await resolveWorktreePathForBranch(resolved.path, branch);
+              if (existsSync(targetPath)) {
+                errors.push({ kind: 'worktree_target_exists', path: targetPath });
+                ok = false;
+              } else {
+                wt.targetPath = targetPath;
+              }
+            } catch {
+              errors.push({ kind: 'repo_not_git', arg: target });
+              ok = false;
+            }
+          }
+        } else if (!(await isGitWorkTree(resolved.path))) {
+          errors.push({ kind: 'repo_not_git', arg: target });
+          ok = false;
+        }
+        if (ok) {
+          spec.worktree = wt;
+          spec.repoDisplayName = resolved.displayName;
+        }
       }
     }
   }

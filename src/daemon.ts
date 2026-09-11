@@ -20149,7 +20149,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     return;
   }
   if (forceTopic) {
-    const resolved = resolveTopicSpec(forceTopic, {
+    const resolved = await resolveTopicSpec(forceTopic, {
       botCfg: selfBotForHeader.config,
       scanDirs: getProjectScanDirsForBot(larkAppId),
     });
@@ -20536,7 +20536,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 于是照常建会话，把 CLI 空跑起来等下一条，与 `/repo` 冷启动的 emptyStart 同语义。
   const topicHeaderIdleStart = isBareForceTopic && !!topicSpec && (
     !!topicSpec.title || !!topicSpec.workingDir || !!topicSpec.repoStartInDefaultDir
-    || !!topicSpec.model || !!topicSpec.reasoningEffort
+    || !!topicSpec.worktree || !!topicSpec.model || !!topicSpec.reasoningEffort
   );
   // Session-group birth charges the ORIGINAL DM before creating the Feishu chat
   // (a quota denial must have zero external side effects), so by the time the
@@ -20659,14 +20659,21 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const headerDefaultStartDir = headerStartInDefaultDir
     ? getSessionWorkingDir({ workingDir: configPinnedWorkingDir, larkAppId } as DaemonSession)
     : undefined;
-  const pinnedWorkingDir = lifecycleWorkingDir ?? topicSpec?.workingDir ?? headerDefaultStartDir ?? configPinnedWorkingDir;
-  const pinnedFromBotDefault = (lifecycleWorkingDir || topicSpec?.workingDir || headerStartInDefaultDir)
+  // 头部 `/repo wt <目标> [分支]`：基目录先钉成用户点名的仓库，会话以 pendingRepo 建立，
+  // 话题建好后走与 auto-worktree / `/tw` 同一条 pre-fork 路径（force + branch）建 worktree，
+  // 再由 commitRepoSelection 把 workingDir 改钉到新 worktree 并 fork（设计 R9 / §8）。
+  // 它同样是用户显式选仓，所以 pinnedFromBotDefault 也翻成 false。
+  // `/th` `/tw` 生命周期变体钉的是「当前会话目录」，与头部 `/repo …` 相斥时沿用主干既有
+  // 优先级：生命周期目录优先、头部仓库指令让位（`/th /repo x` 今天就是这样，见设计 §15）。
+  const headerWorktree = forceTopicMode === 'default' ? topicSpec?.worktree : undefined;
+  const pinnedWorkingDir = lifecycleWorkingDir ?? headerWorktree?.repoPath ?? topicSpec?.workingDir ?? headerDefaultStartDir ?? configPinnedWorkingDir;
+  const pinnedFromBotDefault = (lifecycleWorkingDir || headerWorktree || topicSpec?.workingDir || headerStartInDefaultDir)
     ? false
     : configPinnedFromBotDefault;
   // 写进会话记录（会被兄弟 bot 的 inherit 层继承）的只有「真的钉了目录」那两种来源。
   // 裸 `/repo` 兜底到的默认目录刻意不写 —— 与卡片「直接开始」的 pinWorkingDir: false
   // 同一条理由，也与今天 `/t /repo` 的落点逐字一致（那条路只在 pinned 存在时才写）。
-  const persistedWorkingDir = lifecycleWorkingDir ?? topicSpec?.workingDir ?? configPinnedWorkingDir;
+  const persistedWorkingDir = lifecycleWorkingDir ?? headerWorktree?.repoPath ?? topicSpec?.workingDir ?? configPinnedWorkingDir;
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
@@ -20721,9 +20728,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
 
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
+  // 头部 `/repo wt` 与 auto-worktree / `/tw` 共用同一条「pendingRepo → 建 worktree → commit → fork」
+  // 路径：force 让失败 fail closed（不退回基目录），branch 让 git 腿按用户点名的分支建。
   const autoWt = forceTopicMode === 'worktree'
     ? !!pinnedWorkingDir
-    : willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+    : !!headerWorktree || willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
 
   // Create session in pending-repo state — don't spawn CLI yet.
   // For thread-scope, rootMessageId == anchor (the thread root). Critical
@@ -20908,6 +20917,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
       ...(forceTopicMode === 'worktree' ? { force: true } : {}),
       ...(sharedWorktree ? { ...sharedWorktree, reuseExisting: true } : {}),
+      // 头部 `/repo wt` 与 `/tw` 同形落盘：daemon 若在创建窗口内重启，restore 按 force+branch
+      // 重建；分支目录已存在时 fail closed 停在 pendingRepo，用 `/repo <路径>` 选即可。
+      ...(headerWorktree ? { force: true, ...(headerWorktree.branch ? { branch: headerWorktree.branch } : {}) } : {}),
       // Persisted turn identity feeds the eventual fork's turnId; it must be the
       // reply anchor so provenance (quoteTargetId === marker.turnId) holds on
       // session-group first turns that go through the repo picker / worktree.
@@ -20930,8 +20942,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
     startAutoWorktreePending(ds, {
       anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: promptContent, operatorOpenId: senderOpenId,
-      force: forceTopicMode === 'worktree',
+      force: forceTopicMode === 'worktree' || !!headerWorktree,
       ...(sharedWorktree ? { ...sharedWorktree, reuseExisting: true } : {}),
+      ...(headerWorktree?.branch ? { branch: headerWorktree.branch } : {}),
     });
     return;
   }

@@ -4,12 +4,15 @@
  *
  *   message   := [title] SENTINEL directive* body
  *   SENTINEL  := "/t" | "/topic"                （大小写不敏感，必须是完整 token）
- *   directive := ("/model" | "/effort") WS arg | "/repo" [WS arg]
+ *   directive := ("/model" | "/effort") WS arg | "/repo" [WS arg] | "/repo" WS "wt" WS target [WS branch]
  *   arg       := token | '"' … '"'              （双引号包裹的参数可含空白）
  *   title     := 不含以 "/" 开头 token 的文字，≤ 3 行，归一化后 ≤ SESSION_TITLE_MAX
  *   body      := 从第一个非指令 token 的原始偏移起的全部原文，原样保留
  *
- * 空白不敏感：换行等价于空格，单行写法与多行写法解析结果逐字相同。
+ * 空白不敏感：换行等价于空格，单行写法与多行写法解析结果逐字相同。唯一例外是 `/repo wt`
+ * 的可选分支：只在下一个 token **匹配分支粗模式且与目标同一行**时才吃（设计 R5），所以
+ * `/repo wt botmux ⏎ fix login bug` 里 `fix` 是正文，而 `/repo wt botmux fix login bug` 里
+ * `fix` 是分支——用法串因此写明「latin 正文请换行」。
  *
  * 三种返回值的含义各不相同，调用方必须分开处理：
  *   - `null`      —— 这不是指令头，按普通消息/原有 `/t` 路径继续走；
@@ -43,8 +46,27 @@ const DIRECTIVE_BY_TOKEN = new Map<string, TopicHeaderDirective>(
  */
 const BARE_FORM_DIRECTIVES: ReadonlySet<TopicHeaderDirective> = new Set(['repo']);
 
+/**
+ * 分支名的**消费用粗模式**（设计 R5）：latin/数字开头、`[A-Za-z0-9._/-]`、无 `..`、限长。
+ * 中文正文永远不匹配，所以单行 `/repo wt botmux 简单确认一下` 不会把正文吃成分支。
+ * 这只是「像不像分支」；**合法性**由 topic-spec 的 `git check-ref-format` 兜底，两层不同：
+ * 不匹配粗模式的 token 是正文，匹配粗模式但 git 拒绝的 token 是错误。
+ */
+export const BRANCH_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const BRANCH_TOKEN_MAX = 200;
+
+export function looksLikeBranchToken(text: string): boolean {
+  return text.length <= BRANCH_TOKEN_MAX && BRANCH_TOKEN_RE.test(text) && !text.includes('..');
+}
+
 /** 标题最多几行——超过就判定「这不是指令头」，避免长文里的 `/t` 误触发。 */
 const TITLE_MAX_LINES = 3;
+
+/** `/repo wt <目标> [分支]` 的原始参数；语义校验（目标可解析、分支合法、目录不存在）在 topic-spec。 */
+export interface TopicHeaderWorktree {
+  target: string;
+  branch?: string;
+}
 
 export interface TopicHeader {
   ok: true;
@@ -55,6 +77,8 @@ export interface TopicHeader {
   /** 头部指令的**原始参数**（已脱掉包裹的双引号），语义校验留给 resolveTopicSpec。
    *  值为 `null` 表示指令写了但没带参数（只有 `/repo` 允许，见 BARE_FORM_DIRECTIVES）。 */
   directives: Partial<Record<TopicHeaderDirective, string | null>>;
+  /** `/repo wt …` 子形式。与 `directives.repo` 互斥（两者都算「写了 /repo」，重复即拒）。 */
+  worktree?: TopicHeaderWorktree;
   /** 首轮任务正文，从第一个非指令 token 的原始偏移起原样保留（仅去掉尾部空白）。 */
   prompt: string;
 }
@@ -63,7 +87,9 @@ export interface TopicHeader {
 export type TopicHeaderErrorReason =
   | { kind: 'missing_arg'; directive: TopicHeaderDirective }
   | { kind: 'duplicate_directive'; directive: TopicHeaderDirective }
-  | { kind: 'unknown_directive'; token: string };
+  | { kind: 'unknown_directive'; token: string }
+  /** `/repo wt` 后面没有目标仓库（`/t /repo wt`、`/t /repo wt /model x`）。 */
+  | { kind: 'missing_worktree_target' };
 
 /** 拒绝结果一并带上用户实际敲的分隔符，授权提示与错误文案都用它的原文措辞。 */
 export type TopicHeaderError = { ok: false; sentinel: '/t' | '/topic' } & TopicHeaderErrorReason;
@@ -96,7 +122,7 @@ export function isTopicHeaderError(parsed: TopicHeaderParse): parsed is TopicHea
  * 只有 thread 路径用它。新话题路径不看这个谓词——那里任何解析成功的头部都照常生效。
  */
 export function topicHeaderDeclaresSpec(header: TopicHeader): boolean {
-  if (Object.keys(header.directives).length > 0) return true;
+  if (Object.keys(header.directives).length > 0 || header.worktree !== undefined) return true;
   return header.title !== undefined && header.prompt === '';
 }
 
@@ -105,6 +131,8 @@ interface Token {
   readonly text: string;
   /** 在原文中的起始偏移——正文按这个偏移原样切出来。 */
   readonly start: number;
+  /** 在原文中的结束偏移（不含）；`/repo wt` 的可选分支用它判断「与目标同一行」。 */
+  readonly end: number;
   /** 是否由双引号包裹：被包裹的 token 永远是字面量，不会当成指令/分隔符。 */
   readonly quoted: boolean;
 }
@@ -125,13 +153,13 @@ function tokenize(content: string): Token[] {
       const close = content.indexOf('"', i + 1);
       const after = close >= 0 ? content[close + 1] : undefined;
       if (close > i && (after === undefined || /\s/.test(after))) {
-        tokens.push({ text: content.slice(i + 1, close), start, quoted: true });
+        tokens.push({ text: content.slice(i + 1, close), start, end: close + 1, quoted: true });
         i = close + 1;
         continue;
       }
     }
     while (i < content.length && !/\s/.test(content[i]!)) i += 1;
-    tokens.push({ text: content.slice(start, i), start, quoted: false });
+    tokens.push({ text: content.slice(start, i), start, end: i, quoted: false });
   }
   return tokens;
 }
@@ -182,6 +210,7 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
   if (title === null) return null;
 
   const directives: Partial<Record<TopicHeaderDirective, string | null>> = {};
+  let worktree: TopicHeaderWorktree | undefined;
   let i = sentinelIndex + 1;
   for (; i < tokens.length; i += 1) {
     const token = tokens[i]!;
@@ -197,10 +226,31 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
       }
       break;
     }
-    if (directives[directive] !== undefined) {
+    if (directives[directive] !== undefined || (directive === 'repo' && worktree !== undefined)) {
       return { ok: false, sentinel, kind: 'duplicate_directive', directive };
     }
     const arg = tokens[i + 1];
+    // `/repo wt <目标> [分支]`：目标必选；分支可选，只在「匹配分支粗模式 + 与目标同一行 +
+    // 不是另一条指令」时吃（R5 两条规则）。引号包裹的 `"wt"` 是字面量，走普通 `/repo` 分支。
+    if (directive === 'repo' && arg && !arg.quoted && arg.text.toLowerCase() === 'wt') {
+      const target = tokens[i + 2];
+      if (!target
+        || (!target.quoted && DIRECTIVE_BY_TOKEN.has(target.text.toLowerCase()))
+        || target.text.trim() === '') {
+        return { ok: false, sentinel, kind: 'missing_worktree_target' };
+      }
+      worktree = { target: target.text };
+      i += 2;
+      const branch = tokens[i + 1];
+      if (branch && !branch.quoted
+        && !DIRECTIVE_BY_TOKEN.has(branch.text.toLowerCase())
+        && !content.slice(target.end, branch.start).includes('\n')
+        && looksLikeBranchToken(branch.text)) {
+        worktree.branch = branch.text;
+        i += 1;
+      }
+      continue;
+    }
     // 没有参数：结尾就没有下一个 token，或下一个 token 是另一条头部指令
     //（`/t /repo /model x` —— 把 `/model` 当仓库名只会得到一句莫名其妙的报错）。
     // `/repo` 有裸形式，记成 null 交给语义层；其余指令是写错了。
@@ -224,5 +274,12 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
 
   const bodyStart = tokens[i]?.start;
   const prompt = bodyStart === undefined ? '' : content.slice(bodyStart).replace(/\s+$/, '');
-  return { ok: true, sentinel, ...(title !== undefined ? { title } : {}), directives, prompt };
+  return {
+    ok: true,
+    sentinel,
+    ...(title !== undefined ? { title } : {}),
+    directives,
+    ...(worktree !== undefined ? { worktree } : {}),
+    prompt,
+  };
 }
