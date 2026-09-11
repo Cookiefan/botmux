@@ -766,7 +766,7 @@ export const messages: Record<string, string> = {
   'help.repo_list': '/repo       - 仓库待选时直接在默认目录开会话；会话中则弹项目选择卡片',
   'help.repo_n': '/repo <N>   - 切换到第 N 个项目',
   'help.repo_path': '/repo <路径|项目名> - 直接指定路径或 workingDir 下的项目名，跳过选择卡片',
-  'help.repo_wt': '/repo wt <编号|项目名> [分支] - 基于远端默认分支新建 worktree 并打开（未指定分支时自动语义命名）',
+  'help.repo_wt': '/repo wt <编号|项目名|路径> [分支] - 基于远端默认分支新建 worktree 并打开（未指定分支时自动语义命名）',
   'help.rename': '/rename <标题> - 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名',
   'help.tabs': '/tabs - 查看与管理当前飞书群的标签页',
   'help.status': '/status     - 查看当前会话状态（含终端链接）',

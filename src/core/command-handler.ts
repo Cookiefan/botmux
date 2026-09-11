@@ -149,7 +149,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue', '/cleanup-wt']);
+export { SESSIONLESS_DAEMON_COMMANDS } from './command-schema.js';
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -178,7 +178,7 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist', '/quote']);
+export { EXISTING_SESSION_ONLY_DAEMON_COMMANDS } from './command-schema.js';
 
 function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   const runtime = snapshotCliRuntime(resolveCliRuntime({
@@ -301,12 +301,9 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-export interface SlashCommandInvocation {
-  cmd: string;
-  content: string;
-}
-
-const MULTILINE_COMMANDS = new Set(['/schedule', '/role', '/fork']);
+// 斜杠命令的解析与分类住在 ./command-router.js（leaf，纯函数，schema 驱动）；这里重新导出，
+// 让既有调用方（daemon.ts、cli、event-dispatcher、tests）在同一个模块面上拿到它。
+export { parseSlashCommandInvocation, type SlashCommandInvocation } from './command-router.js';
 
 // `validateWorkingDir` now lives in ./working-dir.js (leaf module the CLI can
 // import without the daemon graph); re-exported here for existing callers.
@@ -518,39 +515,6 @@ export function parseForceTopicInvocation(content: string): { prompt: string; mo
         mode: variant[1]!.toLowerCase() === 'worktree' ? 'worktree' : 'here',
       }
     : { prompt: rawPrompt, mode: 'default' };
-}
-
-/** Parse a user-authored slash command after leading @mentions have already
- *  been stripped. Messages that look like command examples or command lists
- *  are intentionally left for the CLI instead of being intercepted by the
- *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
- *  trigger real daemon actions. */
-export function parseSlashCommandInvocation(content: string): SlashCommandInvocation | null {
-  // trim BOTH ends: a trailing newline/space rides into the returned `content`
-  // and, for a passthrough command relayed verbatim to the CLI (raw_input), gets
-  // typed as a literal trailing newline — which breaks the CLI's slash-command
-  // detection (it sees a multi-line message, not a `/cmd`). Internal newlines for
-  // MULTILINE_COMMANDS are preserved (trim only touches the ends).
-  const trimmed = content.trim();
-  if (!trimmed.startsWith('/')) return null;
-
-  const lines = trimmed.split(/\r?\n/);
-  const firstLine = (lines[0] ?? '').trimEnd();
-  const [cmdRaw] = firstLine.split(/\s+/);
-  const cmd = cmdRaw?.toLowerCase();
-  if (!cmd) return null;
-
-  // Treat angle-bracket placeholders as documentation, not an invocation.
-  if (/<[^>\r\n]+>/.test(firstLine)) return null;
-
-  const restNonBlank = lines.slice(1).map(l => l.trim()).filter(Boolean);
-  if (restNonBlank.length > 0) {
-    // A list of slash commands is almost certainly discussion / planning text.
-    if (restNonBlank.some(l => l.startsWith('/'))) return null;
-    if (!MULTILINE_COMMANDS.has(cmd)) return null;
-  }
-
-  return { cmd, content: trimmed };
 }
 
 function tag(ds: DaemonSession): string {

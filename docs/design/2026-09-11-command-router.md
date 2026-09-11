@@ -138,6 +138,7 @@ type SessionPhase =
   | 'pendingRepo'       // 等选仓/建 worktree，worker 未起（ds.pendingRepo；持久化镜像 Session.pendingRepoSetup）
   | 'worktreeCreating'  // ds.worktreeCreating || ds.pendingRepoCommitInFlight（会话内 /repo wt 在无 pendingRepo 时也会置位）
   | 'queued'            // 停起态（Session.queued，worker:null，等 dashboard「开始」或群里第一条消息激活）
+  | 'dormant'           // 会话在、worker 不在（restore 后等 refork / 开场 fork 尚未发生）：今天透传被"worker 不在线"分支拒，正文触发 refork
   | 'spawning'          // worker 已起、CLI 提示符未就绪（ds.worker && !ds.cliReady）
   | 'ready'             // 提示符就绪、首轮未发（ds.cliReady && session.initialUserTurnPending）
   | 'running'           // 正常运行
@@ -314,3 +315,21 @@ PR-1 独立有价值；PR-2 若延期，PR-1 不受影响；PR-3 依赖 PR-2 的
   - `worktree_target_exists` 只对显式分支查；自动命名的冲突由 `createRepoWorktree` 换下一个候选。
   - `isValidBranchName` 通过 spawn `git check-ref-format` 实现而不是手写正则：git 的规则有十几条（`.lock` 结尾、`@{`、控制字符…），手抄必然漂移。
   - 测试环境：本 worktree 的 `node_modules` 按仓库规范 symlink 到 canonical checkout（锁文件逐字一致，未跑 install）。
+
+### PR-2 统一路由器（2026-09-12 凌晨）
+
+落地形状：
+
+- **`src/core/command-schema.ts`**（leaf，零 import）：36 条命令 / 39 个 token 的表——名字、别名、会话政策、前置特判（两条入口各自的位置如实记录）、多行豁免、参数形状与子命令（如实记录今天各 case 的解析方式，PR-2 不改参数语义）、help 键。今天的五个裸集合（`DAEMON_COMMANDS` / `SESSIONLESS_*` / `EXISTING_SESSION_ONLY_*` / `MULTILINE_COMMANDS` / `FORCE_TOPIC_COMMANDS`）从表推导，名字不变，`passthrough-commands.ts` / `command-handler.ts` / `command-trigger.ts` 改为再导出，所有消费方无感。
+- **`src/core/session-phase.ts`**：`deriveSessionPhase(ds)`，九个相位（§5 的八个加 `dormant`：会话在、worker 不在、非等选仓——restore 后等 refork / 开场 fork 尚未发生；今天透传在这里被"worker 不在线"分支拒，正文触发 refork）。`ds.cliReady` / `ds.cliReadyGeneration` 由 worker 的 `prompt_ready` 置位，spawn / restart（含 dashboard 两条直发 restart IPC 的路由）/ `claude_exit` / worker 退役清零，**不由 `ready` 清零**；代际单调递增。已知边界：worker 自发的 in-worker CLI 重启对 daemon 不可见，该窗口内 `cliReady` 可能为 stale true，消费方只能当提示。
+- **`src/core/command-router.ts`**：`parseSlashCommandInvocation`（从 command-handler 搬来，逐字）+ `isSessionlessCommandInvocation`（从 daemon 搬来）+ `classifySlash`（纯函数：bot 门 → parse → 前置特判 → 透传闸 → DAEMON_COMMANDS → unknown）。决策类型与 oracle 同形。
+- **daemon 两条入口**：`parseSlashCommandInvocation` + 逐个 `if (cmd === …)` + 三个集合判定 → 一次 `classifySlash`，之后只按 `decision.kind / handler / delivery / sessionPolicy` 执行；执行代码（授权闸、预建会话、`startInitialPassthroughSession`、`deliverPassthroughToExistingSession`、`/fast` 后端门、排队激活闸）一行没动。thread 入口把 `existingDs` 与冻结的 `passthroughCliId` 提到分类之前求值。
+- **验证**：`test/legacy-oracle/slash-route-oracle.ts` 冻结今天两条入口的判定（零 src import）；`test/command-schema.test.ts` 钉 schema 推导集合 == oracle 字面量集合、help 键双语齐全、switch 的 case 与表互相覆盖；`test/command-router-oracle-diff.test.ts` 对 23 符号 × 长度 ≤ 3 × 两种分隔符（49,749 串）× 9 个入口/相位组合 × 3 种透传配置 × 2 种发送方 ≈ 269 万次求值断言逐字相等（Bun 下 1.2s），INTENTIONAL 名单为空；22 个路由层测试文件不改语义直接通过（唯一改动是 `dashboard-attention-signals` 源码顺序守卫的标记从 `parseSlashCommandInvocation` 换成 `classifySlash(`）。
+- **顺手修的**：`help.repo_wt` zh/en 补上 `路径 / path`，与 `cmd.repo.worktree_usage` 一致（§9 有意变化表 PR-2 第二行）。
+
+决策与拿不准：
+
+- **oracle 转写时发现的两条入口差异**（都如实保留，未收敛）：① 无会话透传被拒的文案不同——新话题 `cmd_requires_session`、thread `cmd_needs_active_cli`；② 预建会话时 thread 写 `creatorOpenId`、新话题不写。前者是文案层面，后者影响会话记录形状，都不在路由决策里，留给后续单独收敛。
+- `hasQueuedActivationAdmissionGate`（活 worker 上排队激活的提交闸）与 `threadChatId` 缺席这两个条件不在 oracle / 路由器模型里，仍留在执行代码，差分假定未触发。
+- 相位矩阵首版逐格填今天的行为（R6），`/help` 与用法串**尚未**改为由 schema 生成——今天的 help 文案是每命令多条、按固定顺序拼的 i18n 句子，生成需要先设计一种双语可读的用法串模板，本轮只做到"schema 钉住每个 help 键都存在、switch 与表互相覆盖"这一层守卫。
+- `isSessionlessCommandInvocation` 对 `/watch-comment` 按参数分叉是 schema 表达不了的（`sessionPolicy` 是命令级），保留为路由器里的一个显式特例，schema 的 notes 记明。
