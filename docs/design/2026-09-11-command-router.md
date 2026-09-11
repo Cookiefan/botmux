@@ -353,3 +353,33 @@ PR-2 收口（有意变化落地）：thread 入口的 `/card` `/cot` 改为与�
 - **瞬时命令的判定靠 3s 宽限窗**：若某个 CLI 对 `/model` 的响应既不触发忙态上报也超过 3s，第二条会提前发出（等价于今天的 busy delivery），不会丢。真实 CLI 上的时序还没肉眼验证过（§10 手动项），是 dogfood 时第一件要看的事。
 - **正文项的重入**用 `handleThreadReply(bodyData)`：同 messageId、`message_type` 改成 text、原 mentions 保留。带附件的消息不切级联（`hasAttachments`），所以重入时不会丢资源。
 - 没做：`/help` 用法串未提及级联写法（等 dogfood 后再写文案）；riff/mojo 的级联支持需要 worker 侧按写入命令的边界信号（§14）。
+
+### 复审修正（2026-09-12 凌晨，三期落地之后）
+
+两轮独立复审（三个 diff × 正确性/跨面两视角；终态 × 承诺兑现/简洁性/可维护性三视角，每条发现再由独立 agent 反驳）。站得住的与已改的：
+
+| 发现 | 改法 |
+|---|---|
+| grant 限制闸丢了对**认不出**的 `/xxx` 的覆盖（改造前 parse 成功即查，与命令是否注册无关；接线后只查三类命令决策）——受限成员的 CLI 自定义斜杠命令能绕过闸进 CLI | 路由器给 `unknown_slash` 的 forward 带上 `cmd`，两条入口在命令决策之前对它单独过一次 `grantRestrictedSlashCommandText`；差分测试比较前剥掉这个多出来的字段 |
+| `/repo wt <目标>` 之后的未知 `/xxx` 不 fail closed（`claimed` 没算 `worktree`），`/t /repo wt botmux /modle sonnet` 会开话题、建 worktree、把错字当正文 | `claimed` 计入 `worktree`，补一行用例 |
+| 头部只交代 `wt` 规格、无正文时，commitRepoSelection 把空串 `pendingCodexAppText` 当"有开场输入"，烧一个空 `<user_message>` 且不打 `initialUserTurnPending`（auto-worktree bot 的 `/t /model sonnet` 在 master 上同样中招） | 走 worktree 分支且 `topicHeaderIdleStart && !hasBufferedOpeningInput` 时把 `pendingCodexAppText` 清成 undefined，让它走既有的 emptyStart |
+| 头部 `wt` 失败后会话停在 `pendingRepo` 但从没发过选仓卡，之后每条消息都回「请在上方卡片中选择」 | 失败提示后追加一句 `/repo …` 自救指引；两处待选仓回复按 `repoCardMessageId` 有无分别用 `choose_repo_first` / 新的 `choose_repo_no_card` |
+| 定序器的空闲判据把 `limited` / `analyzing` / `stalled` 都当空闲 | 空闲 = `idle` 或未知；`limited` / `stalled` 立即返回 `blocked`，与超时同样按 busy delivery 放行剩余条目 |
+| 级联 detached 之后没有任何互斥：等待期间同话题后到的消息会抢先写进 worker；第二条级联也能并行 | `ds.cascadeInFlight` + `cascadeDeferred`：在飞时普通正文与单条透传排队、收尾按到达顺序重入，第二条级联 fail closed（`cascade_busy`） |
+| 正文重入把接纳状态清成 undefined，正文腿抛错会提示「请重发」，但前面的 `/compact` 已执行 | 重入共享同一个接纳 box（同一条 inbound）；提示改为 best-effort；整体失败回 `cascade_failed`（前 N 条已送出、剩余 M 条未送达，只重发未送达部分） |
+| 正文重入对同一 messageId 再发一次 `thread.reply` hook、再学一次 mentions | `RoutingContext.cascadeBodyReentry` 跳过这两处一次性副作用 |
+| `passthrough.delivery` 四值里只有 `cold_start` 被消费，另三个按相位猜的值与执行段按 `ds.worker` 的实时判定口径不一致（`worktreeCreating` / `queued` 在活 worker 上也会置位），接上即变行为 | 收成 `cold_start \| to_session`，透传分支不再按相位猜；§5 矩阵里 worktreeCreating / queued 两格的「拒」**不是今天行为**，将来若接线属 §9 有意变化 |
+| `special.{newTopic, thread}` 的位置区分只剩 `/term` 一条，且透传集与 daemon 命令恒不相交，先后不可观测 | 收成 `special: handler`，路由器删掉 DAEMON 块内的特判分支；thread 入口 `/term` 与其它四条一起在透传闸前派发 |
+| `isValidBranchName` 用 daemon 的 cwd 跑 git（cwd 被删会 ENOENT） | 改用 `tmpdir()` |
+| `/help` 键守卫只扫 `case '/help'` 之后 6000 字符 | 扫到下一个 `case` |
+
+复审里**站得住但刻意不改**、记在这里的差距（"承诺 vs 代码"）：
+
+- R4 承诺的"schema 是唯一事实源"只兑现了一半：五个集合、前置特判、help 键的守卫从表来；`argShape` / `subcommands` / `notes` 目前没有生产消费者（是对今天 38 个 case 解析方式的如实记录，供后续把参数解析收进解析器时逐条对照）；`/help` 与用法串仍是手写。
+- R6 承诺的"phase × command 矩阵是数据"没有兑现：矩阵存在于 §5 的文档表和路由器的两个谓词（有没有会话、有没有活 worker）里，九个相位在路由决策中只区分到这两档；`deriveSessionPhase` 本身没有直接测试（差分把相位当输入轴喂两边）。要么下一步把矩阵落成数据并接上执行段（那是 §9 级别的变化），要么把 §5 收敛成"两个谓词"——本轮选择如实记录，不装。
+- §9 承诺的"两条 lane 显式输出"（`promptText` / `commandText`）没做，入口仍原地改写 `parsed.content`。
+- 两条入口的**执行段**仍各一份（约 240 行一一对应的分支）；分类收成一处了，执行没有。
+- `hasQueuedActivationAdmissionGate` 只在派发定序器前查一次，是动态谓词。
+- 源码级守卫测试（`initial-passthrough-ownership` 等）仍是 grep daemon.ts，没换成真实用例；§9 点名的 `/term` `/vc-auth` daemon 级用例、裸 `/repo` 含空格实例没补（`/role` 多行豁免已补）。
+- oracle 没有退役条件：INTENTIONAL 名单已 2 条；建议在 PR-3 上线并稳定一个版本后把 oracle 冻结为"发布基线"，新的有意变化改为对比上一发布基线而不是继续累积规则。
+- riff / mojo / adopt 上的多行透传消息从"整条转发"变成 `cascade_unsupported` 拒绝——这是设计选择（fail closed 而非静默错序），已在 §9/§13 登记；若 dogfood 里发现有人依赖旧行为，退回整条转发是一行改动。
