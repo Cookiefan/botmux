@@ -135,6 +135,16 @@ Some CLIs also declare adapter-default passthrough commands: Claude Code and Cod
 
 To allow more commands through, configure [`customPassthroughCommands`](/en/bots-json) for that bot (e.g. `["/export"]`) to extend beyond the allowlist above as needed. Entries that would shadow a botmux daemon command (such as `/status`, `/help`, `/cd`) are automatically dropped — daemon commands always keep their own semantics and cannot be overridden via passthrough.
 
+**Cascading several passthrough commands in one message** (inside a running session): put one passthrough command per line, optionally followed by a task body, and botmux sends them in order, waiting for the CLI to become idle between items —
+
+```text
+/model opus
+/clear
+Now go through the review comments on PR #1361
+```
+
+Rules: only a leading run of passthrough lines forms a cascade (a botmux command such as `/cd` or an unknown `/xxx` inside that run makes the whole message ordinary text, as today); the body starts at the first line not beginning with `/`, and any later `/xxx` is part of the body; a single line such as `/model opus then continue` is still sent verbatim as one line. The idle wait is capped at 120 s, after which the remaining items are sent immediately with a notice. Remote sandbox backends (riff / mojo) and adopted external sessions do not support cascades and reply "send them one by one"; messages with attachments are not split either.
+
 ## 🧩 View Available Commands
 
 `/list-slash-command` (alias `/slash`): lists the currently available slash commands in a card, in four sections —
