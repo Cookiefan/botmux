@@ -675,6 +675,28 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toContain('没有活跃的会话');
   });
 
+  // PR-2 有意变化（docs/design/2026-09-11-command-router.md §9）：thread 入口的 /card /cot
+  // 与新话题入口对齐为前置特判——无会话时不再预建 worker:null 的幽灵会话。
+  it('thread reply with no existing session: `/card pin status` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_card', '/card pin status', 'om_root_card'),
+      makeCtx('om_root_card', 'om_reply_card'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
+  });
+
+  it('thread reply with no existing session: `/cot status` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_cot', '/cot status', 'om_root_cot'),
+      makeCtx('om_root_cot', 'om_reply_cot'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
+  });
+
   it('thread reply with an existing session: `/rename` renames it in place', async () => {
     const ds = seedThreadSession('om_root_2', '旧标题');
 

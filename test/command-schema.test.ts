@@ -97,13 +97,12 @@ describe('command schema ↔ handleCommand switch', () => {
       expect(cases.has(c), `schema 有 ${c} 但 switch 没有 case`).toBe(true);
     }
   });
-  it('前置特判表：五条命令、新话题全部在透传闸之前；thread 的不一致如实记录', () => {
+  it('前置特判表：五条命令、新话题全部在透传闸之前；thread 只有 /term 留在 DAEMON 块内', () => {
     expect(sorted(new Set(ROUTE_SPECIAL_COMMANDS.keys()))).toEqual(['/card', '/cot', '/sessions', '/term', '/vc-auth']);
     for (const [, sp] of ROUTE_SPECIAL_COMMANDS) expect(sp.newTopic).toBe('before-passthrough');
-    expect(ROUTE_SPECIAL_COMMANDS.get('/sessions')?.thread).toBe('before-passthrough');
-    expect(ROUTE_SPECIAL_COMMANDS.get('/vc-auth')?.thread).toBe('before-passthrough');
+    for (const c of ['/sessions', '/vc-auth', '/card', '/cot']) {
+      expect(ROUTE_SPECIAL_COMMANDS.get(c)?.thread, c).toBe('before-passthrough');
+    }
     expect(ROUTE_SPECIAL_COMMANDS.get('/term')?.thread).toBe('in-daemon-block');
-    expect(ROUTE_SPECIAL_COMMANDS.get('/card')?.thread).toBeUndefined();
-    expect(ROUTE_SPECIAL_COMMANDS.get('/cot')?.thread).toBeUndefined();
   });
 });

@@ -333,3 +333,5 @@ PR-1 独立有价值；PR-2 若延期，PR-1 不受影响；PR-3 依赖 PR-2 的
 - `hasQueuedActivationAdmissionGate`（活 worker 上排队激活的提交闸）与 `threadChatId` 缺席这两个条件不在 oracle / 路由器模型里，仍留在执行代码，差分假定未触发。
 - 相位矩阵首版逐格填今天的行为（R6），`/help` 与用法串**尚未**改为由 schema 生成——今天的 help 文案是每命令多条、按固定顺序拼的 i18n 句子，生成需要先设计一种双语可读的用法串模板，本轮只做到"schema 钉住每个 help 键都存在、switch 与表互相覆盖"这一层守卫。
 - `isSessionlessCommandInvocation` 对 `/watch-comment` 按参数分叉是 schema 表达不了的（`sessionPolicy` 是命令级），保留为路由器里的一个显式特例，schema 的 notes 记明。
+
+PR-2 收口（有意变化落地）：thread 入口的 `/card` `/cot` 改为与新话题入口一致的前置特判——schema 的 `special.thread` 两个数据值从缺席改为 `before-passthrough`，路由器不动；daemon thread 入口在 `/vc-auth` 之后按 handler 派给 `handleCardCommand` / `handleCotCommand`（两者内部按 anchor 自己取 ds，有会话时与原先经 `handleCommand` switch 的效果一致；无会话时不再预建幽灵会话）。差分测试的 INTENTIONAL 名单登记了这一条（thread × `/card`|`/cot` × `daemon precreate/existing` → `special`），其余 269 万组仍逐字相等；`test/daemon-rename-route.test.ts` 加两条 daemon 级用例钉「无会话 → 不建会话仍有回复」。`/term` 在 thread 入口仍留在 DAEMON 块内（透传闸之后）：差异只在「`/term` 同时进了透传集」这个被 `normalizePassthroughCommand` 排除的形状上可观测，不值得改。

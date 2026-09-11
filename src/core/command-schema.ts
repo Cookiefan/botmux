@@ -49,10 +49,11 @@ export interface CommandSpec {
   readonly sessionPolicy: CommandSessionPolicy;
   /**
    * 前置特判：不进 `handleCommand` 的 switch，而由路由入口直接派给专属处理器。
-   * `newTopic` / `thread` 各自记录今天在哪一段：`before-passthrough` = 透传闸之前；
+   * `newTopic` / `thread` 各自记录在哪一段：`before-passthrough` = 透传闸之前；
    * `in-daemon-block` = `DAEMON_COMMANDS` 块内（透传闸之后）；缺席 = 该入口没有特判，
-   * 走通用 daemon 分支（今天两条入口对 `/card` `/cot` `/term` 的处理并不一致，如实记录，
-   * 收敛是 §9 里 PR-2 的一条有意变化）。
+   * 走通用 daemon 分支。`/card` `/cot` 在 PR-2 收敛成两条入口一致（此前 thread 入口无特判，
+   * 无会话时会预建幽灵会话，§9 有意变化）；`/term` 在 thread 入口仍在 DAEMON 块内（透传闸之后），
+   * 差异只在「`/term` 同时进了透传集」这个被 normalizePassthroughCommand 排除的形状上可观测。
    */
   readonly special?: {
     readonly handler: CommandSpecialHandler;
@@ -129,14 +130,14 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: '/card', sessionPolicy: 'default', argShape: 'subcommand',
     subcommands: ['show', 'on', 'off', 'pin on', 'pin off', 'pin status'], help: ['help.card'],
-    special: { handler: 'card', newTopic: 'before-passthrough' },
-    notes: 'thread 入口今天没有特判（走 handleCommand switch，无会话时会预建幽灵会话）；`pin off` 类子命令按整串全等比较',
+    special: { handler: 'card', newTopic: 'before-passthrough', thread: 'before-passthrough' },
+    notes: '两条入口同一张表（PR-2 收敛：thread 入口原先没有特判，无会话时会预建幽灵会话）；`pin off` 类子命令按整串全等比较',
   },
   {
     name: '/cot', sessionPolicy: 'default', argShape: 'subcommand',
     subcommands: ['status', 'on', 'off', 'show'], help: ['help.cot'],
-    special: { handler: 'cot', newTopic: 'before-passthrough' },
-    notes: 'thread 入口今天没有特判',
+    special: { handler: 'cot', newTopic: 'before-passthrough', thread: 'before-passthrough' },
+    notes: '两条入口同一张表（PR-2 收敛：thread 入口原先没有特判）',
   },
   {
     name: '/term', sessionPolicy: 'default', argShape: 'none', help: ['help.term'],

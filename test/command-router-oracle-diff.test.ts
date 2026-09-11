@@ -6,7 +6,7 @@
  * oracle 不 import src（冻结的老行为），所以这不是恒等式：src 侧任何改动都会在这里变红，
  * 由人来判断是回归还是 §9 里登记过的有意变化——后者写进下面的 INTENTIONAL 名单才放行。
  *
- * PR-2 的名单为空：路由器与今天逐字一致。
+ * 名单里每一条都对应 §9 有意变化表的一行（PR-2：thread 入口 /card /cot 的前置特判对齐）。
  *
  * Run: bun run vitest run test/command-router-oracle-diff.test.ts
  */
@@ -70,9 +70,15 @@ function toOraclePhase(phase: SessionPhase): OraclePhase | null {
   }
 }
 
-/** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。PR-2 为空。 */
-const INTENTIONAL: Array<(input: SlashRouteInput, legacy: OracleDecision, next: SlashRouteDecision) => boolean> = [];
-
+/** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
+const INTENTIONAL: Array<(input: SlashRouteInput, legacy: OracleDecision, next: SlashRouteDecision) => boolean> = [
+  // PR-2：thread 入口的 /card /cot 与新话题入口对齐为前置特判（原先走 daemon 分支，无会话时预建幽灵会话）。
+  (input, legacy, next) =>
+    input.context === 'thread'
+    && legacy.kind === 'daemon' && (legacy.cmd === '/card' || legacy.cmd === '/cot')
+    && next.kind === 'special' && next.cmd === legacy.cmd && next.content === legacy.content
+    && next.handler === legacy.cmd.slice(1),
+];
 describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
   it('小字母表 × 长度 ≤ 3 × 入口 × 相位 × 透传配置 × 发送方：决策逐字相等', () => {
     const contexts: Array<{ context: 'new-topic' | 'thread'; phase: SessionPhase }> = [

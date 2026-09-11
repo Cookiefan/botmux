@@ -22091,6 +22091,17 @@ async function handleThreadReplyAdmitted(
       });
       return;
     }
+    // /card /cot 只改每群配置或召唤已有会话的卡片，从不需要新会话：与新话题入口同一张
+    // schema 表（special.thread），不再落进下面的 DAEMON_COMMANDS 块预建 worker:null 幽灵会话。
+    // 有会话时两个 handler 内部按 anchor 自己取 ds，效果与原先经 handleCommand 的 switch 一致。
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'card') {
+      await handleCardCommand(anchor, larkAppId, effectiveThreadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      return;
+    }
+    if (slashDecision.kind === 'special' && slashDecision.handler === 'cot') {
+      await handleCotCommand(anchor, larkAppId, effectiveThreadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      return;
+    }
     if (slashDecision.kind === 'passthrough') {
       if (slashDecision.delivery === 'cold_start' && threadChatId) {
         await startInitialPassthroughSession({
@@ -22172,14 +22183,14 @@ async function handleThreadReplyAdmitted(
       else void invocationDeps.sessionReply(anchor, tr('daemon.cmd_needs_active_cli', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
       return;
     }
-    if (slashDecision.kind === 'daemon' || slashDecision.kind === 'special') {
+    if (slashDecision.kind === 'daemon' || (slashDecision.kind === 'special' && slashDecision.handler === 'term')) {
       // /term only hands out a writable link for an ALREADY-live session — it must
       // never pre-create one. Special-case it before the canOperate gate + the
       // pre-create block below (mirrors the new-topic route + /card). Its own
       // canOperate gate (inside the handler) is the sole authority; without this,
       // /term in a thread with no existingDs would spawn a worker:null phantom
       // session and pollute the dashboard before replying not_ready/owner_only.
-      // （thread 入口今天只有 /term 一条 in-daemon-block 特判，见 schema special.thread。）
+      // （thread 入口只有 /term 一条 in-daemon-block 特判，见 schema special.thread。）
       if (slashDecision.kind === 'special') {
         await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
         return;
