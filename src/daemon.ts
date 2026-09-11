@@ -309,8 +309,10 @@ import {
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
-import { classifySlash } from './core/command-router.js';
+import { classifySlash, isCommandDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
+import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
+import type { CascadeItem } from './core/command-router.js';
 import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
@@ -19441,6 +19443,88 @@ function buildTurnParticipants(
 
 /** Preserve the established mid-session passthrough semantics when a cold-start
  * scratch loses its registration race to a concurrently-created real session. */
+/**
+ * runtime 级联定序器（设计 docs/design/2026-09-11-command-router.md §6，PR-3）。
+ *
+ * 一条消息里的 `透传命令行 ⏎ … ⏎ 正文` 按书写顺序逐条送出，每条之前等 CLI 空闲、每条透传
+ * 之后等它执行完（core/cli-idle-wait.ts 的两个等待原语）。每条透传仍走今天的
+ * deliverPassthroughToExistingSession（turn 记账、写入闸、卡片一概不变），正文则以本条消息的
+ * 正文重新进入 handleThreadReply（配额、附件、ledger 与普通消息完全一致）。
+ *
+ * 刻意 detached（调用方 `void` 掉、立即返回）：等待可能长达 idleTimeoutMs，不能拿 ingress
+ * 的 admission 锁去等（session-turn-queue.ts 的原则）。超时按今天的 busy delivery 语义把剩余
+ * 条目直接发出并提示一句；worker 中途没了则停止并提示剩余条数。
+ */
+async function runPassthroughCascade(args: {
+  ds: DaemonSession;
+  items: readonly CascadeItem[];
+  anchor: string;
+  larkAppId: string;
+  data: any;
+  ctx: RoutingContext;
+  parsed: { messageId: string; threadId?: string };
+  replyRootId?: string;
+  senderOpenId?: string;
+  senderIsBot: boolean;
+  substitute: boolean;
+}): Promise<void> {
+  const { ds, items, anchor, larkAppId, data, ctx, parsed } = args;
+  const loc = localeForBot(larkAppId);
+  const tag8 = anchor.substring(0, 12);
+  let timedOut = false;
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i]!;
+    const last = i === items.length - 1;
+    if (!timedOut) {
+      const idle = await waitForCliIdle(ds);
+      if (idle === 'gone') {
+        logger.warn(`[${tag8}] cascade stopped: worker gone before item ${i + 1}/${items.length}`);
+        await sessionReply(anchor, tr('daemon.cascade_worker_gone', { n: items.length - i }, loc), 'text', larkAppId);
+        return;
+      }
+      if (idle === 'timeout') {
+        timedOut = true;
+        logger.warn(`[${tag8}] cascade: CLI not idle within ${cascadeTiming.idleTimeoutMs}ms, delivering remaining ${items.length - i} item(s) busy`);
+        await sessionReply(anchor, tr('daemon.cascade_timeout', { seconds: Math.round(cascadeTiming.idleTimeoutMs / 1000), n: items.length - i }, loc), 'text', larkAppId);
+      }
+    }
+    if (item.kind === 'passthrough') {
+      const sentAt = ds.cliReadyGeneration ?? 0;
+      deliverPassthroughToExistingSession(ds, item.cmd, item.content, anchor, larkAppId, {
+        messageId: parsed.messageId,
+        replyRootId: args.replyRootId,
+        senderOpenId: args.senderOpenId,
+        senderIsBot: args.senderIsBot,
+        substitute: args.substitute,
+        inThread: !!parsed.threadId,
+        // 最后一条沿用真实 messageId（与单条透传逐字相同）；之前的用派生 id。
+        ...(last ? {} : { turnId: `${parsed.messageId}#c${i + 1}` }),
+      });
+      logger.info(`[${tag8}] cascade ${i + 1}/${items.length}: ${item.cmd}`);
+      if (!last && !timedOut) {
+        const settled = await waitForCommandSettled(ds, sentAt);
+        if (settled === 'gone') {
+          await sessionReply(anchor, tr('daemon.cascade_worker_gone', { n: items.length - i - 1 }, loc), 'text', larkAppId);
+          return;
+        }
+        if (settled === 'timeout') {
+          timedOut = true;
+          await sessionReply(anchor, tr('daemon.cascade_timeout', { seconds: Math.round(cascadeTiming.idleTimeoutMs / 1000), n: items.length - i - 1 }, loc), 'text', larkAppId);
+        }
+      }
+      continue;
+    }
+    // 正文：以同一条消息（同 messageId → 同 turn / 引用目标）重新进入 thread 入口，正文里
+    // 没有命令 token，路由器判 forward，走与普通消息完全相同的转发链。
+    const bodyData = {
+      ...data,
+      message: { ...(data?.message ?? {}), content: JSON.stringify({ text: item.text }), message_type: 'text' },
+    };
+    logger.info(`[${tag8}] cascade ${i + 1}/${items.length}: body (${item.text.length} chars)`);
+    await handleThreadReply(bodyData, { ...ctx, ingressAdmission: undefined });
+  }
+}
+
 function deliverPassthroughToExistingSession(
   ds: DaemonSession,
   cmd: string,
@@ -19460,8 +19544,14 @@ function deliverPassthroughToExistingSession(
      *  调用方打接纳标——其后同步收尾（落盘/事件派发）抛错不得再诱导重发，否则
      *  /compact 这类非幂等 passthrough 会被重发重复执行。 */
     onDelivered?: () => void;
+    /** runtime 级联（§6）里第 1..N-1 条的派生 turn 标识（`<messageId>#c<i>`）：worker 的
+     *  turn 终态去重按 turnId 键，同一条飞书消息的多条透传不能共用一个 id。缺省 = messageId。
+     *  `quoteTargetId` 仍指向真实消息，所以派生 turn 期间 current-turn provenance 的
+     *  `quoteTargetId === turnId` 校验不成立——级联里的透传本就不产生需要归属的 CLI 回复。 */
+    turnId?: string;
   },
 ): void {
+  const turnId = turn.turnId ?? turn.messageId;
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
     // Passthrough commands bypass the normal message-forwarding block, so bind
     // the accepted Lark turn before the worker rotates its marker at the PTY
@@ -19474,7 +19564,7 @@ function deliverPassthroughToExistingSession(
       : 'thread';
     // Passthrough is a raw CLI command (no @-mentions) — window is the sender only.
     const passthroughWindow = buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined);
-    beginReplyTargetTurn(ds, turn.replyRootId, turn.messageId, new Date().toISOString(), {
+    beginReplyTargetTurn(ds, turn.replyRootId, turnId, new Date().toISOString(), {
       quoteOnly: substituteReplyMode === 'quote',
       substitute: turn.substitute,
       senderOpenId: turn.senderOpenId,
@@ -19503,13 +19593,13 @@ function deliverPassthroughToExistingSession(
       // Same reason as the worker-pool raw_input send: a passthrough is a real
       // mojo turn, so it needs the live credential snapshot too.
       ...(mojoLivePatchForSession(ds) ?? {}),
-      turnId: turn.messageId,
+      turnId,
     });
     if (!accepted) {
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
       return;
     }
-    beginNewTurn(ds, commandContent, turn.messageId);
+    beginNewTurn(ds, commandContent, turnId);
     turn.onDelivered?.();
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
@@ -20278,7 +20368,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     senderIsBot: senderIsBotForSlashGate,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
   });
-  if (slashDecision.kind !== 'forward') {
+  if (isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
       scope,
@@ -22034,8 +22124,63 @@ async function handleThreadReplyAdmitted(
     coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
     senderIsBot: isBotSenderType || isForeignBot,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
+    // runtime 级联（§6）只在 PTY 家族后端、非 adopt 会话上跑：riff / mojo 一条透传是两次
+    // write、turn 边界与命令不是 1:1；adopt 会话人机输入交错。带附件的消息整条按今天转发。
+    cascadeCapable: !!existingDs && !isRemoteBackendSession(existingDs)
+      && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
+    hasAttachments: resources.length > 0,
   });
-  if (slashDecision.kind !== 'forward') {
+  if (slashDecision.kind === 'cascade' || slashDecision.kind === 'cascade_unsupported') {
+    const cascadeDs = existingDs!; // 路由器只在活 worker 的相位上给出级联决策
+    const cascadeDeps = commandDepsForInvocation({
+      scope,
+      chatId: ctxChatId,
+      anchor,
+      messageId: parsed.messageId,
+      replyRootId,
+    });
+    const cascadeChatId = cascadeDs.chatId ?? threadChatId;
+    // 与单条透传同一组闸，逐条命令过一遍：grant 限制、排队激活提交闸、/fast 后端门。
+    for (const item of slashDecision.items) {
+      if (item.kind !== 'passthrough') continue;
+      const restrictedText = grantRestrictedSlashCommandText(larkAppId, cascadeChatId, threadSenderOpenId, item.cmd);
+      if (restrictedText) {
+        await cascadeDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
+        return;
+      }
+    }
+    if (slashDecision.kind === 'cascade_unsupported') {
+      await cascadeDeps.sessionReply(anchor, tr('daemon.cascade_unsupported', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+      return;
+    }
+    if (cascadeDs.worker && !cascadeDs.worker.killed && hasQueuedActivationAdmissionGate(cascadeDs)) {
+      await cascadeDeps.sessionReply(anchor, tr('daemon.cmd_activation_pending', { cmd: slashDecision.items[0]!.kind === 'passthrough' ? slashDecision.items[0]!.cmd : '' }, localeForBot(larkAppId)), 'text', larkAppId);
+      return;
+    }
+    if (slashDecision.items.some(it => it.kind === 'passthrough' && it.cmd === '/fast') && fastToggleUnsupportedBackend(cascadeDs)) {
+      await cascadeDeps.sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+      return;
+    }
+    // 消息已被 detached 的定序器接管：之后的失败由它自己在话题里提示，不再诱导重发。
+    markIngressAdmitted(ctx);
+    void runPassthroughCascade({
+      ds: cascadeDs,
+      items: slashDecision.items,
+      anchor,
+      larkAppId,
+      data,
+      ctx,
+      parsed,
+      replyRootId,
+      senderOpenId: threadSenderOpenId,
+      senderIsBot: isForeignBot,
+      substitute: !!substituteTrigger,
+    }).catch(err => {
+      logger.error(`[${anchor.substring(0, 12)}] cascade failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return;
+  }
+  if (isCommandDecision(slashDecision)) {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
       scope,

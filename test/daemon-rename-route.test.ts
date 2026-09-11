@@ -210,6 +210,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 
 import { registerBot } from '../src/bot-registry.js';
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
+import { __testOnly_setCascadeTiming } from '../src/core/cli-idle-wait.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {
   __testOnly_activeSessions as activeSessions,
@@ -3658,5 +3659,82 @@ describe('/repo trusted sibling production routing', () => {
     expect(repliedText()).toContain('仅 allowedUsers 可执行');
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * runtime 级联定序器（docs/design/2026-09-11-command-router.md §6，PR-3）：thread + 活 worker 上
+ * 「透传命令行 ⏎ …」逐条送出，每条之间等 CLI 执行完；后端跑不了时 fail closed。
+ * 只钉透传项的顺序与 turn 标识；正文项的重入走与普通消息相同的链路，由既有用例覆盖。
+ */
+describe('runtime passthrough cascade (PR-3)', () => {
+  const tick = (ms: number) => new Promise(r => setTimeout(r, ms));
+  beforeEach(() => {
+    __testOnly_setCascadeTiming({ idleTimeoutMs: 400, busyGraceMs: 40, pollMs: 5 });
+  });
+
+  function seedLiveThreadSession(anchor: string): { ds: DaemonSession; raws: () => any[] } {
+    const ds = seedThreadSession(anchor, '级联');
+    const send = vi.fn(() => true);
+    (ds as any).worker = { killed: false, pid: 4242, send };
+    ds.cliReady = true;
+    ds.cliReadyGeneration = 1;
+    ds.lastScreenStatus = 'idle';
+    ds.session.cliId = 'claude-code';
+    return { ds, raws: () => send.mock.calls.map(c => c[0]).filter((m: any) => m.type === 'raw_input') };
+  }
+
+  it('瞬时命令：第一条立即送出，宽限窗内没忙就送第二条；派生/真实 turn id 各归其位', async () => {
+    const { raws } = seedLiveThreadSession('om_root_casc1');
+    await handleThreadReply(
+      makeEventData('om_casc_1', '/model opus\n/clear', 'om_root_casc1'),
+      makeCtx('om_root_casc1', 'om_casc_1'),
+    );
+    await tick(15);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(raws()[0].turnId).toBe('om_casc_1#c1');
+    await tick(120);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus', '/clear']);
+    expect(raws()[1].turnId).toBe('om_casc_1');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it('真忙命令：第二条要等到 prompt_ready 代际递增才送', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc2');
+    await handleThreadReply(
+      makeEventData('om_casc_2', '/compact 只留登录上下文\n/clear', 'om_root_casc2'),
+      makeCtx('om_root_casc2', 'om_casc_2'),
+    );
+    await tick(15);
+    expect(raws()).toHaveLength(1);
+    ds.lastScreenStatus = 'working';
+    await tick(150);
+    expect(raws()).toHaveLength(1);
+    ds.cliReadyGeneration = 2;
+    ds.lastScreenStatus = 'idle';
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear']);
+  });
+
+  it('adopt 会话跑不了级联：fail closed 回一句，什么都不发', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc3');
+    (ds as any).adoptedFrom = { kind: 'tmux', pane: '%1' };
+    await handleThreadReply(
+      makeEventData('om_casc_3', '/model opus\n/clear', 'om_root_casc3'),
+      makeCtx('om_root_casc3', 'om_casc_3'),
+    );
+    await tick(30);
+    expect(raws()).toHaveLength(0);
+    expect(repliedText()).toContain('分条发送');
+  });
+
+  it('单条透传不受影响：仍然立即以真实 messageId 送出', async () => {
+    const { raws } = seedLiveThreadSession('om_root_casc4');
+    await handleThreadReply(
+      makeEventData('om_casc_4', '/model opus', 'om_root_casc4'),
+      makeCtx('om_root_casc4', 'om_casc_4'),
+    );
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(raws()[0].turnId).toBe('om_casc_4');
   });
 });

@@ -87,7 +87,16 @@ export interface SlashRouteInput {
   coldStartPassthrough: ReadonlySet<string>;
   senderIsBot: boolean;
   acceptSlashFromBots: boolean;
+  /** 这个会话能不能跑 runtime 级联（§6）：非 riff/mojo 后端、非 adopt 会话。缺省 = 不能。 */
+  cascadeCapable?: boolean;
+  /** 消息带附件时不切级联（附件跟正文走一条路），整条按今天转发。 */
+  hasAttachments?: boolean;
 }
+
+/** runtime 级联的一项：透传命令行，或最后的正文。 */
+export type CascadeItem =
+  | { kind: 'passthrough'; cmd: string; content: string }
+  | { kind: 'body'; text: string };
 
 export type SlashRouteDecision =
   /** 交给 CLI 当普通消息：没有命令 token / 讨论文本 / bot 发送方被门掉 / 认不出的 `/xxx`。 */
@@ -97,7 +106,49 @@ export type SlashRouteDecision =
   /** 透传给 CLI：冷启动拉起会话 / 送进已有 worker / 两种拒绝（文案不同，如实保留）。 */
   | { kind: 'passthrough'; cmd: string; content: string; delivery: 'cold_start' | 'existing' | 'reject_needs_session' | 'reject_needs_active_cli' }
   /** botmux 自己的命令，带无会话时的会话政策。 */
-  | { kind: 'daemon'; cmd: string; content: string; sessionPolicy: 'sessionless' | 'existing_only' | 'precreate' | 'existing' };
+  | { kind: 'daemon'; cmd: string; content: string; sessionPolicy: 'sessionless' | 'existing_only' | 'precreate' | 'existing' }
+  /** runtime 级联（PR-3）：≥1 条透传命令行 + 可选正文，按书写顺序逐条等 CLI 空闲后送出（§6）。 */
+  | { kind: 'cascade'; items: CascadeItem[] }
+  /** 级联形状成立，但该会话跑不了（riff / mojo / adopt）：fail closed，回一句"请分条发送"。 */
+  | { kind: 'cascade_unsupported'; items: CascadeItem[] };
+
+/**
+ * runtime 级联的形状（R3 / §4 会话内文法）：连续的前缀块里每一行都是一条透传命令行
+ * （单行形态能过 parseSlashCommandInvocation、且 cmd 在透传集里），从第一条不以命令
+ * 开头的行起是正文；正文**不能**以 `/` 开头（那是一条 daemon / 未知命令行，不是正文），
+ * 空行只在前缀块内跳过。至少 1 条透传 + 至少 2 项才算级联（单条透传走今天的路径）。
+ * 返回 null 表示不是级联，调用方按今天的 forward 处理。
+ */
+export function parseRuntimeCascade(text: string, passthrough: ReadonlySet<string>): CascadeItem[] | null {
+  const lines = text.trim().split(/\r?\n/);
+  const items: CascadeItem[] = [];
+  let i = 0;
+  for (; i < lines.length; i += 1) {
+    const line = lines[i]!.trim();
+    if (line === '') continue;
+    if (!line.startsWith('/')) break;
+    const single = parseSlashCommandInvocation(line);
+    if (!single || !passthrough.has(single.cmd)) {
+      // 前缀块里出现非透传的命令行（daemon 命令 / 未知 / 占位符）→ 不是级联。
+      return null;
+    }
+    items.push({ kind: 'passthrough', cmd: single.cmd, content: single.content });
+  }
+  if (items.length === 0) return null;
+  if (i < lines.length) {
+    const body = lines.slice(i).join('\n').trim();
+    if (body.startsWith('/')) return null;
+    if (body) items.push({ kind: 'body', text: body });
+  }
+  return items.length >= 2 ? items : null;
+}
+
+/** 带 cmd/content 的三类决策（special / passthrough / daemon）——入口里按命令执行的那一段只认这三类。 */
+export type SlashCommandDecision = Extract<SlashRouteDecision, { cmd: string }>;
+
+export function isCommandDecision(decision: SlashRouteDecision): decision is SlashCommandDecision {
+  return decision.kind === 'special' || decision.kind === 'passthrough' || decision.kind === 'daemon';
+}
 
 export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   // ① bot 门：在 parse 之前——被门掉的 bot 消息连"是不是命令"都不判。
@@ -108,7 +159,14 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   // ② parse：不以 `/` 开头是"没有命令"；占位符/多行是"讨论文本"。
   const invocation = parseSlashCommandInvocation(input.text);
   if (!invocation) {
-    return { kind: 'forward', reason: input.text.trim().startsWith('/') ? 'discussion' : 'no_slash' };
+    if (!input.text.trim().startsWith('/')) return { kind: 'forward', reason: 'no_slash' };
+    // 多行被今天的解析器判成"讨论文本"的，只在「thread + 活 worker + 无附件」下再试一次
+    // 级联形状（PR-3 唯一的语义变化，§9）；其它相位/入口维持今天的整条转发。
+    if (input.context === 'thread' && phaseHasLiveWorker(input.phase) && !input.hasAttachments) {
+      const items = parseRuntimeCascade(input.text, input.passthrough);
+      if (items) return input.cascadeCapable ? { kind: 'cascade', items } : { kind: 'cascade_unsupported', items };
+    }
+    return { kind: 'forward', reason: 'discussion' };
   }
   const { cmd, content } = invocation;
   const special = ROUTE_SPECIAL_COMMANDS.get(cmd);

@@ -180,6 +180,8 @@ type SessionPhase =
 
 跨相位顺序由相位决定，文本里 `/model` 写在 `/repo` 前后无关。runtime 相位内 `/model opus ⏎ /clear ⏎ 正文` = 等空闲 → 送 `/model opus` → 等下一次空闲 → 送 `/clear` → 等下一次空闲 → 送正文。
 
+定序器怎么判"执行完"（实现时补的第二样证据）：daemon 除了 `prompt_ready`（代际）之外还能看到 worker 在忙/闲转换时立即上报的 `screen_update.status`（`ds.lastScreenStatus`）。每条透传发出后先开一个 **忙态宽限窗**（3s）：窗内看到代际增量 → 完成；看到 `working` → 转入等代际增量或屏幕回到非 `working`（上限 120s）；窗内两样都没看到 → `/model` `/clear` 这类瞬时命令没让 CLI 进入忙态，视为完成。发送每条之前另等一次"空闲"（`cliReady` 且屏幕非 `working`）。轮询 200ms，不订阅事件——最小实现。
+
 定序器的边界：
 
 - **turn 标识**：级联第 2..N 条不能复用飞书 `messageId` 当 `turnId`——worker 的 `InputTurnDeduper` 按 `turnId` 去重，重复的 id 会被当成重投递丢弃。定序器给每条派生一个独立 turn 标识（新增字段，不复用专指 durable 重投递次数的 `dispatchAttempt`），并按它注册回复目标/卡片血缘；`quoteTargetId` 仍指向真实 `messageId`。`prompt_ready` 不带 turnId，不受此影响。
@@ -335,3 +337,19 @@ PR-1 独立有价值；PR-2 若延期，PR-1 不受影响；PR-3 依赖 PR-2 的
 - `isSessionlessCommandInvocation` 对 `/watch-comment` 按参数分叉是 schema 表达不了的（`sessionPolicy` 是命令级），保留为路由器里的一个显式特例，schema 的 notes 记明。
 
 PR-2 收口（有意变化落地）：thread 入口的 `/card` `/cot` 改为与新话题入口一致的前置特判——schema 的 `special.thread` 两个数据值从缺席改为 `before-passthrough`，路由器不动；daemon thread 入口在 `/vc-auth` 之后按 handler 派给 `handleCardCommand` / `handleCotCommand`（两者内部按 anchor 自己取 ds，有会话时与原先经 `handleCommand` switch 的效果一致；无会话时不再预建幽灵会话）。差分测试的 INTENTIONAL 名单登记了这一条（thread × `/card`|`/cot` × `daemon precreate/existing` → `special`），其余 269 万组仍逐字相等；`test/daemon-rename-route.test.ts` 加两条 daemon 级用例钉「无会话 → 不建会话仍有回复」。`/term` 在 thread 入口仍留在 DAEMON 块内（透传闸之后）：差异只在「`/term` 同时进了透传集」这个被 `normalizePassthroughCommand` 排除的形状上可观测，不值得改。
+
+### PR-3 runtime 级联（2026-09-12 凌晨）
+
+落地形状：
+
+- **路由器**（`command-router.ts`）：`parseRuntimeCascade`——今天被 `parseSlashCommandInvocation` 判成"讨论文本"的多行消息，只在 **thread + 活 worker + 无附件** 下再试一次级联形状：前缀块每行都是单行形态可解析、且 cmd 在透传集里的命令行（空行跳过）；从第一条不以 `/` 开头的行起是正文；正文以 `/` 开头（daemon / 未知命令行）→ 不是级联；≥1 条透传且 ≥2 项才算。新增决策 `cascade { items }` 与 `cascade_unsupported`（会话跑不了：`isRemoteBackendSession` 或 adopt，由入参 `cascadeCapable` 决定），其它相位/入口/带附件维持今天的整条转发。差分测试的 INTENTIONAL 名单登记这一条。
+- **等待原语**（`core/cli-idle-wait.ts`，纯函数、轮询）：`waitForCliIdle`（worker 活、`cliReady`、屏幕非 `working`）与 `waitForCommandSettled`（§6 的忙态宽限窗 + 代际增量/屏幕回闲）。
+- **定序器**（daemon.ts `runPassthroughCascade`，detached）：每条透传仍走 `deliverPassthroughToExistingSession`（新增可选 `turnId`：第 1..N-1 条用 `<messageId>#c<i>`，最后一条用真实 messageId；`quoteTargetId` 始终是真实消息）；正文以同一条消息的正文重新进入 `handleThreadReply`（配额/附件/ledger 与普通消息完全一致，路由器对无命令 token 的正文判 forward）。超时 → 剩余条目按 busy delivery 直接发出并提示一句；worker 中途没了 → 停止并提示剩余条数。入口处逐条过 grant 限制、排队激活闸、`/fast` 后端门，然后 `markIngressAdmitted` 交给定序器。
+- **验证**：`test/cli-idle-wait.test.ts`（两原语）；`test/command-router-cascade.test.ts`（§13 的级联行 + 接入条件）；`test/daemon-rename-route.test.ts` 加四条 daemon 级用例：瞬时命令宽限后送第二条、真忙命令等到代际递增、adopt 会话 fail closed、单条透传不受影响；穷举差分 INTENTIONAL 第二条；路由层 34 个文件全绿。
+
+决策与拿不准：
+
+- **派生 turn id 的代价**：第 1..N-1 条透传的 `quoteTargetId !== turnId`，`current-turn-provenance` 对这些中间 turn 的归属校验不成立——只影响"CLI 在执行 `/compact` 期间调 `botmux send` 归属到当前 turn"这种几乎不会发生的组合；最后一条与单条透传逐字相同。
+- **瞬时命令的判定靠 3s 宽限窗**：若某个 CLI 对 `/model` 的响应既不触发忙态上报也超过 3s，第二条会提前发出（等价于今天的 busy delivery），不会丢。真实 CLI 上的时序还没肉眼验证过（§10 手动项），是 dogfood 时第一件要看的事。
+- **正文项的重入**用 `handleThreadReply(bodyData)`：同 messageId、`message_type` 改成 text、原 mentions 保留。带附件的消息不切级联（`hasAttachments`），所以重入时不会丢资源。
+- 没做：`/help` 用法串未提及级联写法（等 dogfood 后再写文案）；riff/mojo 的级联支持需要 worker 侧按写入命令的边界信号（§14）。

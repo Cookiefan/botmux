@@ -1169,6 +1169,9 @@ export const messages: Record<string, string> = {
   // ─── Topic directive header (`[title] /t /repo … /model … body`) rejections ──
   // Fail closed: one bad field voids the whole header, so this reply is the
   // user's only feedback and must name the offending field.
+  'daemon.cascade_unsupported': '⚠️ This session\'s backend (remote sandbox / adopted external session) cannot run several commands cascaded in one message — send them one by one.',
+  'daemon.cascade_timeout': '⚠️ The CLI did not become idle within {seconds}s; the remaining {n} cascaded item(s) were sent as-is.',
+  'daemon.cascade_worker_gone': '⚠️ The session ended in the middle of the cascade; the remaining {n} item(s) were not sent.',
   'daemon.topic_header_needs_new_topic': '⚠️ A topic header only takes effect on the first message of a NEW topic, so this one did nothing. To change repo/model/reasoning effort inside a running topic, send `/repo`, `/model` or `/effort` on their own.',
   'daemon.topic_header_ready': '💬 Topic ready ({summary}). Send a task in this topic.',
   'daemon.topic_header_ready_repo': 'repo {repo}',

@@ -78,6 +78,14 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: OracleDecision, next: 
     && legacy.kind === 'daemon' && (legacy.cmd === '/card' || legacy.cmd === '/cot')
     && next.kind === 'special' && next.cmd === legacy.cmd && next.content === legacy.content
     && next.handler === legacy.cmd.slice(1),
+  // PR-3：thread + 活 worker 上"透传命令行 ⏎ …"的多行消息，今天整条被判讨论文本转发，
+  // 现在按级联逐条排队（cascadeCapable 缺省为 false → cascade_unsupported，同属这一条变化）。
+  (input, legacy, next) =>
+    input.context === 'thread'
+    && (input.phase === 'spawning' || input.phase === 'ready' || input.phase === 'running')
+    && legacy.kind === 'forward' && legacy.reason === 'discussion'
+    && (next.kind === 'cascade' || next.kind === 'cascade_unsupported')
+    && next.items.length >= 2 && next.items[0]!.kind === 'passthrough',
 ];
 describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
   it('小字母表 × 长度 ≤ 3 × 入口 × 相位 × 透传配置 × 发送方：决策逐字相等', () => {
@@ -133,7 +141,10 @@ describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
     for (const c of cases) {
       const cfg = PASSTHROUGH_CONFIGS[0]!;
       const input: SlashRouteInput = { ...c, passthrough: cfg.passthrough, coldStartPassthrough: cfg.coldStart, senderIsBot: false, acceptSlashFromBots: true };
-      expect(classifySlash(input), c.text).toEqual(legacySlashRoute({ ...input, phase: toOraclePhase(c.phase)! }));
+      const legacy = legacySlashRoute({ ...input, phase: toOraclePhase(c.phase)! });
+      const next = classifySlash(input);
+      if (INTENTIONAL.some(rule => rule(input, legacy, next))) continue; // 登记过的有意变化（PR-3 级联）
+      expect(next, c.text).toEqual(legacy);
     }
   });
 });
