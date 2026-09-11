@@ -688,6 +688,16 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText().length).toBeGreaterThan(0);
   });
 
+  it('thread reply with no existing session: `/term` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_term', '/term', 'om_root_term'),
+      makeCtx('om_root_term', 'om_reply_term'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
+  });
+
   it('thread reply with no existing session: `/cot status` creates NOTHING and still replies', async () => {
     await handleThreadReply(
       makeEventData('om_reply_cot', '/cot status', 'om_root_cot'),

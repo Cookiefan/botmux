@@ -383,3 +383,5 @@ PR-2 收口（有意变化落地）：thread 入口的 `/card` `/cot` 改为与�
 - 源码级守卫测试（`initial-passthrough-ownership` 等）仍是 grep daemon.ts，没换成真实用例；§9 点名的 `/term` `/vc-auth` daemon 级用例、裸 `/repo` 含空格实例没补（`/role` 多行豁免已补）。
 - oracle 没有退役条件：INTENTIONAL 名单已 2 条；建议在 PR-3 上线并稳定一个版本后把 oracle 冻结为"发布基线"，新的有意变化改为对比上一发布基线而不是继续累积规则。
 - riff / mojo / adopt 上的多行透传消息从"整条转发"变成 `cascade_unsupported` 拒绝——这是设计选择（fail closed 而非静默错序），已在 §9/§13 登记；若 dogfood 里发现有人依赖旧行为，退回整条转发是一行改动。
+
+补测（2026-09-12 03:00，额度窗口重置后的 re-trigger）：`test/session-phase.test.ts` 直接钉 `deriveSessionPhase` 的优先级与两个谓词（此前差分把相位当输入轴，推导本身零覆盖）；`daemon-rename-route.test.ts` 补 thread 无会话 `/term` 不建会话的用例。§9 里仍缺的只剩 `/vc-auth` daemon 级用例（需要 VC 配置夹具）与裸 `/repo` 含空格路径的实例（command-handler 的 /repo 用例没有可克隆的路径形态夹具），留给 dogfood 之后。
