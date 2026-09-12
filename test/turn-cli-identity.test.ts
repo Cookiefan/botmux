@@ -32,6 +32,14 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
   mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
 }));
 
+// lark-cli per-person HOME (device-code identity). A HOME present here wins over
+// the legacy bot-app token; null means "no device-code login for this person".
+const larkHomes = new Map<string, string>();
+vi.mock('../src/services/lark-cli-auth.js', () => ({
+  larkCliHomeForTurn: vi.fn((openId: string | undefined) =>
+    openId && larkHomes.has(openId) ? larkHomes.get(openId)! : null),
+}));
+
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
 const { sessionIdentityPath, writeSessionIdentity } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
@@ -46,6 +54,7 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-turn-identity-'));
   tokens.clear();
   bytedcliJwts.clear();
+  larkHomes.clear();
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -78,6 +87,28 @@ describe('publishTurnCliIdentity — the sender acts as themselves', () => {
     const body = readFileSync(larkPath(), 'utf8');
     expect(body).toContain('tok-alice');
     expect(body).toContain(APP);
+  });
+
+  it('prefers the per-person HOME (device code) and injects no token', async () => {
+    // Both exist: a legacy bot-app token AND a device-code HOME. The HOME wins.
+    tokens.set(`${APP}|${ALICE}`, 'legacy-bot-token');
+    larkHomes.set(ALICE, '/data/lark-cli-home/alice');
+    await publish(botConfig(), ALICE);
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='user-home'");
+    expect(body).toContain("BOTMUX_IDENTITY_HOME='/data/lark-cli-home/alice'");
+    // The legacy token is NOT injected on this path.
+    expect(body).not.toContain('legacy-bot-token');
+    expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
+  });
+
+  it('falls back to the legacy bot-app token when no device-code HOME exists', async () => {
+    tokens.set(`${APP}|${ALICE}`, 'legacy-bot-token');
+    // larkHomes empty ⟹ no HOME ⟹ old injected-token path still serves them.
+    await publish(botConfig(), ALICE);
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='user'");
+    expect(body).toContain('legacy-bot-token');
   });
 
   it('swaps the acting identity when a different person speaks next', async () => {

@@ -9,6 +9,7 @@ import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
 import { unauthorizedOutcomeFor, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual } from './close-residual.js';
@@ -2892,7 +2893,19 @@ export async function handleCommand(
         const loginOpenId = message.senderId;
         if (subCmd === 'status' || subCmd === '状态') {
           // 按人查：报「你自己」授权了没。别人的授权状态与你无关，也不该让你看见。
-          const lines = [getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId)];
+          // 当按触发人鉴权开着时，lark-cli 的主授权是设备码 per-person HOME，先报它；
+          // bot 应用 OAuth 那行仅在确有该 token 时才补（兼容旧授权 / 服务器侧功能）。
+          const lines: string[] = [];
+          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+            lines.push(t(
+              hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no',
+              undefined, loc,
+            ));
+            const botToken = getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId);
+            if (/已|valid|authorized/i.test(botToken)) lines.push(botToken);
+          } else {
+            lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
+          }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。只在这个
           // bot 真的会用 bytedcli 时才多说一行，否则是噪音。
           if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
@@ -2939,6 +2952,60 @@ export async function handleCommand(
             ...loginPromptLines(scopedUrl, loc, 'cmd.login.scope_title'),
             '',
             t('cmd.login.scope_footer', { scopes: requested.join(' ') }, loc),
+          ].join('\n'));
+          break;
+        }
+
+        // `/login done` / `/login 完成` —— 收尾上一次 lark-cli 设备码授权（扫码）。
+        if (subCmd === 'done' || subCmd === '完成') {
+          if (!loginOpenId) { await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc)); break; }
+          // 优先 lark-cli；若进行中的是 bytedcli（老用法 `/login bytedcli done`），
+          // 由下面的 bytedcli 分支处理。这里只在有 lark-cli challenge 时认领。
+          if (pendingLarkCliChallenge(loginOpenId) || hasLarkCliHome(loginOpenId)) {
+            const { state, detail } = await completeLarkCliLogin(loginOpenId);
+            await sessionReply(rootId, state === 'authorized'
+              ? t('cmd.login.lark_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.lark_pending', undefined, loc)
+                : t('cmd.login.lark_failed', { detail: detail ?? 'unknown' }, loc));
+            break;
+          }
+          // 没有 lark-cli challenge；若 bytedcli 有进行中的，交给其分支。
+          if (pendingBytedcliChallenge(loginOpenId)) {
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, pendingBytedcliChallenge(loginOpenId)!);
+            await sessionReply(rootId, state === 'authorized'
+              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.bytedcli_pending', undefined, loc)
+                : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+            break;
+          }
+          await sessionReply(rootId, t('cmd.login.lark_no_challenge', undefined, loc));
+          break;
+        }
+
+        // `/login`（无子命令）—— 默认走 lark-cli 设备码（扫码/点链接）授权。这是
+        // 「按触发人鉴权」里 lark-cli 取身份的主路径：用 lark-cli 通用应用，绕开 bot
+        // 应用可用范围。当功能开着时走这里；功能关闭时回落到下面的 bot 应用 OAuth。
+        const triggerUserAuthOnLark = !!botCfg2.triggerUserAuth?.enabled
+          && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
+        if (!subCmd && triggerUserAuthOnLark) {
+          if (!loginOpenId) { await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc)); break; }
+          const started = await beginLarkCliLogin(loginOpenId);
+          if (!started) {
+            await sessionReply(rootId, t('cmd.login.lark_begin_failed',
+              { detail: 'lark-cli auth login（设备码）未能发起；请确认服务器已配置 lark-cli 应用' }, loc));
+            break;
+          }
+          await sessionReply(rootId, [
+            t('cmd.login.lark_title', undefined, loc),
+            '',
+            t('cmd.login.lark_step1', undefined, loc),
+            started.authUrl,
+            '',
+            t('cmd.login.lark_step2', undefined, loc),
+            '',
+            t('cmd.login.lark_note', undefined, loc),
           ].join('\n'));
           break;
         }

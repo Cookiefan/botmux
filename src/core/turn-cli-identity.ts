@@ -18,6 +18,7 @@ import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { mintBytedcliJwts } from '../services/bytedcli-auth.js';
+import { larkCliHomeForTurn } from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import {
   triggerUserAuthApplies,
@@ -241,6 +242,16 @@ async function resolveIdentityFor(
   senderOpenId: string,
 ): Promise<CliIdentity | null> {
   if (tool === 'lark-cli') {
+    // Preferred path: the per-person HOME created by the device-code (`/login`)
+    // flow. lark-cli then acts as that person using its OWN app's credentials —
+    // no token is injected, and this does not require the person to be inside the
+    // bot app's availability scope. The wrapper only exports HOME.
+    const home = larkCliHomeForTurn(senderOpenId);
+    if (home) return { tool: 'lark-cli', mode: 'user-home', home };
+
+    // Back-compat: a person who authorized through the bot app before the
+    // device-code path existed still gets their injected token. New logins go to
+    // the HOME above; this branch only fires for a legacy token with no HOME.
     if (!botConfig.larkAppId || !botConfig.larkAppSecret) return null;
     const token = await resolveUserToken(
       botConfig.larkAppId,
