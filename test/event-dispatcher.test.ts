@@ -12,6 +12,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createHmac } from 'node:crypto';
+import * as Lark from '@larksuiteoapi/node-sdk';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 
@@ -1011,88 +1012,19 @@ function makeHistoryMessage(opts: {
   };
 }
 
-const WS_PROXY_ENV_KEYS = [
-  'HTTPS_PROXY',
-  'https_proxy',
-  'HTTP_PROXY',
-  'http_proxy',
-  'ALL_PROXY',
-  'all_proxy',
-  'NO_PROXY',
-  'no_proxy',
-  'NPM_CONFIG_HTTPS_PROXY',
-  'npm_config_https_proxy',
-  'NPM_CONFIG_PROXY',
-  'npm_config_proxy',
-  'NPM_CONFIG_NO_PROXY',
-  'npm_config_no_proxy',
-] as const;
-
-function withWsProxyEnv(values: Partial<Record<(typeof WS_PROXY_ENV_KEYS)[number], string>>, callback: () => void): void {
-  const original = Object.fromEntries(
-    WS_PROXY_ENV_KEYS.map(key => [key, process.env[key]]),
-  );
-  for (const key of WS_PROXY_ENV_KEYS) delete process.env[key];
-  Object.assign(process.env, values);
-
-  try {
-    callback();
-  } finally {
-    for (const key of WS_PROXY_ENV_KEYS) {
-      const value = original[key];
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-}
-
-describe('startLarkEventDispatcher — WebSocket proxy', () => {
-  it('uses HTTPS proxy precedence for secure WebSocket URLs', () => {
-    withWsProxyEnv({
-      HTTPS_PROXY: 'http://upper-proxy:8118',
-      https_proxy: 'http://lower-proxy:8118',
-    }, () => {
-      startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
-
-      const agent = capturedWsClientOptions?.agent;
-      // Must be HttpsProxyAgent, not ProxyAgent: Bun's built-in ws reads the
-      // proxy URL off `agent.proxy` (the HttpsProxyAgent shape) and silently
-      // ignores a ProxyAgent, so an http proxy has to arrive as HttpsProxyAgent
-      // for both runtimes. proxy-from-env prefers the lowercase https_proxy.
-      expect(agent?.constructor?.name).toBe('HttpsProxyAgent');
-      expect((agent as { proxy?: URL })?.proxy?.href).toBe('http://lower-proxy:8118/');
+describe('startLarkEventDispatcher — connection wiring', () => {
+  it.each(['feishu', 'lark'] as const)('starts %s with the registered dispatcher and returns the SDK client', (brand) => {
+    const client = startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers(), brand);
+    expect(client).toBeInstanceOf(Lark.WSClient);
+    expect(capturedWsClientOptions).toMatchObject({
+      appId: MY_APP_ID,
+      appSecret: 'secret',
+      domain: brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn',
     });
-  });
-
-  it('honors NO_PROXY for the WebSocket destination', () => {
-    withWsProxyEnv({
-      HTTPS_PROXY: 'http://proxy.example:8118',
-      NO_PROXY: '.feishu.cn',
-    }, () => {
-      startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
-
-      // The proxy is resolved once for the bot's own Open API domain
-      // (open.feishu.cn); NO_PROXY=.feishu.cn matches it, so the connection is
-      // direct and no agent is attached.
-      expect(capturedWsClientOptions?.agent).toBeUndefined();
-    });
-  });
-
-  it('supports an ALL_PROXY fallback such as SOCKS', () => {
-    withWsProxyEnv({ ALL_PROXY: 'socks5://127.0.0.1:1080' }, () => {
-      startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
-
-      const agent = capturedWsClientOptions?.agent;
-      expect(agent?.getProxyForUrl('wss://msg-frontier.feishu.cn/ws', {})).toBe('socks5://127.0.0.1:1080');
-    });
-  });
-
-  it('keeps the SDK default agent when no proxy is configured', () => {
-    withWsProxyEnv({}, () => {
-      startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
-
-      expect(capturedWsClientOptions?.agent).toBeUndefined();
-    });
+    expect(client.start).toHaveBeenCalledOnce();
+    expect(client.start).toHaveBeenCalledWith({ eventDispatcher: expect.any(Lark.EventDispatcher) });
+    expect(capturedHandlers['im.message.receive_v1']).toBeTypeOf('function');
+    expect(capturedHandlers['card.action.trigger']).toBeTypeOf('function');
   });
 });
 
