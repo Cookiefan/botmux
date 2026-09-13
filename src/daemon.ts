@@ -213,9 +213,9 @@ import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-pr
 import type { CliId } from './adapters/cli/types.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
-import { scanProjects, scanMultipleProjects, type ProjectInfo } from './services/project-scanner.js';
+import { scanProjects, scanMultipleProjects, projectDisplayName } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { buildTraexInitializationCard } from './im/lark/traex-initialization-card.js';
+import { buildTraexStartupModeCard } from './im/lark/traex-initialization-card.js';
 import { checkForgeTraexStartupAvailability } from './core/forge-availability.js';
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
@@ -18890,7 +18890,26 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
     return;
   }
-  if (ds.pendingRepo) {
+  // Forge 可用时，TraeX 人工首轮改为两段确认：先复用 master repo card，
+  // 工作目录确定后再发启动方式卡；确认前绝不 fork worker。Forge 不可用则沿用
+  // master 的普通 TraeX 启动路径。
+  // Bot/监听器/替身/显式 Forge 指令保留既有直达路径，避免自动化入口等待一个
+  // 永远不会发生的人工点击，也保留专家快捷用法。
+  const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(content);
+  const traexInitializationCandidate =
+    botCfg.cliId === 'traex'
+    && !isBotSenderType
+    && !messageListener
+    && !substituteTrigger
+    && !workflowGrillPrompt
+    && !explicitForgePrompt
+    && !isExistingLarkThreadReply(parsed);
+  const forgeAvailability = traexInitializationCandidate
+    ? checkForgeTraexStartupAvailability()
+    : undefined;
+  const shouldShowTraexInitialization = forgeAvailability?.available === true
+    && !(pinnedWorkingDir && autoWt);
+  if (ds.pendingRepo && !shouldShowTraexInitialization) {
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
@@ -18905,61 +18924,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 接纳标记按分支下沉，不绑在 appendMessage 上：queues/*.jsonl 仅供 dashboard
   // 预览，无投递重放语义；且 replyInvalidWorkingDirs 是「放弃本轮」分支（关闭
   // 会话后才回复），放弃前的失败必须保持「请重发」提示。
-
-  // TraeX 人工首轮先走统一初始化卡：仓库、运行方式和可编辑首轮提示词一次确认，
-  // 确认前绝不 fork worker。Bot/监听器/替身/显式 Forge 指令保留既有直达路径，
-  // 避免自动化入口等待一个永远不会发生的人工点击，也保留专家快捷用法。
-  const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(content);
-  const shouldShowTraexInitialization =
-    botCfg.cliId === 'traex'
-    && !isBotSenderType
-    && !messageListener
-    && !substituteTrigger
-    && !workflowGrillPrompt
-    && !explicitForgePrompt
-    && !isExistingLarkThreadReply(parsed);
-  if (shouldShowTraexInitialization) {
-    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
-    const scanDirs = getProjectScanDirs(ds).filter(dir => existsSync(dir));
-    const projects = scanDirs.length > 0
-      ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
-      : [];
-    if (projects.length > 0) lastRepoScan.set(chatId, projects);
-    const currentPath = pinnedWorkingDir ?? getSessionWorkingDir(ds);
-    const currentProject = projects.find(project => project.path === currentPath);
-    const pendingTraexInitialization: NonNullable<DaemonSession['pendingTraexInitialization']> = {
-      nonce: randomUUID(),
-      ownerOpenId: senderOpenId,
-      originalPrompt: content,
-      promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
-      selection: autoWt && pinnedWorkingDir
-        ? {
-            kind: 'auto-worktree',
-            path: pinnedWorkingDir,
-            label: currentProject?.name ?? pinnedWorkingDir,
-          }
-        : {
-            kind: 'directory',
-            path: currentPath,
-            label: currentProject
-              ? `${currentProject.name} (${currentProject.branch})`
-              : currentPath,
-            pinWorkingDir: !!pinnedWorkingDir,
-          },
-    };
-    await postTraexInitializationCard({
-      ds,
-      anchor,
-      larkAppId,
-      triggerMessageId: messageId,
-      replyRootId,
-      pending: pendingTraexInitialization,
-      projects,
-      logContext: `projects=${projects.length}, cwd=${currentPath}`,
-    });
-    logger.info(`[${tag(ds)}] Waiting for TraeX initialization (projects=${projects.length}, cwd=${currentPath})`);
-    return;
-  }
 
   // Auto-worktree: session is registered PENDING; build the worktree off the
   // critical path, then commitRepoSelection pins it + forks (folding in any
@@ -18976,6 +18940,32 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (shouldShowTraexInitialization) {
+      await postTraexStartupModeCard({
+        ds,
+        anchor,
+        larkAppId,
+        triggerMessageId: messageId,
+        replyRootId,
+        pending: {
+          nonce: randomUUID(),
+          ownerOpenId: senderOpenId,
+          originalPrompt: content,
+          promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
+          phase: 'mode',
+          selection: {
+            kind: 'directory',
+            path: pinnedWorkingDir,
+            label: pinnedWorkingDir,
+            pinWorkingDir: true,
+          },
+        },
+        logContext: `pinned cwd=${pinnedWorkingDir}`,
+      });
+      markIngressAdmitted(ctx);
+      logger.info(`[${tag(ds)}] Waiting for TraeX startup mode (cwd=${pinnedWorkingDir})`);
+      return;
+    }
     ensureSessionWhiteboard(ds);
     await maybeSeedCardlessForceTopicTurn({
       ds,
@@ -19011,6 +19001,23 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   if (projects.length > 0) {
     ds.initialStartPending = false; // pendingRepo/card now owns buffering
     lastRepoScan.set(chatId, projects);
+    if (shouldShowTraexInitialization) {
+      const currentCwd = getSessionWorkingDir(ds);
+      const currentProject = projects.find(project => project.path === currentCwd);
+      ds.pendingTraexInitialization = {
+        nonce: randomUUID(),
+        ownerOpenId: senderOpenId,
+        originalPrompt: content,
+        promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
+        phase: 'repo',
+        selection: {
+          kind: 'directory',
+          path: currentCwd,
+          label: currentProject ? projectDisplayName(currentProject) : currentCwd,
+          pinWorkingDir: false,
+        },
+      };
+    }
     // 已 durable staging（picker）且通过放弃闸；接下来卡片发送失败不得诱导重发
     //（重发会在 pendingRepo 缓冲里再入一份）。
     markIngressAdmitted(ctx);
@@ -19021,6 +19028,33 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     announcePendingRepoSession(ds);
     logger.info(`[${tag(ds)}] Waiting for repo selection (${projects.length} projects)`);
   } else {
+    if (shouldShowTraexInitialization) {
+      const currentCwd = getSessionWorkingDir(ds);
+      await postTraexStartupModeCard({
+        ds,
+        anchor,
+        larkAppId,
+        triggerMessageId: messageId,
+        replyRootId,
+        pending: {
+          nonce: randomUUID(),
+          ownerOpenId: senderOpenId,
+          originalPrompt: content,
+          promptPrefix: topicThreadContext + codexAppQuoteContext + codexAppApplicationContext,
+          phase: 'mode',
+          selection: {
+            kind: 'directory',
+            path: currentCwd,
+            label: currentCwd,
+            pinWorkingDir: false,
+          },
+        },
+        logContext: `no projects, cwd=${currentCwd}`,
+      });
+      markIngressAdmitted(ctx);
+      logger.info(`[${tag(ds)}] Waiting for TraeX startup mode (no projects, cwd=${currentCwd})`);
+      return;
+    }
     // No projects found — skip repo selection, spawn directly.
     // 已 durable staging（picker）且通过放弃闸：即使下面 fork 失败，opening 仍由
     // 会话 durable 持有（pre-init 回滚恢复 queued journal，重启复活），重发会
@@ -19702,18 +19736,18 @@ function closeUnstartedTraexInitializationDraft(ds: DaemonSession, reason: strin
   logger.info(`[${tag(ds)}] Closed unstarted TraeX initialization draft: ${reason}`);
 }
 
-async function postTraexInitializationCard(input: {
+async function postTraexStartupModeCard(input: {
   ds: DaemonSession;
   anchor: string;
   larkAppId: string;
   triggerMessageId: string;
   replyRootId?: string;
   pending: NonNullable<DaemonSession['pendingTraexInitialization']>;
-  projects: ProjectInfo[];
   logContext: string;
 }): Promise<void> {
-  const { ds, anchor, larkAppId, triggerMessageId, replyRootId, pending, projects, logContext } = input;
+  const { ds, anchor, larkAppId, triggerMessageId, replyRootId, pending, logContext } = input;
   const previousPendingRepo = ds.pendingRepo;
+  const previousInitialStartPending = ds.initialStartPending;
   const previousPendingTraexInitialization = ds.pendingTraexInitialization;
   const previousRepoCardMessageId = ds.repoCardMessageId;
   const previousReplyThreadAliases = ds.replyThreadAliases;
@@ -19723,6 +19757,7 @@ async function postTraexInitializationCard(input: {
   const previousSessionReplyTargets = ds.session.replyTargets;
 
   ds.pendingRepo = true;
+  ds.initialStartPending = false;
   ds.pendingTraexInitialization = pending;
   ds.repoCardMessageId = undefined;
   beginReplyTargetTurn(
@@ -19733,21 +19768,10 @@ async function postTraexInitializationCard(input: {
   );
   sessionStore.updateSession(ds.session);
   try {
-    const forgeAvailability = checkForgeTraexStartupAvailability();
-    if (!forgeAvailability.available) {
-      pending.mode = 'traex';
-      if (ds.session.traexForgeMode) {
-        delete ds.session.traexForgeMode;
-        sessionStore.updateSession(ds.session);
-      }
-    }
-    const cardJson = buildTraexInitializationCard({
+    const cardJson = buildTraexStartupModeCard({
       rootId: anchor,
       pending,
-      projects,
       locale: localeForBot(larkAppId),
-      multiPicker: getBot(larkAppId).config.worktreeMultiPicker,
-      forgeAvailable: forgeAvailability.available,
     });
     ds.repoCardMessageId = await sessionReply(
       anchor,
@@ -19759,6 +19783,7 @@ async function postTraexInitializationCard(input: {
     );
   } catch (error) {
     ds.pendingRepo = previousPendingRepo;
+    ds.initialStartPending = previousInitialStartPending;
     ds.pendingTraexInitialization = previousPendingTraexInitialization;
     ds.repoCardMessageId = previousRepoCardMessageId;
     ds.replyThreadAliases = previousReplyThreadAliases;
@@ -19775,7 +19800,7 @@ async function postTraexInitializationCard(input: {
       ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
     );
     logger.warn(
-      `[${tag(ds)}] Failed to post TraeX initialization card; rolled back pending draft `
+      `[${tag(ds)}] Failed to post TraeX startup mode card; rolled back pending draft `
       + `(${logContext}): ${error instanceof Error ? error.message : String(error)}`,
     );
     throw error;
@@ -20664,7 +20689,7 @@ async function handleThreadReplyAdmitted(
         codexAppFollowUpContextParts.unshift(followUpSenderBlock);
       }
     }
-    if (ds.pendingRepo) {
+    if (ds.pendingRepo && !ds.pendingTraexInitialization) {
       const hasOpening = (ds.pendingPrompt?.trim().length ?? 0) > 0
         || (ds.pendingAttachments?.length ?? 0) > 0
         || !!ds.pendingRawInput;
@@ -20960,7 +20985,19 @@ async function handleThreadReplyAdmitted(
       }
       return;
     }
-    if (newDs.pendingRepo) {
+    const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(parsed.content);
+    const traexInitializationCandidate =
+      botCfg.cliId === 'traex'
+      && !isForeignBot
+      && !substituteTrigger
+      && !explicitForgePrompt
+      && !isExistingLarkThreadReply(parsed);
+    const forgeAvailability = traexInitializationCandidate
+      ? checkForgeTraexStartupAvailability()
+      : undefined;
+    const shouldShowTraexInitialization = forgeAvailability?.available === true
+      && !(pinnedWorkingDir && autoWt);
+    if (newDs.pendingRepo && !shouldShowTraexInitialization) {
       stageClaimedPendingRepoSetup(activeSessions, newDs, {
         mode: autoWt ? 'auto_worktree' : 'picker',
         ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
@@ -20973,56 +21010,6 @@ async function handleThreadReplyAdmitted(
     messageQueue.appendMessage(anchor, parsed);
     // 接纳标记按分支下沉（同 handleNewTopicAdmitted）：append 仅供 dashboard 预览，
     // replyInvalidWorkingDirs 是放弃分支，放弃前的失败必须保持「请重发」提示。
-
-    const explicitForgePrompt = /^\s*[$/]forge-(?:pipeline|pilot)\b/i.test(parsed.content);
-    const shouldShowTraexInitialization =
-      botCfg.cliId === 'traex'
-      && !isForeignBot
-      && !substituteTrigger
-      && !explicitForgePrompt
-      && !isExistingLarkThreadReply(parsed);
-    if (shouldShowTraexInitialization) {
-      if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
-      const scanDirs = getProjectScanDirs(newDs).filter(dir => existsSync(dir));
-      const projects = scanDirs.length > 0
-        ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
-        : [];
-      if (projects.length > 0) lastRepoScan.set(autoCreateChatId, projects);
-      const currentPath = pinnedWorkingDir ?? getSessionWorkingDir(newDs);
-      const currentProject = projects.find(project => project.path === currentPath);
-      const pendingTraexInitialization: NonNullable<DaemonSession['pendingTraexInitialization']> = {
-        nonce: randomUUID(),
-        ownerOpenId,
-        originalPrompt: parsed.content,
-        promptPrefix: codexAppMessageContext + codexAppApplicationContext,
-        selection: autoWt && pinnedWorkingDir
-          ? {
-              kind: 'auto-worktree',
-              path: pinnedWorkingDir,
-              label: currentProject?.name ?? pinnedWorkingDir,
-            }
-          : {
-              kind: 'directory',
-              path: currentPath,
-              label: currentProject
-                ? `${currentProject.name} (${currentProject.branch})`
-                : currentPath,
-              pinWorkingDir: !!pinnedWorkingDir,
-            },
-      };
-      await postTraexInitializationCard({
-        ds: newDs,
-        anchor,
-        larkAppId,
-        triggerMessageId: parsed.messageId,
-        replyRootId,
-        pending: pendingTraexInitialization,
-        projects,
-        logContext: `reply auto-create, projects=${projects.length}, cwd=${currentPath}`,
-      });
-      logger.info(`[${tag(newDs)}] Waiting for TraeX initialization after reply auto-create (projects=${projects.length}, cwd=${currentPath})`);
-      return;
-    }
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
@@ -21037,6 +21024,32 @@ async function handleThreadReplyAdmitted(
     // spawn CLI immediately, skip repo selection.
     if (pinnedWorkingDir) {
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
+      if (shouldShowTraexInitialization) {
+        await postTraexStartupModeCard({
+          ds: newDs,
+          anchor,
+          larkAppId,
+          triggerMessageId: parsed.messageId,
+          replyRootId,
+          pending: {
+            nonce: randomUUID(),
+            ownerOpenId,
+            originalPrompt: parsed.content,
+            promptPrefix: codexAppMessageContext + codexAppApplicationContext,
+            phase: 'mode',
+            selection: {
+              kind: 'directory',
+              path: pinnedWorkingDir,
+              label: pinnedWorkingDir,
+              pinWorkingDir: true,
+            },
+          },
+          logContext: `reply auto-create pinned cwd=${pinnedWorkingDir}`,
+        });
+        markIngressAdmitted(ctx);
+        logger.info(`[${tag(newDs)}] Waiting for TraeX startup mode after reply auto-create (cwd=${pinnedWorkingDir})`);
+        return;
+      }
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -21062,6 +21075,23 @@ async function handleThreadReplyAdmitted(
     if (projects.length > 0) {
       newDs.initialStartPending = false; // pendingRepo/card now owns buffering
       lastRepoScan.set(autoCreateChatId, projects);
+      if (shouldShowTraexInitialization) {
+        const currentCwd = getSessionWorkingDir(newDs);
+        const currentProject = projects.find(project => project.path === currentCwd);
+        newDs.pendingTraexInitialization = {
+          nonce: randomUUID(),
+          ownerOpenId,
+          originalPrompt: parsed.content,
+          promptPrefix: codexAppMessageContext + codexAppApplicationContext,
+          phase: 'repo',
+          selection: {
+            kind: 'directory',
+            path: currentCwd,
+            label: currentProject ? projectDisplayName(currentProject) : currentCwd,
+            pinWorkingDir: false,
+          },
+        };
+      }
       // 已 durable staging（picker）且通过放弃闸；卡片发送失败不得诱导重发。
       markIngressAdmitted(ctx);
       const currentCwd = getSessionWorkingDir(newDs);
@@ -21071,6 +21101,33 @@ async function handleThreadReplyAdmitted(
       announcePendingRepoSession(newDs);
       logger.info(`[${tag(newDs)}] Waiting for repo selection (${projects.length} projects)`);
     } else {
+      if (shouldShowTraexInitialization) {
+        const currentCwd = getSessionWorkingDir(newDs);
+        await postTraexStartupModeCard({
+          ds: newDs,
+          anchor,
+          larkAppId,
+          triggerMessageId: parsed.messageId,
+          replyRootId,
+          pending: {
+            nonce: randomUUID(),
+            ownerOpenId,
+            originalPrompt: parsed.content,
+            promptPrefix: codexAppMessageContext + codexAppApplicationContext,
+            phase: 'mode',
+            selection: {
+              kind: 'directory',
+              path: currentCwd,
+              label: currentCwd,
+              pinWorkingDir: false,
+            },
+          },
+          logContext: `reply auto-create no projects, cwd=${currentCwd}`,
+        });
+        markIngressAdmitted(ctx);
+        logger.info(`[${tag(newDs)}] Waiting for TraeX startup mode after reply auto-create (no projects, cwd=${currentCwd})`);
+        return;
+      }
       // No projects found — skip repo selection, spawn directly.
       // 已 durable staging（picker）：fork 失败后 opening 仍由会话 durable 持有，
       // 先打接纳标（同 handleNewTopicAdmitted 的 no-projects 分支）。

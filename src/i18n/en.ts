@@ -101,6 +101,8 @@ export const messages: Record<string, string> = {
   // ─── TraeX first-turn initialization card ───────────────────────────────
   'card.traex_init.title': '🚀 Initialize TraeX Session',
   'card.traex_init.intro': 'Confirm the working directory, run mode, and initial prompt before starting the agent.',
+  'card.traex_init.mode_title': '🚀 Choose TraeX Startup Mode',
+  'card.traex_init.mode_intro': 'The working directory is confirmed. Choose how to start the session.',
   'card.traex_init.selected_dir': 'Selected:',
   'card.traex_init.selection_worktree': 'New worktree: {name}',
   'card.traex_init.selection_auto_worktree': '{path} (a worktree will be created automatically)',
@@ -123,6 +125,7 @@ export const messages: Record<string, string> = {
   'card.traex_init.in_progress': 'The session is already being initialized',
   'card.traex_init.repo_not_found': 'The selected repository no longer exists. Choose again.',
   'card.traex_init.mode_selected': 'Startup mode selected',
+  'card.traex_init.mode_selected_with_mode': '✅ Startup mode selected: {mode}',
   'card.traex_init.forge_unavailable': 'Forge is not installed on this machine, or forge doctor reports blocking errors. Forge startup modes are unavailable.',
   'card.traex_init.repo_selected': 'Working directory selected: {path}',
   'card.traex_init.worktree_selected': 'A new worktree will be created from {name}',
@@ -1146,7 +1149,7 @@ export const messages: Record<string, string> = {
   'daemon.fast_unsupported_backend': "⚠️ /fast can't toggle Codex's tier on this session's backend (RPC input mode / Riff runs turns off the terminal, so the keystroke never reaches the executor). The card badge still reflects the tier Codex is actually running.",
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
-  'daemon.complete_traex_init_first': 'Confirm the working directory, run mode, and prompt in the initialization card above first. Your new message is queued and will be included when the session starts.',
+  'daemon.complete_traex_init_first': 'Complete the TraeX initialization flow above first. Your new message is queued and will be included when the session starts.',
   'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',
 
   // ─── /dashboard command group (PR3 C1) ─────────────────────────────────

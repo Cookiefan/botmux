@@ -181,6 +181,10 @@ vi.mock('../src/services/project-scanner.js', async () => {
   return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
 });
 
+vi.mock('../src/core/forge-availability.js', () => ({
+  checkForgeTraexStartupAvailability: vi.fn(() => ({ available: true })),
+}));
+
 vi.mock('../src/im/lark/identity-cache.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
@@ -209,6 +213,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { __testOnly_resetSessionTurnQueues, runSessionTurn } from '../src/core/session-turn-queue.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { checkForgeTraexStartupAvailability } from '../src/core/forge-availability.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
 
@@ -571,6 +576,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.discoverAntigravitySessions.mockReturnValue([]);
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+    vi.mocked(checkForgeTraexStartupAvailability).mockReturnValue({ available: true });
     activeSessions.clear();
     __testOnly_resetSessionTurnQueues();
     resetDocCommentClaims();
@@ -1629,7 +1635,7 @@ describe('/rename production routing — must not pre-create a session (review P
     }
   });
 
-  it('TraeX human new topic returns one initialization card and does not fork before confirmation', async () => {
+  it('TraeX human new topic with pinned cwd returns startup mode card and does not fork before selection', async () => {
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -1645,14 +1651,100 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(mocks.forkWorker).not.toHaveBeenCalled();
-    expect(repliedText()).toContain('初始化 TraeX 会话');
+    expect(repliedText()).toContain('选择 TraeX 启动方式');
     const ds = activeSessions.get(sessionKey('om_traex_init', APP));
     expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.session.queued).toBeUndefined();
+    expect(ds?.session.pendingRepoSetup).toBeUndefined();
     expect(ds?.pendingTraexInitialization?.originalPrompt).toBe('实现统一初始化卡');
+    expect(ds?.pendingTraexInitialization?.phase).toBe('mode');
     expect(ds?.pendingTraexInitialization?.selection).toMatchObject({
       kind: 'directory',
       path: '/tmp',
+      pinWorkingDir: true,
     });
+  });
+
+  it('TraeX human new topic with scanned projects shows the master repo card first', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: '/tmp',
+      type: 'repo',
+      branch: 'master',
+    }]);
+
+    await handleNewTopic(
+      makeEventData('om_traex_repo_first', '先选仓库再选启动方式'),
+      makeCtx('om_traex_repo_first', 'om_traex_repo_first'),
+    );
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(repliedText()).toContain('项目仓库管理');
+    expect(repliedText()).not.toContain('选择 TraeX 启动方式');
+    const ds = activeSessions.get(sessionKey('om_traex_repo_first', APP));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.session.queued).toBeUndefined();
+    expect(ds?.session.pendingRepoSetup).toBeUndefined();
+    expect(ds?.pendingTraexInitialization).toMatchObject({
+      phase: 'repo',
+      originalPrompt: '先选仓库再选启动方式',
+    });
+  });
+
+  it('TraeX human new topic uses master opening path when Forge is unavailable', async () => {
+    vi.mocked(checkForgeTraexStartupAvailability).mockReturnValue({ available: false, reason: 'forge not found' });
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_no_forge', '按 master 逻辑启动'),
+      makeCtx('om_traex_no_forge', 'om_traex_no_forge'),
+    );
+
+    expect(repliedText()).not.toContain('初始化 TraeX 会话');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const ds = activeSessions.get(sessionKey('om_traex_no_forge', APP));
+    expect(ds?.pendingTraexInitialization).toBeUndefined();
+    expect(ds?.pendingRepo).toBe(false);
+  });
+
+  it('TraeX auto-worktree skips startup mode card and starts like master even when Forge is available', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: '/tmp',
+      defaultWorkingDirAutoWorktree: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_auto_wt', '自动 worktree 任务'),
+      makeCtx('om_traex_auto_wt', 'om_traex_auto_wt'),
+    );
+
+    await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+    expect(repliedText()).not.toContain('选择 TraeX 启动方式');
+    const ds = activeSessions.get(sessionKey('om_traex_auto_wt', APP));
+    expect(ds?.pendingTraexInitialization).toBeUndefined();
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.session.traexForgeMode).toBeUndefined();
+    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).not.toContain('$forge-');
   });
 
   it('TraeX chat-scope initialization card stays flat when routing has no topic reply target', async () => {
@@ -1681,7 +1773,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.sendMessage).toHaveBeenCalledWith(
       APP,
       CHAT,
-      expect.stringContaining('初始化 TraeX 会话'),
+      expect.stringContaining('选择 TraeX 启动方式'),
       'interactive',
       undefined,
       expect.anything(),
@@ -1718,7 +1810,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.replyMessage).toHaveBeenCalledWith(
       APP,
       'om_traex_shared_seed',
-      expect.stringContaining('初始化 TraeX 会话'),
+      expect.stringContaining('选择 TraeX 启动方式'),
       'interactive',
       true,
       undefined,
@@ -1772,7 +1864,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.sendMessage).toHaveBeenCalledWith(
       APP,
       CHAT,
-      expect.stringContaining('初始化 TraeX 会话'),
+      expect.stringContaining('选择 TraeX 启动方式'),
       'interactive',
       undefined,
       expect.anything(),
@@ -1815,7 +1907,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.replyMessage).toHaveBeenCalledWith(
       APP,
       'om_traex_live_new_seed',
-      expect.stringContaining('初始化 TraeX 会话'),
+      expect.stringContaining('选择 TraeX 启动方式'),
       'interactive',
       true,
       undefined,
@@ -1869,13 +1961,16 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(mocks.forkWorker).not.toHaveBeenCalled();
-    expect(repliedText()).toContain('请先在上方初始化卡中确认');
+    expect(repliedText()).toContain('请先完成上方 TraeX 初始化流程');
     const stillFirst = activeSessions.get(sessionKey(CHAT, APP));
     expect(stillFirst?.session.sessionId).toBe(first?.session.sessionId);
-    expect(stillFirst?.session.queuedActivationTail?.[0]?.userPrompt).toContain('补充要求');
+    expect(stillFirst?.pendingFollowUps?.[0]).toContain('补充要求');
+    expect(stillFirst?.session.queued).toBeUndefined();
+    expect(stillFirst?.session.pendingRepoSetup).toBeUndefined();
+    expect(stillFirst?.session.queuedActivationTail).toBeUndefined();
   });
 
-  it('TraeX initialization card send failure does not leave a no-card pending draft', async () => {
+  it('TraeX startup mode card send failure does not leave a no-card pending draft', async () => {
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -1902,7 +1997,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.sendMessage).toHaveBeenCalledWith(
       APP,
       CHAT,
-      expect.stringContaining('初始化 TraeX 会话'),
+      expect.stringContaining('选择 TraeX 启动方式'),
       'interactive',
       undefined,
       expect.anything(),
@@ -2247,7 +2342,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds.initialStartPending).toBe(false);
   });
 
-  it('TraeX thread safety-net also waits on the unified initialization card', async () => {
+  it('TraeX thread safety-net also waits on startup mode card before worker start', async () => {
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -2263,9 +2358,12 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(mocks.forkWorker).not.toHaveBeenCalled();
-    expect(repliedText()).toContain('初始化 TraeX 会话');
+    expect(repliedText()).toContain('选择 TraeX 启动方式');
     const ds = activeSessions.get(sessionKey('om_traex_root', APP));
+    expect(ds?.session.queued).toBeUndefined();
+    expect(ds?.session.pendingRepoSetup).toBeUndefined();
     expect(ds?.pendingTraexInitialization?.originalPrompt).toBe('排查初始化问题');
+    expect(ds?.pendingTraexInitialization?.phase).toBe('mode');
   });
 
   it('TraeX existing Lark thread reply bypasses initialization card and continues directly', async () => {

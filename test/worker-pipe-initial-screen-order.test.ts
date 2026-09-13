@@ -46,6 +46,9 @@ describe('worker pipe initial screen ordering', () => {
 
     expect(poolSource).toContain("agentCfg.cliId === 'traex' && ds.session.traexForgeMode");
     expect(poolSource).toContain('traexForgeMode: ds.session.traexForgeMode');
+    expect(poolSource).toContain("const keepForgeTraexSessionTitle = agentCfg.cliId === 'traex' && !!ds.session.traexForgeMode");
+    expect(workerSource).toContain("cfg.cliId === 'traex' && !cfg.traexForgeMode && !remoteWsUrl");
+    expect(workerSource).toContain("if (cfg.cliId === 'traex' && cfg.traexForgeMode) return false");
   });
 
   it('fences bridge markers before worker-side close teardown can race fallback reads', () => {

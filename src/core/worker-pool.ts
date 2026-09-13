@@ -9438,7 +9438,8 @@ export function sendWorkerInput(
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, routingTurnId);
   let nativeSessionTitlePrompt: string | undefined;
   let nativeSessionTitle: string | undefined;
-  if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
+  const keepForgeTraexSessionTitle = effectiveCliId === 'traex' && !!ds.session.traexForgeMode;
+  if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom && !keepForgeTraexSessionTitle) {
     if (supportsBotmuxLarkNativeSessionTitle(effectiveCliId)) {
       nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
         normalized.codexAppInput?.text ?? normalized.content,
@@ -10554,7 +10555,8 @@ export function forkWorker(
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
-  if (supportsBotmuxLarkNativeSessionTitle(agentCfg.cliId) && !isSharedAdoptSession(ds)) {
+  const keepForgeTraexSessionTitle = agentCfg.cliId === 'traex' && !!ds.session.traexForgeMode;
+  if (supportsBotmuxLarkNativeSessionTitle(agentCfg.cliId) && !isSharedAdoptSession(ds) && !keepForgeTraexSessionTitle) {
     const isFreshNativeSession = !resume && !ds.session.cliSessionId;
     const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
       promptPayload.codexAppInput?.text ?? prompt,

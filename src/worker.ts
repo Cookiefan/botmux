@@ -1066,6 +1066,7 @@ function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
   const cfg = lastInitConfig;
   const trimmed = title?.trim();
   if (!cfg || cfg.adoptMode || !trimmed) return false;
+  if (cfg.cliId === 'traex' && cfg.traexForgeMode) return false;
   if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
   if (codexRpcEngine || remoteWsUrl) return false;
   if (!cliAdapter?.buildSessionRenameCommand) return false;
@@ -14487,7 +14488,7 @@ async function spawnCli(
     remoteThreadId,
     // The remote TUI is only a viewer; its app-server received the same hook in
     // engageCodexRpc. Plain Trae TUI processes own the model and get it here.
-    nativeSubagentRuntimeHookCommand: cfg.cliId === 'traex' && !remoteWsUrl
+    nativeSubagentRuntimeHookCommand: cfg.cliId === 'traex' && !cfg.traexForgeMode && !remoteWsUrl
       ? nativeSubagentRuntimeHookCommand()
       : undefined,
   });

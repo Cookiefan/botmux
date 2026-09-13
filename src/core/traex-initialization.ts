@@ -8,6 +8,8 @@ export const TRAEX_INITIALIZATION_MODES = [
 
 export type TraexInitializationMode = (typeof TRAEX_INITIALIZATION_MODES)[number];
 
+export type TraexInitializationPhase = 'repo' | 'mode';
+
 export type TraexInitializationSelection =
   | {
       kind: 'directory';
@@ -33,6 +35,7 @@ export interface PendingTraexInitialization {
   ownerOpenId?: string;
   originalPrompt: string;
   promptPrefix: string;
+  phase?: TraexInitializationPhase;
   mode?: TraexInitializationMode;
   selection: TraexInitializationSelection;
   commitInFlight?: boolean;
