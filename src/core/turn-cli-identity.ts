@@ -225,11 +225,18 @@ function writeDenial(
     // sender), fall back to the /login instructions.
     const parts: string[] = [];
     if (authUrl) {
+      // Say how long the one-time authorization lasts, truthfully: lark-cli holds
+      // a short access token plus a ~week refresh token it renews automatically;
+      // bytedcli's SSO login lives ~3 weeks. Neither is forever, so don't promise
+      // that — but both mean "no re-scan on every call".
+      const persistence = tool === 'bytedcli'
+        ? t('trigger_user_auth.auth_persistence_bytedcli', undefined, locale)
+        : t('trigger_user_auth.auth_persistence_lark', undefined, locale);
       parts.push(knownName
         ? t('trigger_user_auth.denied_named_link', { tool, provider, name: knownName }, locale)
         : t('trigger_user_auth.denied_you_link', { tool, provider }, locale));
       parts.push(authUrl);
-      parts.push(t('trigger_user_auth.denied_link_footer', undefined, locale));
+      parts.push(t('trigger_user_auth.denied_link_footer', { persistence }, locale));
     } else {
       // With no name, address the reader directly rather than printing a raw
       // open_id at them. The name comes from a stored Lark token, which someone

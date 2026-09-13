@@ -187,6 +187,20 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).toContain('https://example.com/lark-device');
     expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
+    // The prompt is a one-time ask with a real (not "forever") duration, so the
+    // first interruption is the only one: it says "authorize once" and names the
+    // ~7-day auto-renewing window rather than vaguely "long-lived".
+    expect(body).toContain('只需授权这一次');
+    expect(body).toMatch(/7\s*天/);
+  });
+
+  it('names the ~3-week persistence window for bytedcli, not the lark 7-day one', async () => {
+    const config = botConfig({ enabled: true, tools: ['bytedcli'] });
+    await publish(config, BOB);
+    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(body).toContain('只需授权这一次');
+    expect(body).toMatch(/3\s*周/);
+    expect(body).not.toMatch(/7\s*天/);
   });
 
   // bytedcli authenticates against ByteCloud SSO, a different provider from Lark
