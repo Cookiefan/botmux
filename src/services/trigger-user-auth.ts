@@ -202,7 +202,14 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     throw new TriggerUserAuthConfigError('triggerUserAuth.tools must be an array');
   }
 
-  let fallback: TriggerUserAuthFallback = 'bot-identity';
+  // Default `none`: with trigger-user auth ON, a governed CLI call that has no
+  // identity for the current sender is REFUSED (and the sender is shown how to
+  // authorize), never silently run as the bot. Running it as the bot made the
+  // feature look broken — calls "worked" but under the wrong identity and nobody
+  // was ever asked to authorize. An operator who genuinely wants the old
+  // best-effort behavior can still set `fallback: 'bot-identity'` explicitly
+  // (effective for lark-cli only; bytedcli has no bot identity to fall back to).
+  let fallback: TriggerUserAuthFallback = 'none';
   if (rec.fallback !== undefined) {
     if (!(TRIGGER_USER_AUTH_FALLBACKS as readonly unknown[]).includes(rec.fallback)) {
       // Name the rejected value: an operator reaching for "device" needs to be

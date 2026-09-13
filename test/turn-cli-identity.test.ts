@@ -28,16 +28,25 @@ vi.mock('../src/utils/user-token.js', () => ({
 
 // bytedcli shells out to the real CLI; here we control who is authorized.
 const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
-vi.mock('../src/services/bytedcli-auth.js', () => ({
-  mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
-}));
 
 // lark-cli per-person HOME (device-code identity). A HOME present here wins over
 // the legacy bot-app token; null means "no device-code login for this person".
 const larkHomes = new Map<string, string>();
+// Device-code links the refusal embeds. Scripted so publish never hits network.
+const beginLarkCalls: string[] = [];
 vi.mock('../src/services/lark-cli-auth.js', () => ({
   larkCliHomeForTurn: vi.fn((openId: string | undefined) =>
     openId && larkHomes.has(openId) ? larkHomes.get(openId)! : null),
+  beginLarkCliLogin: vi.fn(async (openId: string) => {
+    beginLarkCalls.push(openId);
+    return { authUrl: 'https://example.com/lark-device' };
+  }),
+}));
+
+// bytedcli device-code begin, likewise scripted.
+vi.mock('../src/services/bytedcli-auth.js', () => ({
+  mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
+  beginBytedcliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/byted-device', completeToken: 'bt' })),
 }));
 
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
@@ -126,44 +135,57 @@ describe('publishTurnCliIdentity — the sender acts as themselves', () => {
 // leftover would make the next command run as the previous person — silently,
 // and with the wrong name in the audit trail.
 describe('publishTurnCliIdentity — withholding removes, never inherits', () => {
-  it('clears when the new sender has not authorized', async () => {
+  it('refuses (and removes the prior identity) when the new sender has not authorized', async () => {
     tokens.set(`${APP}|${ALICE}`, 'tok-alice');
     await publish(botConfig(), ALICE);
     expect(existsSync(larkPath())).toBe(true);
 
-    // Bob has no token: Alice's must be gone. Under the default fallback the
-    // file is rewritten to the bot identity rather than deleted — deleting it
-    // would make the wrapper refuse, and leaving it would run Bob's command as
-    // Alice.
+    // Bob has no identity. Under the DEFAULT policy (fallback none) the file is
+    // rewritten to a refusal rather than Alice's token or a bot identity — the
+    // command must not run as Alice OR silently as the bot.
     const outcomes = await publish(botConfig(), BOB);
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     const body = readFileSync(larkPath(), 'utf8');
     expect(body).not.toContain('tok-alice');
-    expect(body).toContain('BOTMUX_IDENTITY_MODE=\'bot\'');
-    expect(body).toContain('LARKSUITE_CLI_APP_SECRET');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toContain('LARKSUITE_CLI_APP_SECRET');
+    // The refusal carries a ready authorization link.
+    expect(body).toContain('https://example.com/lark-device');
   });
 
   // Scheduled runs, hooks, meeting events and bot-to-bot handoffs have no
   // trigger user. Reaching for the session creator's or owner's credentials to
   // fill that gap is exactly the borrowing this feature removes.
-  it('clears when the turn has no human sender', async () => {
+  it('refuses when the turn has no human sender (and sends no link)', async () => {
     tokens.set(`${APP}|${ALICE}`, 'tok-alice');
     await publish(botConfig(), ALICE);
     const outcomes = await publish(botConfig(), undefined);
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
-    expect(readFileSync(larkPath(), 'utf8')).not.toContain('tok-alice');
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).not.toContain('tok-alice');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    // Nobody to scan a link ⇒ no device link in an anonymous-turn refusal.
+    expect(body).not.toContain('https://example.com/lark-device');
   });
 
-  it('reports needs-authorization instead of degrading under fallback: none', async () => {
-    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
+  it('still degrades to the bot identity under an explicit fallback: bot-identity', async () => {
+    tokens.set(`${APP}|${ALICE}`, 'tok-alice');
+    await publish(botConfig(), ALICE);
+    const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' });
     const outcomes = await publish(config, BOB);
-    expect(readFileSync(larkPath(), 'utf8')).toContain('飞书');
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
-    // A refusal is published, not an empty file: it carries the text the person
-    // whose command just failed reads, including how to authorize.
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
     const body = readFileSync(larkPath(), 'utf8');
-    expect(body).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
-    expect(body).toContain('/login');
+    expect(body).not.toContain('tok-alice');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='bot'");
+    expect(body).toContain('LARKSUITE_CLI_APP_SECRET');
+  });
+
+  it('reports needs-authorization under the default fallback (none), with a link', async () => {
+    const outcomes = await publish(botConfig(), BOB);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).toContain('https://example.com/lark-device');
     expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
   });
 
@@ -183,25 +205,27 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
     expect(body).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
     expect(body).not.toContain('BYTEDCLI_USER_CLOUD_JWT');
-    // And it names ByteCloud, not Feishu — both in the provider it asks them to
-    // authorize with and in the command. Getting either wrong sends them off to
-    // authorize the other provider and hit this same refusal again.
+    // And it names ByteCloud, not Feishu — getting the provider wrong would send
+    // them off to authorize the other one.
     expect(body).toContain('ByteCloud');
     expect(body).not.toContain('飞书');
-    expect(body).toContain('/login bytedcli');
+    // It carries the ready ByteCloud device link (self-serve), not a typed command.
+    expect(body).toContain('https://example.com/byted-device');
     // Someone refused for lack of authorization usually has no stored name, so
     // the nameless path is the common one — it must read as a sentence, not
     // print a raw open_id back at the person.
     expect(body).not.toContain(ALICE);
-    expect(body).toContain('你自己');
+    expect(body).toContain('你');
   });
 
-  it('uses the stored name when we actually know it', async () => {
+  it('uses the stored name in the link refusal when we actually know it', async () => {
     const { lookupAuthorizedUserName } = await import('../src/utils/user-token.js');
     vi.mocked(lookupAuthorizedUserName).mockReturnValueOnce('孙晓雪');
     const config = botConfig({ enabled: true, tools: ['lark-cli'], fallback: 'none' });
     await publish(config, ALICE);
-    expect(readFileSync(larkPath(), 'utf8')).toContain('孙晓雪');
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain('孙晓雪');
+    expect(body).toContain('https://example.com/lark-device');
   });
 
   it('publishes this person\'s own ByteCloud JWTs once they have authorized', async () => {
@@ -280,9 +304,9 @@ describe('publishTurnCliIdentity — failures fail closed', () => {
     vi.mocked(resolveUserToken).mockRejectedValueOnce(new Error('keychain unavailable'));
     const outcomes = await publish(botConfig(), ALICE);
     // The turn survives, and the stale identity is gone. A store outage lands on
-    // the same policy as "never authorized" — otherwise a transient failure
-    // would quietly grant a different identity than a missing token does.
-    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('bot-identity');
+    // the same policy as "never authorized" — refusal under the default (none),
+    // otherwise a transient failure would quietly grant a different identity.
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(readFileSync(larkPath(), 'utf8')).not.toContain('tok-alice');
   });
 

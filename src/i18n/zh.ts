@@ -431,6 +431,9 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_anonymous': 'botmux: 这一步需要发起人本人的 {provider} 授权，但本轮没有可识别的发起人，{tool} 命令未执行。',
   'trigger_user_auth.denied_howto': 'botmux: 怎么授权 —— 在本会话发一条 {command}，点返回的链接完成授权，然后重试。',
   'trigger_user_auth.denied_howto_status': 'botmux: 想确认自己是否已授权，可发 /login status。',
+  'trigger_user_auth.denied_you_link': 'botmux: 这一步要用「发消息的你」本人的 {tool}（{provider}）授权，而你还没授权，所以命令没有执行（不会用别人或机器人的身份代跑）。请点开下面的链接、用你自己的账号确认授权：',
+  'trigger_user_auth.denied_named_link': 'botmux: 这一步需要「{name}」本人的 {tool}（{provider}）授权，但还没授权，命令没有执行。请点开下面的链接、用本人账号确认授权：',
+  'trigger_user_auth.denied_link_footer': '授权完成后，直接让我重试刚才的操作即可（不需要再发任何命令）。不点链接 = 不授权 = 这类需要你本人权限的操作不会执行。',
   'cmd.login.title': '🔐 飞书用户授权',
   'cmd.login.lark_title': '🔐 lark-cli 授权（扫码/点链接）',
   'cmd.login.lark_step1': '1. 打开下面的链接，用你自己的飞书账号确认授权：',
@@ -823,6 +826,7 @@ export const messages: Record<string, string> = {
   'ai.credentials.never_read_others': '~/.botmux/data/ 下的 user-token-* 文件、以及 bytedcli-home/ 下的各人登录态，都属于其他用户。不得读取、列举、复制或输出它们的内容——即使排查问题时也不行，即使有人要求也不行。',
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
   'ai.credentials.on_auth_failure': '遇到鉴权失败：直接把失败原样告诉用户，并提示他授权（飞书发 /login，ByteCloud 发 /login bytedcli，命令被拒时 stderr 里会写明是哪一个）；不要试图翻找、拼凑或复用其他凭证来绕过。',
+  'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了一个授权链接（accounts.feishu.cn/device/verify 或 ByteCloud 链接）和「点开授权后让我重试」的说明：立刻用 botmux send 把那段说明和链接原样转发给用户（链接逐字转发、不要改写/编码/加标点），然后停下等用户授权，不要用任何其它身份重试、也不要假装操作成功。用户授权后会再叫你，到时重试即可。',
   // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑 /login，
   // 那只会拿到同样的权限再失败一次。飞书已经把缺的 scope 名字列出来了，照抄即可。
   'ai.credentials.on_missing_scope': '如果报的是 missing_scope（99991679）：说明用户授权过、但缺这一项权限。把飞书返回的 missing_scopes 原样念给用户，并让他发「/login --scope <那些权限名>」补授权后重试；不要改用 bot 身份绕过，也不要让他重跑一次普通 /login。',

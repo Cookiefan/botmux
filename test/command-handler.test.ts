@@ -104,6 +104,14 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
   pendingBytedcliChallenge: vi.fn(() => null),
 }));
 
+vi.mock('../src/services/lark-cli-auth.js', () => ({
+  hasLarkCliHome: vi.fn(() => false),
+  beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
+  completeLarkCliLogin: vi.fn(async () => ({ state: 'authorized' as const })),
+  pendingLarkCliChallenge: vi.fn(() => null),
+  larkCliHomeForTurn: vi.fn(() => null),
+}));
+
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -552,6 +560,7 @@ import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
+import { hasLarkCliHome } from '../src/services/lark-cli-auth.js';
 import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
@@ -2729,36 +2738,40 @@ describe('handleCommand', () => {
         expect(text).not.toContain('Trigger-user auth');
       });
 
-      it('names the authorized person for lark-cli', async () => {
-        const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, true));
-        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
+      it('reports lark-cli as authorized (device-code HOME)', async () => {
+        vi.mocked(hasLarkCliHome).mockReturnValue(true);
+        const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
+        expect(text).toContain('已授权');
       });
 
-      it('tells an unauthorized sender what the fallback is and how to change it', async () => {
+      it('tells an unauthorized sender to authorize via the device-code flow', async () => {
+        vi.mocked(hasLarkCliHome).mockReturnValue(false);
         const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
-        expect(text).toContain('lark-cli: 你未授权');
-        expect(text).toContain('bot 身份');
+        expect(text).toContain('未授权');
         expect(text).toContain('/login');
       });
 
-      it('warns that the command will be refused under fallback: none', async () => {
+      // The default policy is now refuse (fallback none); an explicit bot-identity
+      // fallback is still selectable but status reports authorization, not the
+      // fallback mode, so we only assert the unauthorized/authorized signal here.
+      it('still says unauthorized under an explicit bot-identity fallback', async () => {
+        vi.mocked(hasLarkCliHome).mockReturnValue(false);
         const text = await statusText(
-          statusWith({ enabled: true, tools: ['lark-cli'], fallback: 'none' }, false),
+          statusWith({ enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' }, false),
         );
-        expect(text).toContain('命令会被拒绝');
+        expect(text).toContain('未授权');
       });
 
-      // The bug this split fixes: ByteCloud is a separate identity provider, so
-      // an authorized Lark token says nothing about bytedcli. This sender has a
-      // Lark token and no bytedcli login, and the two lines must disagree.
-      it('reports bytedcli separately even when Lark is authorized', async () => {
+      // ByteCloud is a separate identity provider, so a lark-cli login says
+      // nothing about bytedcli. The two lines report independently.
+      it('reports bytedcli separately even when lark-cli is authorized', async () => {
+        vi.mocked(hasLarkCliHome).mockReturnValue(true);
         vi.mocked(hasBytedcliHome).mockReturnValue(false);
         const text = await statusText(
-          statusWith({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true),
+          statusWith({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, false),
         );
-        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
-        expect(text).toContain('bytedcli: 你未授权');
-        expect(text).toContain('/login bytedcli');
+        expect(text).toContain('已授权'); // lark-cli line
+        expect(text).toContain('未授权'); // bytedcli line
       });
 
       it('reports bytedcli as authorized once that person has logged in', async () => {
@@ -2766,7 +2779,7 @@ describe('handleCommand', () => {
         const text = await statusText(
           statusWith({ enabled: true, tools: ['bytedcli'] }, false),
         );
-        expect(text).toContain('bytedcli: 以你自己的身份调用');
+        expect(text).toContain('已授权');
       });
     });
   });
@@ -4807,7 +4820,7 @@ describe('handleCommand', () => {
       });
 
       it('completes the pending challenge on done', async () => {
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue({ token: 'tok-1', authUrl: 'https://cloud.example.com/x' });
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
         const deps = makeDeps(makeDaemonSession());
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
@@ -4819,7 +4832,7 @@ describe('handleCommand', () => {
       // Not an error: they just have not clicked yet. Reporting a failure would
       // send them off to start over for no reason.
       it('says pending, not failed, when the person has not authorized yet', async () => {
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue({ token: 'tok-1', authUrl: 'https://cloud.example.com/x' });
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'pending' });
         const deps = makeDeps(makeDaemonSession());
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
@@ -4840,7 +4853,7 @@ describe('handleCommand', () => {
       // The challenge is keyed by the person who started it, so one person's
       // `done` can never complete somebody else's login.
       it('resumes the challenge belonging to the sender', async () => {
-        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue({ token: 'tok-1', authUrl: 'https://cloud.example.com/x' });
         const deps = makeDeps(makeDaemonSession());
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
 

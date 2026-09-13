@@ -145,24 +145,24 @@ function challengePath(openId: string): string {
   return join(bytedcliHomeFor(openId), '.botmux-login-challenge');
 }
 
-/** The resume token from this person's in-progress login, if it is still
- *  usable. ByteCloud gives the challenge about an hour; we expire slightly
+/** The resume token (and shown link) from this person's in-progress login, if
+ *  still usable. ByteCloud gives the challenge about an hour; we expire slightly
  *  earlier so a token we hand back is not rejected the moment it is used. */
-export function pendingBytedcliChallenge(openId: string): string | null {
+export function pendingBytedcliChallenge(openId: string): { token: string; authUrl?: string } | null {
   try {
     const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
-      { token?: unknown; createdAt?: unknown };
+      { token?: unknown; authUrl?: unknown; createdAt?: unknown };
     if (typeof raw.token !== 'string' || typeof raw.createdAt !== 'number') return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
-    return raw.token;
+    return { token: raw.token, ...(typeof raw.authUrl === 'string' ? { authUrl: raw.authUrl } : {}) };
   } catch { return null; }
 }
 
-function saveChallenge(openId: string, token: string): void {
+function saveChallenge(openId: string, token: string, authUrl: string): void {
   try {
     atomicWriteFileSync(
       challengePath(openId),
-      JSON.stringify({ token, createdAt: Date.now() }),
+      JSON.stringify({ token, authUrl, createdAt: Date.now() }),
       { mode: 0o600 },
     );
   } catch (e) {
@@ -191,6 +191,13 @@ export interface BytedcliLoginChallenge {
  * shape that works when the person authorizing is on the other side of a chat.
  */
 export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
+  // Reuse a still-fresh challenge (same one-link-per-unauthorized-spell behavior
+  // as lark-cli): do not mint a new ByteCloud code on every turn while the person
+  // has not authorized.
+  const existing = pendingBytedcliChallenge(openId);
+  if (existing?.authUrl && !hasBytedcliHome(openId)) {
+    return { authUrl: existing.authUrl, completeToken: existing.token };
+  }
   const { ok, stdout, stderr } = await runAsUser(openId, ['auth', 'login', '--begin', '--json']);
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
@@ -202,7 +209,7 @@ export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginC
     logger.warn(`[bytedcli-auth] could not start a login: ${stderr.trim() || stdout.trim() || 'no output'}`);
     return null;
   }
-  saveChallenge(openId, completeToken);
+  saveChallenge(openId, completeToken, authUrl);
   return { authUrl, completeToken };
 }
 

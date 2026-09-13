@@ -35,7 +35,7 @@ describe('parseTriggerUserAuthConfig', () => {
     expect(parseTriggerUserAuthConfig({})).toEqual({
       enabled: false,
       tools: [...TRIGGER_USER_AUTH_TOOLS],
-      fallback: 'bot-identity',
+      fallback: 'none',
     });
   });
 
@@ -53,8 +53,12 @@ describe('parseTriggerUserAuthConfig', () => {
       .toEqual(['bytedcli']);
   });
 
-  it('defaults the fallback to the bot\'s own identity', () => {
-    expect(parseTriggerUserAuthConfig({ enabled: true })?.fallback).toBe('bot-identity');
+  it('defaults the fallback to none (refuse, not silently run as the bot)', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true })?.fallback).toBe('none');
+  });
+
+  it('still allows an explicit bot-identity fallback for operators who want it', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, fallback: 'bot-identity' })?.fallback).toBe('bot-identity');
   });
 
   it('accepts fallback: none', () => {
@@ -169,8 +173,13 @@ describe('unauthorizedOutcomeFor', () => {
     expect(unauthorizedOutcomeFor(larkOnly, 'bytedcli')).toBe('bot-identity');
   });
 
-  it('lets lark-cli degrade to the bot\'s own identity', () => {
+  it('refuses lark-cli by default (fallback none) rather than running as the bot', () => {
     const config = parseTriggerUserAuthConfig({ enabled: true });
+    expect(unauthorizedOutcomeFor(config, 'lark-cli')).toBe('fail');
+  });
+
+  it('still lets lark-cli degrade to the bot identity when explicitly configured', () => {
+    const config = parseTriggerUserAuthConfig({ enabled: true, fallback: 'bot-identity' });
     expect(unauthorizedOutcomeFor(config, 'lark-cli')).toBe('bot-identity');
   });
 

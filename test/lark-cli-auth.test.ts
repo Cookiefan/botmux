@@ -160,6 +160,43 @@ describe('begin / complete device flow', () => {
     expect(hasLarkCliHome(OPEN)).toBe(false);
   });
 
+  it('reuses a fresh pending challenge instead of minting a new code', async () => {
+    seedMachine();
+    const calls: string[][] = [];
+    __setLarkCliRunnerForTest(async (args) => {
+      calls.push(args);
+      return { ok: true, stdout: JSON.stringify({ verification_url: 'https://v/first', device_code: 'dc-first' }), stderr: '' };
+    });
+    const first = await beginLarkCliLogin(OPEN);
+    const second = await beginLarkCliLogin(OPEN);
+    expect(first?.authUrl).toBe('https://v/first');
+    // Second call returns the SAME url and did NOT re-invoke lark-cli.
+    expect(second?.authUrl).toBe('https://v/first');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('mints a new code after the person authorizes (challenge cleared)', async () => {
+    seedMachine();
+    let n = 0;
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true,
+      stdout: JSON.stringify({ verification_url: `https://v/${++n}`, device_code: `dc-${n}` }),
+      stderr: '',
+    }));
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBe('https://v/1');
+    // They scan → token file appears, challenge cleared by complete.
+    simulateUserToken();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true,
+      stdout: JSON.stringify({ verification_url: 'https://v/2', device_code: 'dc-2', status: 'ok' }),
+      stderr: ''
+    }));
+    await completeLarkCliLogin(OPEN, 'dc-1');
+    // A later re-login (e.g. expired) mints fresh because the old challenge is gone.
+    clearLarkCliAuth(OPEN);
+    expect((await beginLarkCliLogin(OPEN))?.authUrl).toBeDefined();
+  });
+
   it('returns null when the operator has no lark-cli app to seed from', async () => {
     // No seedMachine() ⇒ operator install absent.
     __setLarkCliRunnerForTest(async () => ({

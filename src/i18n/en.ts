@@ -433,6 +433,9 @@ export const messages: Record<string, string> = {
   'trigger_user_auth.denied_anonymous': 'botmux: this step needs the sender\'s own {provider} authorization, but this turn has no identifiable sender. {tool} command not run.',
   'trigger_user_auth.denied_howto': 'botmux: to authorize — send {command} in this chat, open the link it returns, then retry.',
   'trigger_user_auth.denied_howto_status': 'botmux: to check whether you are already authorized, send /login status.',
+  'trigger_user_auth.denied_you_link': 'botmux: this step needs YOUR OWN {tool} ({provider}) authorization — you have not authorized yet, so the command did NOT run (it will not run as the bot or anyone else). Open the link below and confirm with your own account:',
+  'trigger_user_auth.denied_named_link': 'botmux: this step needs {name}\'s own {tool} ({provider}) authorization, which has not been granted, so the command did NOT run. Open the link below and confirm with that account:',
+  'trigger_user_auth.denied_link_footer': 'Once authorized, just ask me to retry — no command to type. Not opening the link means not authorizing, and actions needing your own permissions will not run.',
   'cmd.login.title': '🔐 Lark User OAuth',
   'cmd.login.lark_title': '🔐 lark-cli authorization (scan / open link)',
   'cmd.login.lark_step1': '1. Open the link below and confirm with your own Lark account:',
@@ -827,6 +830,7 @@ export const messages: Record<string, string> = {
   'ai.credentials.on_auth_failure': 'On an auth failure: report it as-is and tell the person to authorize (/login for Feishu, /login bytedcli for ByteCloud — a refusal names which). Do not go looking for, assemble, or reuse other credentials to work around it.',
   // missing_scope means "authorized, but not for this" — a plain /login re-grants
   // the same scopes and fails identically. Feishu already names what is missing.
+  'ai.credentials.on_auth_link': 'If a command is refused and stderr contains an authorization link (accounts.feishu.cn/device/verify or a ByteCloud link) plus instructions to authorize and retry: immediately relay that text and the link verbatim to the user with botmux send (forward the link byte-for-byte; do not rewrite, encode, or add punctuation), then stop and wait. Do not retry under any other identity and do not pretend the operation succeeded. The user will call you again after authorizing; retry then.',
   'ai.credentials.on_missing_scope': 'If the error is missing_scope (99991679): the person IS authorized but this one permission was not granted. Read back the missing_scopes verbatim and ask them to send "/login --scope <those scopes>", then retry. Do not switch to the bot identity to get around it, and do not send them through a plain /login again.',
   'ai.identity.routing_intro': 'There may be multiple bots in the group. Route by @name and open_id:',
   'ai.identity.rule_own_part': '- Do only your part; do not pick up work assigned to other bots',

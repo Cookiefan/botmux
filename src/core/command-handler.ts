@@ -1138,9 +1138,8 @@ function triggerUserAuthStatusLines(
   const policy = botCfg.triggerUserAuth;
   if (!policy?.enabled || !policy.tools.length) return [];
   const brand = normalizeBrand(botCfg.brand);
-  const larkAuthorized = senderOpenId
-    ? listAuthorizedUsers(botCfg.larkAppId, brand).find(u => u.openId === senderOpenId)
-    : undefined;
+  // lark-cli identity is the per-person device-code HOME (not the bot-app token).
+  const larkAuthorized = senderOpenId ? hasLarkCliHome(senderOpenId) : false;
   const botFallback = unauthorizedOutcomeFor(policy, 'lark-cli') !== 'fail';
 
   const lines = ['Trigger-user auth: 已开启'];
@@ -1148,16 +1147,16 @@ function triggerUserAuthStatusLines(
     lines.push(`  ${tool}: ${
       tool === 'lark-cli'
         ? larkAuthorized
-          ? `以${larkAuthorized.userName ? `「${larkAuthorized.userName}」` : '你'}的身份调用`
+          ? '已授权（扫码），以你自己的身份调用'
           : botFallback
-            ? '你未授权 —— 当前以 bot 身份调用，发 /login 可改为用你自己的权限'
-            : '你未授权 —— 命令会被拒绝，发 /login 授权后重试'
+            ? '你未授权 —— 当前以 bot 身份调用，发 /login 点链接可改为用你自己的权限'
+            : '你未授权 —— 命令会被拒绝；发 /login 点链接授权（或需要时我直接给你链接），点完即可'
         // ByteCloud is a separate identity provider, so this is a genuinely
         // different verdict from the Lark line above — the same person can be
         // authorized for one and not the other. There is no bot identity to
         // degrade to here, so unauthorized always means the command is refused.
         : hasBytedcliHome(senderOpenId ?? '')
-          ? '以你自己的身份调用'
+          ? '已授权，以你自己的身份调用'
           : '你未授权 —— 命令会被拒绝，发 /login bytedcli 授权后重试'
     }`);
   }
@@ -2972,7 +2971,7 @@ export async function handleCommand(
           }
           // 没有 lark-cli challenge；若 bytedcli 有进行中的，交给其分支。
           if (pendingBytedcliChallenge(loginOpenId)) {
-            const { state, detail } = await completeBytedcliLogin(loginOpenId, pendingBytedcliChallenge(loginOpenId)!);
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, pendingBytedcliChallenge(loginOpenId)!.token);
             await sessionReply(rootId, state === 'authorized'
               ? t('cmd.login.bytedcli_ok', undefined, loc)
               : state === 'pending'
@@ -3024,7 +3023,7 @@ export async function handleCommand(
               await sessionReply(rootId, t('cmd.login.bytedcli_no_challenge', undefined, loc));
               break;
             }
-            const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge);
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge.token);
             await sessionReply(rootId, state === 'authorized'
               ? t('cmd.login.bytedcli_ok', undefined, loc)
               : state === 'pending'

@@ -282,22 +282,26 @@ function challengePath(openId: string): string {
   return join(larkCliHomeFor(openId), '.botmux-login-challenge');
 }
 
-/** The resume token from an in-progress login if still usable. */
-export function pendingLarkCliChallenge(openId: string): { deviceCode: string; createdAt: number } | null {
+/** The resume token + link from an in-progress login if still usable. */
+export function pendingLarkCliChallenge(openId: string): { deviceCode: string; authUrl?: string; createdAt: number } | null {
   try {
     const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
-      { deviceCode?: unknown; createdAt?: unknown };
+      { deviceCode?: unknown; authUrl?: unknown; createdAt?: unknown };
     if (typeof raw.deviceCode !== 'string' || typeof raw.createdAt !== 'number') return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
-    return { deviceCode: raw.deviceCode, createdAt: raw.createdAt };
+    return {
+      deviceCode: raw.deviceCode,
+      ...(typeof raw.authUrl === 'string' ? { authUrl: raw.authUrl } : {}),
+      createdAt: raw.createdAt,
+    };
   } catch { return null; }
 }
 
-function saveChallenge(openId: string, deviceCode: string): void {
+function saveChallenge(openId: string, deviceCode: string, authUrl: string): void {
   try {
     atomicWriteFileSync(
       challengePath(openId),
-      JSON.stringify({ deviceCode, createdAt: Date.now() }),
+      JSON.stringify({ deviceCode, authUrl, createdAt: Date.now() }),
       { mode: 0o600 },
     );
   } catch (e) {
@@ -326,6 +330,14 @@ export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginCha
     logger.warn('[lark-cli-auth] cannot begin login: operator lark-cli has no app to seed from');
     return null;
   }
+  // Reuse a still-fresh, not-yet-completed challenge: several turns in quick
+  // succession from one person who has not authorized must not mint a new code
+  // (and invalidate the link already shown) on every message. A fresh scan
+  // clears the challenge, so after they authorize a new code is correctly made.
+  const pending = pendingLarkCliChallenge(openId);
+  if (pending?.authUrl && !hasLarkCliHome(openId)) {
+    return { authUrl: pending.authUrl };
+  }
   const { ok, stdout, stderr } = await runAsUser(openId, [
     'auth', 'login', '--no-wait', '--json', '--scope', LARK_CLI_DEVICE_SCOPES.join(' '),
   ]);
@@ -338,7 +350,7 @@ export async function beginLarkCliLogin(openId: string): Promise<LarkCliLoginCha
     logger.warn(`[lark-cli-auth] could not start a login: ${stderr.trim() || stdout.trim() || 'no output'}`);
     return null;
   }
-  saveChallenge(openId, deviceCode);
+  saveChallenge(openId, deviceCode, authUrl);
   return { authUrl };
 }
 

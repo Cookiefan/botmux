@@ -17,8 +17,8 @@ import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.
 import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
-import { mintBytedcliJwts } from '../services/bytedcli-auth.js';
-import { larkCliHomeForTurn } from '../services/lark-cli-auth.js';
+import { mintBytedcliJwts, beginBytedcliLogin } from '../services/bytedcli-auth.js';
+import { larkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import {
   triggerUserAuthApplies,
@@ -92,7 +92,7 @@ export async function publishTurnCliIdentity(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
-      outcomes.push(withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+      outcomes.push(await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
     }
   }
   return outcomes;
@@ -112,7 +112,8 @@ async function publishOne(
 
   // No human sender (scheduled run, hook, meeting event, bot-to-bot handoff):
   // there is no "trigger user" to act as. Withhold — never reach for the session
-  // creator's or the owner's credentials to fill the gap.
+  // creator's or the owner's credentials to fill the gap. No link either (nobody
+  // to scan it).
   if (!senderOpenId) return withheld();
 
   const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
@@ -134,7 +135,7 @@ async function publishOne(
  * operator's on-disk login instead). And a refusal is published too, because it
  * carries the text the refused person reads.
  */
-function withholdIdentity(
+async function withholdIdentity(
   tool: TriggerUserAuthTool,
   botConfig: BotConfig,
   sessionDataDir: string,
@@ -142,7 +143,7 @@ function withholdIdentity(
   senderOpenId: string | undefined,
   locale: Locale | undefined,
   turnId: string | undefined,
-): ToolIdentityOutcome {
+): Promise<ToolIdentityOutcome> {
   if (
     unauthorizedOutcomeFor(botConfig.triggerUserAuth, tool) !== 'fail'
     && tool === 'lark-cli'
@@ -163,7 +164,23 @@ function withholdIdentity(
       // which is the safe end of this failure.
     }
   }
-  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId);
+  // Blocking refusal. Fetch a fresh authorization link NOW (at acceptance, before
+  // the agent picks a tool) and bake it into the message the wrapper prints — so
+  // the moment the command actually needs this CLI, the agent has a ready,
+  // correct link to relay instead of asking the person to type /login. Beginning
+  // the device flow does not message anyone; the link is only surfaced if the
+  // tool is really invoked and refused.
+  let authUrl: string | undefined;
+  if (senderOpenId) {
+    try {
+      authUrl = tool === 'bytedcli'
+        ? (await beginBytedcliLogin(senderOpenId))?.authUrl
+        : (await beginLarkCliLogin(senderOpenId))?.authUrl;
+    } catch (e) {
+      logger.debug(`[trigger-user-auth] could not pre-fetch ${tool} auth link: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, authUrl);
   return { tool, state: 'needs-authorization' };
 }
 
@@ -187,45 +204,58 @@ function writeDenial(
   botConfig: BotConfig,
   locale: Locale | undefined,
   turnId: string | undefined,
+  authUrl?: string,
 ): void {
   try {
-    const name = senderOpenId && botConfig.larkAppId
-      // Brand matters: the lookup checks it, so a Lark-brand bot with the
-      // default 'feishu' finds nothing and the refusal loses the person's name.
-      ? lookupAuthorizedUserName(botConfig.larkAppId, senderOpenId, normalizeBrand(botConfig.brand))
-      : undefined;
-    // Name the right provider. bytedcli authenticates against ByteCloud, so
-    // saying "Feishu authorization" would send the reader to authorize the
-    // wrong thing — the same mistake as naming the wrong /login command.
+    // Provider name is always relevant: bytedcli authenticates against ByteCloud,
+    // so the link/refusal must not read as a Feishu authorization.
     const provider = tool === 'bytedcli'
       ? 'ByteCloud'
       : t('trigger_user_auth.provider_lark', undefined, locale);
-    // With no name, address the reader directly rather than printing a raw
-    // open_id at them. The name comes from a stored Lark token, which someone
-    // being refused for lack of authorization usually does not have — so the
-    // nameless case is the COMMON one here, not an edge case, and `「ou_5f3a…」
-    // 本人` reads as a machine talking to itself.
-    const head = !senderOpenId
-      ? t('trigger_user_auth.denied_anonymous', { tool, provider }, locale)
-      : name
-        ? t('trigger_user_auth.denied_known_user', { name, tool, provider }, locale)
-        : t('trigger_user_auth.denied_you', { tool, provider }, locale);
+    // Optional: name the person when we genuinely know it. Uncommon on a refusal
+    // (they usually have no stored token), so most renders address the reader
+    // directly rather than print a raw open_id.
+    const knownName = senderOpenId && botConfig.larkAppId
+      ? lookupAuthorizedUserName(botConfig.larkAppId, senderOpenId, normalizeBrand(botConfig.brand))
+      : undefined;
+
+    // With a live device-code link, lead with the direct, self-serve instruction
+    // — the person does not type anything; they open the link and authorize, then
+    // tell the agent to retry. Without one (link fetch failed, or no human
+    // sender), fall back to the /login instructions.
+    const parts: string[] = [];
+    if (authUrl) {
+      parts.push(knownName
+        ? t('trigger_user_auth.denied_named_link', { tool, provider, name: knownName }, locale)
+        : t('trigger_user_auth.denied_you_link', { tool, provider }, locale));
+      parts.push(authUrl);
+      parts.push(t('trigger_user_auth.denied_link_footer', undefined, locale));
+    } else {
+      // With no name, address the reader directly rather than printing a raw
+      // open_id at them. The name comes from a stored Lark token, which someone
+      // being refused for lack of authorization usually does not have — so the
+      // nameless case is the COMMON one here, not an edge case, and `「ou_5f3a…」
+      // 本人` reads as a machine talking to itself.
+      parts.push(!senderOpenId
+        ? t('trigger_user_auth.denied_anonymous', { tool, provider }, locale)
+        : knownName
+          ? t('trigger_user_auth.denied_known_user', { name: knownName, tool, provider }, locale)
+          : t('trigger_user_auth.denied_you', { tool, provider }, locale));
+      // Name the right command: ByteCloud and Feishu are separate providers, so
+      // telling a refused bytedcli user to send `/login` would send them to
+      // authorize the wrong thing and fail again.
+      parts.push(t(
+        'trigger_user_auth.denied_howto',
+        { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
+        locale,
+      ));
+      parts.push(t('trigger_user_auth.denied_howto_status', undefined, locale));
+    }
     writeSessionIdentity(sessionDataDir, sessionId, {
       tool,
       mode: 'denied',
       ...(turnId ? { turnId } : {}),
-      message: [
-        head,
-        // Name the right command: ByteCloud and Feishu are separate providers,
-        // so telling a refused bytedcli user to send `/login` would send them
-        // to authorize the wrong thing and fail again.
-        t(
-          'trigger_user_auth.denied_howto',
-          { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
-          locale,
-        ),
-        t('trigger_user_auth.denied_howto_status', undefined, locale),
-      ].join('\n'),
+      message: parts.join('\n'),
     });
   } catch (e) {
     clearSessionIdentity(sessionDataDir, sessionId, tool);
