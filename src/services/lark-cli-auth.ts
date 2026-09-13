@@ -59,9 +59,35 @@ export function __setMachineHomeForTest(home: string | null): void {
 }
 const LARK_CLI_HOME_ROOT_DEFAULT = join(homedir(), '.botmux', 'data', 'lark-cli-home');
 
-/** The lark-cli app this flow is issued against. This is lark-cli's own app,
- *  generally available — not the per-bot app. Read from the operator's install
- *  when present; the constant is only the fallback/default. */
+/**
+ * Where the issuing app's material (config + master.key + appsecret) comes from.
+ *
+ * Device login has no built-in public app: it MUST bind a real self-built app,
+ * and that app's availability scope decides who can authorize. Resolution order:
+ *
+ *   1. test override (`__setMachineHomeForTest`)
+ *   2. BOTMUX_LARK_CLI_ISSUER_HOME (explicit env)
+ *   3. the botmux-managed issuer HOME (~/.botmux/data/lark-cli-app-bootstrap),
+ *      if it has a configured app — provision it once with
+ *      `HOME=<dir> lark-cli config init --new` and set that app's scope
+ *   4. the operator's own lark-cli HOME (back-compat)
+ *
+ * Point it at a dedicated provisioning HOME whose app has the intended
+ * availability scope (all-staff or a named set).
+ */
+function issuerMachineHome(): string {
+  if (machineHomeOverride) return machineHomeOverride;
+  const env = process.env.BOTMUX_LARK_CLI_ISSUER_HOME?.trim();
+  if (env) return env;
+  const managed = join(LARK_CLI_HOME_ROOT_DEFAULT, '..', 'lark-cli-app-bootstrap');
+  if (existsSync(join(managed, '.lark-cli', 'config.json'))) return managed;
+  return homedir();
+}
+
+/** Last-resort app id if the issuer HOME has no readable config. Normally the
+ *  app id is read from the issuer HOME's lark-cli config (BOTMUX_LARK_CLI_ISSUER_HOME
+ *  or the operator HOME); a wrong default here surfaces as a device-login failure,
+ *  not a silent mis-issuance. */
 const DEFAULT_LARK_CLI_APP_ID = 'cli_aa8021c36af9dcde';
 
 /** Device-code challenges live about 10 minutes (lark-cli `expires_in: 600`).
@@ -201,7 +227,7 @@ async function runAsUser(openId: string, args: string[]): Promise<LarkCliResult>
 function machineLarkCliPaths(): {
   config: string; dataDir: string; appId: string;
 } | null {
-  const root = machineHomeOverride ?? homedir();
+  const root = issuerMachineHome();
   const config = join(root, '.lark-cli', 'config.json');
   const dataDir = join(root, '.local', 'share', 'lark-cli');
   if (!existsSync(config) || !existsSync(dataDir)) return null;

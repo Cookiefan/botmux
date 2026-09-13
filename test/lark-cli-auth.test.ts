@@ -160,6 +160,41 @@ describe('begin / complete device flow', () => {
     expect(hasLarkCliHome(OPEN)).toBe(false);
   });
 
+  it('issues from BOTMUX_LARK_CLI_ISSUER_HOME instead of the operator HOME', async () => {
+    // The operator HOME deliberately points at a DIFFERENT app; an explicit issuer
+    // HOME must win so the device code is minted by the chosen all-staff app.
+    const issuer = mkdtempSync(join(tmpdir(), 'larkauth-issuer-'));
+    const ISSUER_APP = 'cli_issuer_allstaff_1';
+    mkdirSync(join(issuer, '.lark-cli'), { recursive: true });
+    mkdirSync(join(issuer, '.local', 'share', 'lark-cli'), { recursive: true });
+    writeFileSync(join(issuer, '.lark-cli', 'config.json'), JSON.stringify({
+      apps: [{ appId: ISSUER_APP, appSecret: { source: 'keychain' }, brand: 'feishu', users: [] }],
+    }));
+    writeFileSync(join(issuer, '.local', 'share', 'lark-cli', 'master.key'), 'issuer-key');
+    writeFileSync(join(issuer, '.local', 'share', 'lark-cli', `appsecret_${ISSUER_APP}.enc`), 'issuer-secret');
+
+    const prev = process.env.BOTMUX_LARK_CLI_ISSUER_HOME;
+    process.env.BOTMUX_LARK_CLI_ISSUER_HOME = issuer;
+    // beforeEach pins a machine-home override that wins over env; in production
+    // only env is set. Clear the override here so the env path is exercised.
+    __setMachineHomeForTest(null);
+    try {
+      __setLarkCliRunnerForTest(async () => ({
+        ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'd' }), stderr: '',
+      }));
+      await beginLarkCliLogin(OPEN);
+      const dataDir = join(larkCliHomeFor(OPEN), '.local', 'share', 'lark-cli');
+      // Seeded from the ISSUER, not from the operator machine HOME.
+      expect(readFileSync(join(dataDir, 'master.key'), 'utf8')).toBe('issuer-key');
+      expect(existsSync(join(dataDir, `appsecret_${ISSUER_APP}.enc`))).toBe(true);
+      expect(existsSync(join(dataDir, `appsecret_${APP_ID}.enc`))).toBe(false);
+    } finally {
+      __setMachineHomeForTest(machineHome);
+      if (prev === undefined) delete process.env.BOTMUX_LARK_CLI_ISSUER_HOME;
+      else process.env.BOTMUX_LARK_CLI_ISSUER_HOME = prev;
+    }
+  });
+
   it('reuses a fresh pending challenge instead of minting a new code', async () => {
     seedMachine();
     const calls: string[][] = [];
