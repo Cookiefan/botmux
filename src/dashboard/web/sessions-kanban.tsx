@@ -30,6 +30,7 @@ import {
   t,
 } from './ui.js';
 import { deriveSessionBoardColumn, sessionExchangePreview } from './sessions.js';
+import { useT } from './react-hooks.js';
 
 export interface SessionsKanbanTeam {
   key: string;
@@ -92,6 +93,9 @@ export interface SessionsKanbanCallbacks {
   onToggleLock: (row: any, button: HTMLButtonElement) => void;
   onToggleSelect: (row: any) => void;
   selectedSessionIds: ReadonlySet<string>;
+  /** 名字表（botDisplayName/chatDisplayTitle 读的模块级 Map）解析完成后自增。
+   *  卡片被 memo 且行对象引用不变，没有这个判据名字表回来后卡片会停在 cli_xxx。 */
+  namesVersion?: number;
 }
 
 export type SessionsKanbanProps = SessionsKanbanState & SessionsKanbanCallbacks & {
@@ -512,6 +516,8 @@ function KanbanCardBase(props: {
   onDragStartCard: (row: any, event: DragEvent<HTMLElement>) => void;
   onEditDone: () => void;
 }): React.JSX.Element {
+  // 卡片被 memo 且比较器不看 locale，必须自己订阅，否则切语言时文案停在旧语言。
+  useT();
   const { callbacks, row } = props;
   const title = rowTitle(row);
   const botName = botDisplayName(row);
@@ -691,6 +697,7 @@ const KanbanCard = memo(KanbanCardBase, (prev, next) => {
   // 渲染时读到的字段。
   const a = prev.callbacks;
   const b = next.callbacks;
+  if (a.namesVersion !== b.namesVersion) return false;
   if (a.icons !== b.icons
     || a.canRestartSession !== b.canRestartSession
     || a.lockActionLabel !== b.lockActionLabel

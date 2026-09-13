@@ -4160,6 +4160,7 @@ function SessionsPage(): React.JSX.Element {
             onToggleLock={kanbanOnToggleLock}
             onToggleSelect={kanbanOnToggleSelect}
             selectedSessionIds={selected}
+            namesVersion={revision}
           />
         </div>
         ) : null}
