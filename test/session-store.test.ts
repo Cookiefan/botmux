@@ -85,6 +85,7 @@ import {
   persistActiveRemoteLineageExact,
   persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
+  findActiveSessionsByWorkingDirStrict,
   repairMissingChatScope,
   loadAllSessionsSnapshot,
   applySessionCommandUnowned,
@@ -136,6 +137,7 @@ function readPersistedRows(dir: string, appId?: string): Record<string, any> {
 beforeEach(() => {
   tempDir = makeTempDir();
   fsControl.failSessionWrite = false;
+  fsControl.failReaddir = false;
   costCalculatorMock.getSessionTokenUsage.mockReset();
   costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
   __testOnly_setBeforeRowPersist(undefined);
@@ -1355,6 +1357,67 @@ describe('Multi-bot isolation', () => {
 
 // ─── findActiveSessionsByRoot() — cross-bot lookup ───────────────────────
 
+describe('findActiveSessionsByWorkingDirStrict()', () => {
+  it('finds active sessions across stores by canonical worktree path', () => {
+    const worktree = join(tempDir, 'repo-wt');
+    const nested = join(worktree, 'packages', 'app');
+    mkdirSync(nested, { recursive: true });
+    const alias = nested;
+
+    init('app-A');
+    const sA = createSession('chat1', 'root-a', 'Bot A');
+    sA.workingDir = alias;
+    sA.larkAppId = 'app-A';
+    updateSession(sA);
+
+    init('app-B');
+    const sB = createSession('chat1', 'root-b', 'Bot B');
+    sB.workingDir = worktree;
+    sB.larkAppId = 'app-B';
+    updateSession(sB);
+
+    const found = findActiveSessionsByWorkingDirStrict(worktree);
+    expect(found.map(s => s.sessionId).sort()).toEqual([sA.sessionId, sB.sessionId].sort());
+  });
+
+  it('fails closed when the cross-store inventory cannot be enumerated', () => {
+    init('app-A');
+    fsControl.failReaddir = true;
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
+      .toThrow(/simulated readdir denial/);
+  });
+
+  it('fails closed when another legacy JSON store has a malformed active row', () => {
+    init('app-B');
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), JSON.stringify({
+      broken: { status: 'active', workingDir: tempDir },
+    }));
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
+      .toThrow(/malformed active session row/i);
+  });
+
+  it('fails closed when another SQLite store has a malformed active row', () => {
+    init('app-A');
+    const session = createSession('chat1', 'root-a', 'Bot A');
+    const dbPath = persistedStorePath(tempDir, 'app-A');
+    expect(dbPath?.endsWith('.db')).toBe(true);
+    const db = new DatabaseSync(dbPath!);
+    try {
+      db.prepare("UPDATE sessions SET row = ? WHERE session_id = ?")
+        .run('{}', session.sessionId);
+    } finally {
+      db.close();
+    }
+
+    init('app-B');
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
+      .toThrow(/malformed active session row/i);
+  });
+});
+
 describe('findActiveSessionsByRoot()', () => {
   it('finds active sessions across per-bot files for the same rootMessageId', () => {
     // Bot A pins workdir for thread root-x
@@ -1792,4 +1855,34 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
     expect(held).toEqual({ outcome: 'contended' });
     expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('active');
   }, 15_000);
+});
+
+it('captures group model defaults only for new topics and persists independent snapshots', () => {
+  const groups = { oc_a: { codex: 'first', 'claude-code': 'sonnet' }, oc_b: { codex: 'other' } };
+  init('model-test', { groupDefaultModels: chatId => groups[chatId as keyof typeof groups] });
+  const first = createSession('oc_a', 'root-one', 'one', 'group');
+  const other = createSession('oc_b', 'root-two', 'two', 'group');
+  groups.oc_a.codex = 'changed';
+  const next = createSession('oc_a', 'root-three', 'three', 'group');
+  expect(first.groupDefaultModels?.codex).toBe('first');
+  expect(other.groupDefaultModels?.codex).toBe('other');
+  expect(next.groupDefaultModels?.codex).toBe('changed');
+  expect(createSession('oc_a', 'p2p', 'dm', 'p2p').groupDefaultModels).toBeUndefined();
+  expect(createSession('oc_a', 'chat', 'chat', 'group', 'chat').groupDefaultModels).toBeUndefined();
+  init('model-test');
+  expect(getSession(first.sessionId)?.groupDefaultModels).toEqual({ codex: 'first', 'claude-code': 'sonnet' });
+  expect(createSession('oc_a', 'legacy', 'no resolver', 'group').groupDefaultModels).toBeUndefined();
+});
+
+
+it('deeply snapshots group model and effort without changing runtime identity', () => {
+  const models = {codex:{model:'gpt-5.6-sol',reasoningEffort:'ultra' as const},'claude-code':{model:'sonnet',reasoningEffort:'high' as const}};
+  init('effort-test', {groupDefaultModels:()=>models});
+  const session=createSession('oc_group','root-effort','effort','group');
+  expect(session.reasoningEffort).toBeUndefined();
+  expect(session.cliId).toBeUndefined();
+  models.codex.model='changed';
+  expect(session.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
+  init('effort-test');
+  expect(getSession(session.sessionId)?.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
 });

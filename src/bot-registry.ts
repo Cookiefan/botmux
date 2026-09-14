@@ -1,4 +1,5 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
@@ -13,6 +14,7 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
@@ -1449,6 +1451,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Per-chat defaults captured only by newly created topics. */
+  groupDefaultModels?: Record<string, GroupDefaultModels>;
   /** Optional TraeX backend variant. Missing inherits TraeX global config. */
   modelBackendVariant?: 'standard' | 'max';
   /**
@@ -1551,6 +1555,7 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  codexInstancePool?: import('./services/codex-instance-pool.js').CodexInstancePool;
   /**
    * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
    * using whatever identity is logged in on the machine. Enabled → `lark-cli` /
@@ -2172,6 +2177,7 @@ const bots = new Map<string, BotState>();
 let parsedNativeSubagentRuntimeStatus = new WeakMap<BotConfig, NativeSubagentRuntimeConfigState['status']>();
 
 export function __testOnly_resetBotRegistry(): void {
+  clearCodexInstanceBots();
   bots.clear();
   parsedNativeSubagentRuntimeStatus = new WeakMap();
   loadedConfigPath = undefined;
@@ -2334,6 +2340,7 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  registerCodexInstanceBot(cfg);
   const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
   const normalizedRuntime = cfg.cliId === 'traex'
     ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
@@ -3125,6 +3132,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   const configs: BotConfig[] = [];
   for (let i = 0; i < parsed.length; i++) {
     const entry = parsed[i];
+    const codexInstancePool = normalizeCodexInstancePool(entry.codexInstancePool, entry);
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
     }
@@ -3540,6 +3548,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
         : undefined,
+      groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
       modelBackendVariant: entryCliId === 'traex'
         && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
         ? entry.modelBackendVariant
@@ -3567,6 +3576,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
@@ -3756,7 +3766,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     parsedNativeSubagentRuntimeStatus.set(config, nativeSubagentRuntimeStatus);
     configs.push(config);
   }
-
+  validateCodexInstanceRoster(configs);
   return configs;
 }
 
