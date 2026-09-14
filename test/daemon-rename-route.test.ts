@@ -2366,6 +2366,34 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds?.pendingTraexInitialization?.phase).toBe('mode');
   });
 
+  it('TraeX thread safety-net treats `/workflow new` as workflow and skips startup mode card', async () => {
+    process.env.BOTMUX_WORKFLOW_ENABLED = 'true';
+    try {
+      const bot = registerBot({
+        larkAppId: APP,
+        larkAppSecret: 's',
+        cliId: 'traex',
+        allowedUsers: [OWNER],
+        oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+      });
+      bot.resolvedAllowedUsers = [OWNER];
+
+      await handleThreadReply(
+        makeEventData('om_traex_workflow_reply', '/workflow new 修复首轮授权', 'om_traex_workflow_root'),
+        makeCtx('om_traex_workflow_root', 'om_traex_workflow_reply'),
+      );
+
+      expect(repliedText()).not.toContain('选择 TraeX 启动方式');
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({ turnId: 'om_traex_workflow_reply' });
+      expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('修复首轮授权');
+      const ds = activeSessions.get(sessionKey('om_traex_workflow_root', APP));
+      expect(ds?.pendingTraexInitialization).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_WORKFLOW_ENABLED;
+    }
+  });
+
   it('TraeX existing Lark thread reply bypasses initialization card and continues directly', async () => {
     const bot = registerBot({
       larkAppId: APP,

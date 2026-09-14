@@ -20991,6 +20991,7 @@ async function handleThreadReplyAdmitted(
       && !isForeignBot
       && !substituteTrigger
       && !explicitForgePrompt
+      && !threadGrill
       && !isExistingLarkThreadReply(parsed);
     const forgeAvailability = traexInitializationCandidate
       ? checkForgeTraexStartupAvailability()
