@@ -30,6 +30,19 @@ if grep -q '^if \[ ! -e "\$HOME/.sudo_as_admin_successful"' /etc/bash.bashrc 2>/
   sudo sed -i 's|^if \[ ! -e "\$HOME/.sudo_as_admin_successful" \] && \[ ! -e "\$HOME/.hushlogin" \] ; then|if false \&\& [ ! -e "$HOME/.sudo_as_admin_successful" ] \&\& [ ! -e "$HOME/.hushlogin" ] ; then|' /etc/bash.bashrc
 fi
 
+# 2b) 修复 /etc 顶层的悬空符号链接。
+#     v3 distillation 沙箱（src/workflows/v3/distillation-runner.ts）会冻结 /etc：
+#     对 readdirSync('/etc') 的每个顶层条目做 `bwrap --ro-bind`。只要有一个条目是
+#     指向不存在目标的悬空 symlink（本镜像即有 vconsole.conf -> default/keyboard），
+#     bwrap 就会 "Can't find source path" 整体启动失败，导致该沙箱能力及其单测全挂。
+#     悬空 symlink 本身已是坏文件，删除无副作用且幂等。
+for f in /etc/*; do
+  if [ -L "$f" ] && [ ! -e "$f" ]; then
+    echo "[install] removing dangling /etc symlink: $f -> $(readlink "$f")"
+    sudo rm -f "$f"
+  fi
+done
+
 # 3) 安装钉住版本的包管理器 bun。
 if ! command -v bun >/dev/null 2>&1 || [ "$(bun --version 2>/dev/null || true)" != "$BUN_VERSION" ]; then
   echo "[install] installing bun v${BUN_VERSION}"
