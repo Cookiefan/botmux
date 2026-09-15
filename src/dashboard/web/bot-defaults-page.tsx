@@ -41,6 +41,7 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
+import { toast } from './toast.js';
 import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
@@ -63,6 +64,10 @@ import {
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
 import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
+import {
+  STREAMING_CARD_BUTTON_IDS,
+  type StreamingCardButtonId,
+} from '../../im/lark/streaming-card-buttons.js';
 
 /** The reasoning-effort selector, its option list and the save payload must all
  *  agree on which CLIs are configurable — they were three separate inline
@@ -111,7 +116,7 @@ const MAX_SG_TAG_NAME_LENGTH = 60;
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string>;
+type CardPrefPatch = Record<string, boolean | string | StreamingCardButtonId[]>;
 
 type JsonResponse = {
   ok: boolean;
@@ -468,7 +473,7 @@ type DropdownFieldOption<T extends string> = {
   disabled?: boolean;
 };
 
-function DropdownField<T extends string>(props: {
+export function DropdownField<T extends string>(props: {
   dataInput: string;
   value: T;
   options: DropdownFieldOption<T>[];
@@ -520,6 +525,7 @@ export function ModelPickerField(props: {
   ariaLabel: string;
   defaultLabel: string;
   customLabel: string;
+  includeDefault?: boolean;
   detectedCount?: number;
   detectedLabel?: string;
   /** 下拉菜单样式类：defaults 页传 bd-field-menu，onboarding 传 onboarding-menu。 */
@@ -531,13 +537,14 @@ export function ModelPickerField(props: {
   const current = props.value;
   const dropdownOptions = useMemo(() => {
     const opts: { value: string; label: ReactNode }[] = [];
+    if (props.includeDefault) opts.push({ value: '', label: props.defaultLabel });
     if (current && !props.options.includes(current)) {
       opts.push({ value: current, label: current });
     }
     for (const item of props.options) opts.push({ value: item, label: item });
     opts.push({ value: MODEL_PICKER_CUSTOM, label: props.customLabel });
     return opts;
-  }, [current, props.options, props.customLabel]);
+  }, [current, props.options, props.customLabel, props.includeDefault, props.defaultLabel]);
 
   return (
     <span className="bd-model-picker">
@@ -746,12 +753,15 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     ...bot,
     usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
+    replyCardMode: body.replyCardMode,
+    hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
     thinkingCard: body.thinkingCard,
+    thinkingCardToolResult: body.thinkingCardToolResult,
     senderTag: body.senderTag,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
@@ -837,7 +847,9 @@ export function BotDefaultsPage() {
       return;
     }
     if (!selectedAppId || !filtered.some(bot => bot.larkAppId === selectedAppId)) {
-      setSelectedAppId(filtered[0].larkAppId);
+      const firstBot = filtered[0];
+      setSelectedAppId(firstBot.larkAppId);
+      if (firstBot.startupBlocked?.reason === 'quota_fallback_cycle') setActiveTab('advanced');
     }
   }, [filtered, loadError, loading, selectedAppId]);
 
@@ -876,6 +888,7 @@ export function BotDefaultsPage() {
       <BotDefaultsCard
         key={`${selectedBot.larkAppId}:${profileRoleVersion}`}
         bot={selectedBot}
+        bots={bots}
         cliState={cliState}
         patchBot={patchBot}
         activeTab={activeTab}
@@ -955,7 +968,10 @@ export function BotDefaultsPage() {
                 key={bot.larkAppId}
                 bot={bot}
                 selected={bot.larkAppId === selectedAppId}
-                onSelect={() => setSelectedAppId(bot.larkAppId)}
+                onSelect={() => {
+                  setSelectedAppId(bot.larkAppId);
+                  if (bot.startupBlocked?.reason === 'quota_fallback_cycle') setActiveTab('advanced');
+                }}
               />
             ))}
           </div>
@@ -967,6 +983,7 @@ export function BotDefaultsPage() {
 }
 
 function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect(): void }) {
+  const tr = useT();
   const { bot } = props;
   const name = bot.botName ?? bot.larkAppId;
   const cli = displayCliId(bot, cliIdOf(bot.larkAppId));
@@ -989,13 +1006,17 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
         <b><OverflowText text={name} showPopover={false} textClassName="bd-roster-name" /></b>
         <span>{cli || bot.larkAppId.slice(0, 14)}</span>
       </div>
-      {bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
+      {bot.startupBlocked?.reason === 'quota_fallback_cycle'
+        ? <span className="bd-roster-flag bd-roster-flag-blocked">{tr('botDefaults.startupBlockedBadge')}</span>
+        : bot.online === false ? <span className="bd-roster-flag">{tr('botDefaults.offlineBadge')}</span>
+        : bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
     </div>
   );
 }
 
 function BotDefaultsCard(props: {
   bot: BotDefaultsRow;
+  bots: BotDefaultsRow[];
   cliState: CliOptionsState;
   patchBot: PatchBot;
   activeTab: BotDefaultsTab;
@@ -1043,7 +1064,10 @@ function BotDefaultsCard(props: {
               patchBot={patchBot}
               meta={(
                 <>
-                  <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
+                  {bot.startupBlocked?.reason === 'quota_fallback_cycle'
+                    ? <small className="bd-meta-blocked">● {tr('botDefaults.metaStartupBlocked')}</small>
+                    : bot.online === false ? <small>● {tr('botDefaults.metaOffline')}</small>
+                    : <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>}
                   {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
                   {(bot.autoboundChatCount ?? 0) > 0 ? <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small> : null}
                 </>
@@ -1054,6 +1078,12 @@ function BotDefaultsCard(props: {
         </header>
         <BotDefaultsTabs active={props.activeTab} onChange={props.onTabChange} />
       </div>
+      {bot.startupBlocked?.reason === 'quota_fallback_cycle' ? (
+        <div className="bd-startup-blocked" role="alert" data-startup-blocked>
+          <strong>{tr('botDefaults.startupBlockedTitle')}</strong>
+          <span>{tr('botDefaults.startupBlockedHelp', { cycle: bot.startupBlocked.cycle.join(' → ') })}</span>
+        </div>
+      ) : null}
       <div className="bd-body bd-tab-panels">
         <div
           id="bd-panel-common"
@@ -1155,6 +1185,7 @@ function BotDefaultsCard(props: {
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
             <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1265,6 +1296,145 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
           </div>
         </details>
       ) : null}
+    </section>
+  );
+}
+
+type QuotaFallbackKind = 'usage' | 'rate';
+
+function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow[]; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.quotaFallbackBot ?? null;
+  const [enabled, setEnabled] = useState(initial?.enabled === true);
+  const [targetAppId, setTargetAppId] = useState(initial?.targetAppId ?? '');
+  const [kinds, setKinds] = useState<QuotaFallbackKind[]>(initial?.kinds ?? ['usage', 'rate']);
+  const [message, setMessage] = useState(initial?.message ?? tr('botDefaults.quotaFallbackDefaultMessage'));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.quotaFallbackBot ?? null;
+    setEnabled(next?.enabled === true);
+    setTargetAppId(next?.targetAppId ?? '');
+    setKinds(next?.kinds ?? ['usage', 'rate']);
+    setMessage(next?.message ?? tr('botDefaults.quotaFallbackDefaultMessage'));
+  }, [props.bot.quotaFallbackBot, tr]);
+
+  const targetOptions = useMemo<DropdownFieldOption<string>[]>(() => [
+    { value: '', label: tr('botDefaults.quotaFallbackTargetPlaceholder') },
+    ...props.bots
+      .filter(candidate => candidate.larkAppId !== props.bot.larkAppId && !candidate.error)
+      .map(candidate => ({
+        value: candidate.larkAppId,
+        label: `${candidate.botName ?? candidate.larkAppId} · ${candidate.larkAppId}`,
+      })),
+  ], [props.bot.larkAppId, props.bots, tr]);
+
+  function toggleKind(kind: QuotaFallbackKind, checked: boolean): void {
+    setKinds(current => checked
+      ? (current.includes(kind) ? current : [...current, kind])
+      : current.filter(item => item !== kind));
+  }
+
+  async function save(): Promise<void> {
+    const cleanMessage = message.trim();
+    if (enabled && !targetAppId) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackTargetRequired')}` });
+      return;
+    }
+    if (enabled && kinds.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackKindsRequired')}` });
+      return;
+    }
+    if (enabled && (!cleanMessage || Array.from(cleanMessage).length > 1000 || /<\s*at\b/i.test(cleanMessage))) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackMessageInvalid')}` });
+      return;
+    }
+
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/quota-fallback`,
+        { enabled, targetAppId, kinds, message: cleanMessage },
+      );
+      if (res.ok && res.body.ok) {
+        const config = res.body.quotaFallbackBot ?? null;
+        props.patchBot(props.bot.larkAppId, {
+          quotaFallbackBot: config,
+          ...(res.body.restartRequired ? { startupBlocked: undefined } : {}),
+        });
+        setStatus({
+          text: `✓ ${res.body.restartRequired ? tr('botDefaults.quotaFallbackSavedRestart') : tr('botDefaults.cardPrefSaved')}`,
+          ok: true,
+        });
+      } else if (res.body?.error === 'quota_fallback_cycle') {
+        const cycle = Array.isArray(res.body?.cycle) ? res.body.cycle.join(' → ') : '';
+        const text = tr('botDefaults.quotaFallbackCycle', { cycle });
+        setStatus({ text: `✗ ${text}` });
+        toast(text, { kind: 'error', duration: 8_000 });
+      } else if (res.body?.error === 'quota_fallback_target_not_local') {
+        const text = tr('botDefaults.quotaFallbackTargetNotLocal');
+        setStatus({ text: `✗ ${text}` });
+        toast(text, { kind: 'error' });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-quota-fallback" data-quota-fallback>
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.quotaFallbackHelp')}>{tr('botDefaults.quotaFallbackTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-quota-fallback"
+        title={tr('botDefaults.quotaFallbackEnabled')}
+        help={tr('botDefaults.quotaFallbackEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <div className="bd-field">
+          <FieldTitle help={tr('botDefaults.quotaFallbackTargetHelp')}>{tr('botDefaults.quotaFallbackTarget')}</FieldTitle>
+          <DropdownField<string>
+            dataInput="quotaFallbackTarget"
+            ariaLabel={tr('botDefaults.quotaFallbackTarget')}
+            value={targetAppId}
+            disabled={busy || !enabled}
+            options={targetOptions}
+            searchable
+            onChange={setTargetAppId}
+          />
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.quotaFallbackKinds')}</h4>
+        <div className="bd-owner-reminder-states">
+          {(['usage', 'rate'] as const).map(kind => (
+            <label key={kind}>
+              <input type="checkbox" checked={kinds.includes(kind)} disabled={busy || !enabled} onChange={event => toggleKind(kind, event.currentTarget.checked)} />
+              <span>{tr(kind === 'usage' ? 'botDefaults.quotaFallbackKindUsage' : 'botDefaults.quotaFallbackKindRate')}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="bd-row">
+        <label>
+          <span><FieldTitle help={tr('botDefaults.quotaFallbackMessageHelp')}>{tr('botDefaults.quotaFallbackMessage')}</FieldTitle></span>
+          <textarea rows={3} maxLength={1000} data-input="quotaFallbackMessage" value={message} disabled={busy || !enabled} onChange={event => setMessage(event.currentTarget.value)} />
+        </label>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.quotaFallbackCycleNote')}</small>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-quota-fallback" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-quota-fallback-status': '' }} />
+      </div>
     </section>
   );
 }
@@ -4096,23 +4266,29 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const { bot, putCardPref } = props;
   const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
+  const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
+  const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
+  const [thinkingCardToolResult, setThinkingCardToolResult] = useState(bot.thinkingCardToolResult !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
+    setReplyMode(bot.replyCardMode ?? 'legacy');
+    setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
     setThinkingCard(bot.thinkingCard !== false);
-  }, [bot.disableStreamingCard, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -4138,12 +4314,54 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     { value: 'footer', label: tr('botDefaults.usageDisplayFooter') },
     { value: 'off', label: tr('botDefaults.usageDisplayOff') },
   ];
+  const buttonOptions: Array<{ id: StreamingCardButtonId; title: string; description: string }> =
+    STREAMING_CARD_BUTTON_IDS.map(id => ({
+      id,
+      title: tr(`botDefaults.streamingButton.${id}`),
+      description: tr(`botDefaults.streamingButton.${id}Description`),
+    }));
+  const pinToggle = <StreamingCardPinToggle
+    scope="bot-defaults"
+    checked={pinStreamingCard}
+    disabled={busy !== null}
+    dataAction="toggle-pin-streaming-card"
+    title={<FieldTitle help={tr('botDefaults.pinStreamingCardHelp')}>{tr('botDefaults.pinStreamingCard')}</FieldTitle>}
+    description={tr('botDefaults.pinStreamingCardDescription')}
+    help={replyMode === 'legacy' ? tr('botDefaults.pinStreamingCardHelp') : undefined}
+    onChange={checked => {
+      const previous = pinStreamingCard;
+      setPinStreamingCard(checked);
+      void savePatch({ pinStreamingCard: checked }, 'pin-streaming', () => setPinStreamingCard(previous));
+    }}
+  />;
   return (
     <section className="bd-section" aria-busy={busy !== null}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
       <div className="bd-card-settings">
         <section className="bd-card-setting-group" data-card-feedback-group>
           <h4 className="bd-card-setting-heading">{tr('botDefaults.cardFeedbackGroup')}</h4>
+          <div className="bd-row bd-card-display">
+            <div className="bd-field">
+              <FieldTitle help={tr('botDefaults.replyCardModeHelp')}>{tr('botDefaults.replyCardMode')}</FieldTitle>
+              <DropdownField
+                dataInput="replyCardMode"
+                ariaLabel={tr('botDefaults.replyCardMode')}
+                value={replyMode}
+                disabled={busy !== null}
+                options={[
+                  { value: 'legacy', label: tr('botDefaults.replyCardLegacy') },
+                  { value: 'unified', label: tr('botDefaults.replyCardUnified') },
+                ]}
+                onChange={next => {
+                  const previous = replyMode;
+                  setReplyMode(next);
+                  void savePatch({ replyCardMode: next }, 'reply-mode', () => setReplyMode(previous));
+                }}
+              />
+            </div>
+            <p className="bd-card-setting-copy">{tr(replyMode === 'unified' ? 'botDefaults.replyCardUnifiedDescription'
+              : 'botDefaults.replyCardLegacyDescription')}</p>
+          </div>
           <ToggleRow
             className="bd-card-primary-toggle"
             checked={!disableStreaming}
@@ -4180,33 +4398,66 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             checked={thinkingCard}
             disabled={busy !== null}
             dataAction="toggle-thinking-card"
-            title={tr('botDefaults.thinkingCard')}
-            description={tr('botDefaults.thinkingCardDescription')}
-            help={tr('botDefaults.thinkingCardHelp')}
+            title={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCard' : 'botDefaults.replyCardTools')}
+            description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardDescription' : 'botDefaults.replyCardToolsDescription')}
+            help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardHelp' : 'botDefaults.replyCardToolsHelp')}
             onChange={checked => {
               const previous = thinkingCard;
               setThinkingCard(checked);
               void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
             }}
           />
-          <StreamingCardPinToggle
-            scope="bot-defaults"
-            checked={pinStreamingCard}
-            disabled={busy !== null}
-            dataAction="toggle-pin-streaming-card"
-            title={<FieldTitle help={tr('botDefaults.pinStreamingCardHelp')}>{tr('botDefaults.pinStreamingCard')}</FieldTitle>}
-            description={tr('botDefaults.pinStreamingCardDescription')}
-            help={tr('botDefaults.pinStreamingCardHelp')}
-            onChange={checked => {
-              const previous = pinStreamingCard;
-              setPinStreamingCard(checked);
-              void savePatch(
-                { pinStreamingCard: checked },
-                'pin-streaming',
-                () => setPinStreamingCard(previous),
+          <div className="bd-card-dependent" data-thinking-card-options hidden={!thinkingCard}>
+            <ToggleRow
+              checked={thinkingCardToolResult}
+              disabled={busy !== null}
+              dataAction="toggle-thinking-card-tool-result"
+              title={tr('botDefaults.thinkingCardToolResult')}
+              description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultDescription' : 'botDefaults.replyCardToolResultDescription')}
+              help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultHelp' : 'botDefaults.replyCardToolResultHelp')}
+              onChange={checked => {
+                const previous = thinkingCardToolResult;
+                setThinkingCardToolResult(checked);
+                void savePatch({ thinkingCardToolResult: checked }, 'thinkingToolResult', () => setThinkingCardToolResult(previous));
+              }}
+            />
+          </div>
+          {replyMode === 'legacy' && pinToggle}
+        </section>
+
+        <section className="bd-card-setting-group" data-card-buttons-group>
+          <h4 className="bd-card-setting-heading">{tr(replyMode === 'legacy' ? 'botDefaults.streamingButtons' : 'botDefaults.replyCardControls')}</h4>
+          {replyMode !== 'legacy' && <p className="bd-card-setting-copy">{tr('botDefaults.replyCardControlsHelp')}</p>}
+          <div className="bd-card-button-grid" data-card-button-grid>
+            {buttonOptions.map(option => {
+              const visible = !hiddenButtons.includes(option.id);
+              return (
+                <ToggleRow
+                  key={option.id}
+                  className="bd-card-button-toggle"
+                  checked={visible}
+                  disabled={busy !== null}
+                  dataAction={`toggle-streaming-button-${option.id}`}
+                  title={option.title}
+                  help={option.description}
+                  onChange={checked => {
+                    const previous = hiddenButtons;
+                    const hidden = new Set(hiddenButtons);
+                    if (checked) hidden.delete(option.id);
+                    else hidden.add(option.id);
+                    const next = STREAMING_CARD_BUTTON_IDS.filter(id => hidden.has(id));
+                    setHiddenButtons(next);
+                    void savePatch(
+                      { hiddenStreamingCardButtons: next },
+                      `streaming-button-${option.id}`,
+                      () => setHiddenButtons(previous),
+                    );
+                  }}
+                />
               );
-            }}
-          />
+            })}
+          </div>
+          {replyMode !== 'legacy' && pinToggle}
         </section>
 
         <section className="bd-card-setting-group" data-card-content-group>

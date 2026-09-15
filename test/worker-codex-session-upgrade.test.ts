@@ -60,6 +60,10 @@ function harness() {
     intentionalRestartBackend: undefined,
     awaitingFirstPrompt: false,
     isPromptReady: true,
+    idleDetector: {
+      isStartupPending: vi.fn(() => false),
+      reset: vi.fn(),
+    },
     tmuxRestartTimer: undefined,
     isFlushing: false,
     injectionFlushing: false,
@@ -152,6 +156,41 @@ async function settleMicrotasks(): Promise<void> {
   // promises. No timers or real worker processes are needed to advance them.
   for (let turn = 0; turn < 12; turn++) await Promise.resolve();
 }
+
+describe('worker input startup fence', () => {
+  it('keeps pending messages queued without consulting queued work while startup is pending', async () => {
+    const h = harness();
+    const pending = { text: 'accepted during startup' };
+    h.state.pendingMessages.push(pending);
+    h.state.idleDetector.isStartupPending.mockReturnValue(true);
+
+    await h.realFlush();
+
+    expect(h.state.idleDetector.isStartupPending).toHaveBeenCalledTimes(1);
+    expect(h.state.hasPendingInputForFlush).not.toHaveBeenCalled();
+    expect(h.state.pendingMessages).toEqual([pending]);
+    expect(h.state.isFlushing).toBe(false);
+  });
+
+  it('consults queued work again once startup completes', async () => {
+    const h = harness();
+    const pending = { text: 'accepted during startup' };
+    h.state.pendingMessages.push(pending);
+    h.state.idleDetector.isStartupPending.mockReturnValue(true);
+    await h.realFlush();
+    expect(h.state.hasPendingInputForFlush).not.toHaveBeenCalled();
+
+    h.state.idleDetector.isStartupPending.mockReturnValue(false);
+    await h.realFlush();
+
+    expect(h.state.idleDetector.isStartupPending).toHaveBeenCalledTimes(2);
+    expect(h.state.hasPendingInputForFlush).toHaveBeenCalledTimes(1);
+    // This boundary deliberately declines delivery; the startup gate must leave
+    // the message available for the production queue owner to inspect.
+    expect(h.state.pendingMessages).toEqual([pending]);
+    expect(h.state.isFlushing).toBe(false);
+  });
+});
 
 describe('worker ready-time Codex runtime version observation', () => {
   function observationHarness() {

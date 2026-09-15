@@ -132,7 +132,9 @@ export interface WorkflowFeatureGlobalConfig {
 }
 
 export interface WorkerConfig {
-  /** Refuse a fresh/resumed worker while MemAvailable is below this value. */
+  /** Default-on switch for fresh/resumed worker memory admission. */
+  memoryAdmissionEnabled?: boolean;
+  /** Refuse a fresh/resumed worker while available memory is below this value. */
   minAvailableMemoryBytes?: number;
   /** Refuse a fresh/resumed worker while memory full PSI avg10 reaches this percentage. */
   maxMemoryFullAvg10?: number;
@@ -312,6 +314,10 @@ export interface DashboardGlobalConfig {
    *  fail-closed lower bound (a restricted bot never gets it regardless). Read live
    *  by the daemon — see config.ts `bypassCodexHookTrust`. */
   bypassCodexHookTrust?: boolean;
+  /** Suppress Codex/TraeX/CoCo's low-quota model-switch picker for managed launches.
+   *  Default ON; false leaves the CLI's own notice configuration in control.
+   *  Applied per process; never edits the user's CLI config. Aiden's gateway cannot forward it. */
+  hideCodexRateLimitModelNudge?: boolean;
   /** Experimental: inject the "no visible output" anti-resend guidance into the
    *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
    *  that make a model resend after a silent `botmux send`-only turn. Default OFF
@@ -454,6 +460,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
   if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
+  if (typeof d.hideCodexRateLimitModelNudge === 'boolean') out.hideCodexRateLimitModelNudge = d.hideCodexRateLimitModelNudge;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
   // 非法值（非数字 / NaN / 越界）静默丢弃，走 card-builder 的默认 80。
   if (typeof d.contextCompactThreshold === 'number'
@@ -474,6 +481,7 @@ function readWorker(raw: unknown): WorkerConfig | undefined {
   const out: WorkerConfig = {};
   const minAvailableMemoryBytes = readPositiveInteger(value.minAvailableMemoryBytes);
   const sessionMemoryMaxBytes = readPositiveInteger(value.sessionMemoryMaxBytes);
+  if (typeof value.memoryAdmissionEnabled === 'boolean') out.memoryAdmissionEnabled = value.memoryAdmissionEnabled;
   if (minAvailableMemoryBytes !== undefined) out.minAvailableMemoryBytes = minAvailableMemoryBytes;
   if (sessionMemoryMaxBytes !== undefined) out.sessionMemoryMaxBytes = sessionMemoryMaxBytes;
   if (typeof value.maxMemoryFullAvg10 === 'number'
@@ -893,6 +901,7 @@ export function clearWorkerConfig(): WorkerConfig {
     return {};
   }
   const remaining = { ...raw.worker as Record<string, unknown> };
+  delete remaining.memoryAdmissionEnabled;
   delete remaining.minAvailableMemoryBytes;
   delete remaining.maxMemoryFullAvg10;
   delete remaining.sessionMemoryMaxBytes;

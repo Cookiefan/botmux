@@ -52,6 +52,7 @@ export interface ResolvedDashboardSettingsView {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -216,6 +217,7 @@ export type ApplySettingsWriteError =
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_bypassCodexHookTrust'
+  | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -444,6 +446,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_bypassCodexHookTrust' };
     }
     patch.bypassCodexHookTrust = obj.bypassCodexHookTrust;
+  }
+  if ('hideCodexRateLimitModelNudge' in obj) {
+    if (typeof obj.hideCodexRateLimitModelNudge !== 'boolean') {
+      return { ok: false, error: 'invalid_hideCodexRateLimitModelNudge' };
+    }
+    patch.hideCodexRateLimitModelNudge = obj.hideCodexRateLimitModelNudge;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {

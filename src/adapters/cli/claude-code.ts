@@ -19,6 +19,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { sessionReadyHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
@@ -584,6 +585,14 @@ function findJsonlAcrossProjectsRoot(
 }
 
 const COMPLETION_RE = /\u2733\s*(?:Worked|Crunched|Cogitated|Cooked|Churned|Saut[eé]ed|Baked|Brewed) for \d+[smh]/;
+/** Busy footer for idle detection: the working-state status bar carries an
+ *  extra 「· esc to interrupt ·」 segment the idle composer lacks. Anchored to
+ *  the footer's STRUCTURE — a leading mode glyph (⏵⏵/⏸, mode name NOT
+ *  enumerated: manual/bypass strings are runtime-assembled, absent from the
+ *  binary) or a retry segment, joined by mid-dots — because the bare phrase
+ *  also appears in transcript prose on the same screen (busyProbeRegion scans
+ *  the bottom third), which would pin an idle session busy forever. */
+const CLAUDE_BUSY_FOOTER_RE = /^\s*(?:[⏵⏸]+\s.*\bon\b|.*next try).*·\s*esc to interrupt\b/m;
 /** Escape hatch: force a specific chat:submit key regardless of
  *  keybindings.json. Accepts the same spellings as the config (e.g.
  *  `meta+enter`, `alt+enter`, `enter`). A value that can't be sent through the
@@ -761,7 +770,7 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     // alias（fable/opus/sonnet/haiku）由 Claude Code 解析到当前推荐版本
     // （`claude --help` 确认）；具体 ID 锁版本（5 代全名 + 当前 haiku 版本）。
     // Claude Code 无枚举接口（--model 只吃 alias/全名），故无 detectModels。
-    modelChoices: ['fable', 'opus', 'sonnet', 'haiku', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
+    modelChoices: CLI_MODEL_CHOICES['claude-code'],
   }, pathOverride ?? 'claude');
 }
 
@@ -1186,6 +1195,24 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
+    // 忙碌正证据：Claude Code 工作时输入框 ❯ 常驻（readyPattern 在忙时也命中），
+    // idle 判定只剩 2s 静默这一条负证据——长思考/网关延迟造成的一次 ≥2s 停顿
+    // 就会把工作中的会话错翻成 idle，且没有拉回手段。工作时 footer 比空闲态
+    // （⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents）多出
+    // 「· esc to interrupt ·」一段：busyPattern 让 deferPromptReadyWhileBusy
+    // 在翻绿前先查一次屏幕（否决错翻），idleToBusyPattern 让已错翻的绿卡在
+    // 下一帧拉回工作中。
+    //
+    // ⚠️ 必须锚 footer 的结构而不是裸短语：transcript 与 footer 同屏，busyProbeRegion
+    // 扫的是末 max(12, ⌈行数/3⌉) 行——正文只要出现裸短语（讨论中断快捷键、贴 diff、
+    // grep 源码）就会命中，把已空闲的会话钉死在「工作中」（probe 重试无上限）。
+    // 行首模式字形（⏵⏵/⏸，不枚举 mode 名——binary 里 manual/bypass 是运行时拼的）
+    // 或重试段「next try」+ `·` 分隔联合锚定：真 footer 7/7 命中（5 种模式 + 重试
+    // footer + ctrl+t 变体），散文 8/8 不误报（reviewer 与本机双向实测）。
+    // 窄视口（<80 列）footer 截断时拿不到中断段——安全降级回 2s 静默裸奔，
+    // 不产生误报。本机 242 个 tmux pane 扫末行实测 0 误报。
+    busyPattern: CLAUDE_BUSY_FOOTER_RE,
+    idleToBusyPattern: CLAUDE_BUSY_FOOTER_RE,
     // Claude 家族在 spawn 时注入 SessionStart hook，回调
     // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
     // readyPattern 证据，并等待新 prompt 再投首条消息。

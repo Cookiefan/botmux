@@ -207,6 +207,9 @@ export interface CliAdapter {
      *  treated as false by adapters (the worker always sends an explicit boolean
      *  for codex/traex). Does NOT apply to `--remote`/app-server/exec paths. */
     bypassHookTrust?: boolean;
+    /** Codex-family (codex/traex/coco): suppress the low-quota model-switch picker per process.
+     *  The worker supplies the global default-ON setting; false/absent adds no override. */
+    hideRateLimitModelNudge?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */
     skillPluginDir?: string;
     /** True when this session runs under per-bot read isolation (the worker
@@ -266,6 +269,22 @@ export interface CliAdapter {
    *  input queue instead of baking it into args — otherwise the message that
    *  triggered the resume would be lost. */
   readonly initialPromptArgsIgnoredOnResume?: boolean;
+
+  readonly durableInitialPromptViaArgs?: boolean;
+  captureInitialPromptArgSubmission?(): number | null;
+  confirmInitialPromptArgSubmission?(
+    baseline: number | null,
+    content: string,
+  ): Promise<{
+    submitted: boolean;
+    cliSessionId?: string;
+    recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+  }>;
+  findInitialPromptArgSubmission?(baseline: number, content: string): {
+    submitted: boolean;
+    cliSessionId?: string;
+  };
+  isInitialPromptComplete?(baseline: number, cliSessionId: string): boolean;
 
   readonly rawCommandInputMode?: 'paste-line';
   readonly rawCommandSettleMs?: number;
@@ -448,6 +467,13 @@ export interface CliAdapter {
    *
    *  Examples: CoCo `⏵⏵` status bar, Codex `›` prompt indicator. */
   readonly readyPattern?: RegExp;
+
+  /** Optional first-start screen gate. Some CLIs draw their composer before
+   * initialization finishes. A pending marker holds screen idle and queued
+   * input until startupReadyPattern or an authoritative transcript idle.
+   * It survives per-turn resets and is retired once per IdleDetector/spawn. */
+  readonly startupPendingPattern?: RegExp;
+  readonly startupReadyPattern?: RegExp;
 
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —
@@ -701,4 +727,4 @@ export interface CliAdapter {
   buildSessionRenameCommand?(title: string): string;
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'opencode2' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'ebsd' | 'kimi' | 'grok' | 'kiro-cli' | 'riff' | 'reasonix' | 'dsh' | 'dsh-tui' | 'mojo' | 'minimax';

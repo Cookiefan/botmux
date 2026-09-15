@@ -6,7 +6,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
-import { expandHome } from './working-dir.js';
+import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
@@ -56,6 +56,7 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -72,6 +73,7 @@ import type { DaemonSession } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
+import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
 import { repoPickerScanOptions } from '../global-config.js';
@@ -91,6 +93,13 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
+import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
+import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
+import {
+  reconcileXpiSharedCwdRecovery,
+  type XpiSharedCwdQuarantineNotice,
+  type XpiSharedCwdStartupNotice,
+} from './xpi-shared-cwd-admission.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -109,6 +118,7 @@ function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: s
 async function resumeRestoredPendingRepoSetup(
   ds: DaemonSession,
   activeSessions: Map<string, DaemonSession>,
+  prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined,
 ): Promise<void> {
   const setup = ds.session.pendingRepoSetup;
   if (!setup || ds.session.queuedActivationPending || !ds.pendingRepo) return;
@@ -132,6 +142,12 @@ async function resumeRestoredPendingRepoSetup(
       operatorOpenId: ds.session.ownerOpenId,
       activeSessions,
       notify,
+      force: setup.force,
+      worktreePath: setup.worktreePath,
+      branch: setup.branch,
+      reuseExisting: setup.reuseExisting,
+      targetSubdir: setup.targetSubdir,
+      prepareTurn,
     }).catch((err) => {
       // Git/worktree recovery is deliberately detached. A failed publish or
       // build may not reject daemon startup or erase this durable setup owner.
@@ -281,6 +297,9 @@ function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageL
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
+  // Includes legacy: migration pins the original runtime/home, not just pool IDs.
+  // Removing the pool changes new-session defaults; it does not unbind old rows.
+  if (ds.session.cliInstanceBinding) return null;
   if (ds.session.cliLaunchSnapshot?.state === 'resolved') return null;
   const sessionCliId = ds.session.cliId;
   if (!sessionCliId) return null;
@@ -935,6 +954,45 @@ function renderRoleContextBlock(
   return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
 }
 
+export function renderProjectGroupModeBlock(
+  larkAppId: string | undefined,
+  chatId: string | undefined,
+  dataDir = config.session.dataDir,
+): string {
+  if (!larkAppId || !chatId) return '';
+  try {
+    const mode = readGroupCollaborationMode(dataDir, chatId);
+    if (mode?.mode !== 'project' || mode.coordinatorAppId !== larkAppId) return '';
+    const workers = (mode.workerAppIds ?? []).map(xmlEscape).join(',');
+    return [
+      `<project_group_mode chat_id="${xmlEscape(chatId)}" coordinator_app_id="${xmlEscape(larkAppId)}" worker_app_ids="${workers}">`,
+      'This ordinary group is the project control plane. Derive and confirm project-specific goals in the conversation; do not treat Dashboard configuration as project content.',
+      'This coordinator protocol is system-owned, chat-scoped, injected on every turn, and independent of custom &lt;role&gt; content; custom roles cannot disable project-state maintenance.',
+      'Use `botmux project init/update/status/close/resume` for the durable project state and pinned progress card.',
+      'At the start of every substantive project turn, read the durable state with `botmux project status`. If no project exists, derive or confirm a provisional title and goal, then use `botmux project init`; discussion is a valid project phase, so do not wait for a fully specified goal.',
+      'When the goal, phase, current focus, plan or remaining work, blockers, or milestones materially changes, immediately persist it with `botmux project update`; ordinary chat prose is not a substitute. `botmux dispatch` and `botmux report` synchronize workstream lifecycle automatically, so do not duplicate those fields unless the project summary also changed.',
+      'Before a substantive progress or completion reply, verify that durable state matches the reported facts. If a project state command fails, surface the failure instead of silently continuing.',
+      'Use `botmux project close/resume` for explicit lifecycle transitions; the pinned progress card is the durable projection of this state.',
+      'Dispatch bounded subtasks only to the configured worker app ids with `botmux dispatch`; every new subtask must use a specific title of at most 24 characters (never generic "子任务/子项目"). Workers execute inside their subtopics and return progress with `botmux report`.',
+      '</project_group_mode>',
+    ].join('\n');
+  } catch (error) {
+    logger.warn(`[project-mode:${chatId}] prompt context unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return '';
+  }
+}
+
+function renderApplicationRoleBlock(
+  larkAppId: string | undefined,
+  chatId: string | undefined,
+  opts?: { followUp?: boolean },
+): string {
+  return [
+    renderRoleContextBlock(larkAppId, chatId, opts),
+    renderProjectGroupModeBlock(larkAppId, chatId),
+  ].filter(Boolean).join('\n\n');
+}
+
 export function ensureSessionWhiteboard(ds: DaemonSession): void {
   if (!whiteboardEnabled()) return;
   // Whiteboard is an optional, best-effort context enhancement. A failure here
@@ -1202,7 +1260,7 @@ function buildNewTopicBlocks(
     ].join('\n');
   }
 
-  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1388,7 +1446,7 @@ export function buildNewTopicCliInput(
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
     return { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
   }
-  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1471,7 +1529,7 @@ function buildFollowUpBlocks(
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
-  const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
@@ -1692,7 +1750,7 @@ export function buildFollowUpCliInput(
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
     return { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
   }
-  const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
+  const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
@@ -2051,9 +2109,11 @@ export async function staggeredRecoveryFork(
 export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
-): Promise<void> {
+  options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
+): Promise<XpiSharedCwdStartupNotice[] | undefined> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
+    if (session.headless) return 2;
     if (session.adoptedFrom || session.cliId || session.cliLaunchSnapshot || session.lastCliInput || session.backendType) return 2;
     if (session.queued) return 1;
     return 0; // disposable daemon-command scratch
@@ -2062,7 +2122,7 @@ export async function restoreActiveSessions(
   // real CLI/adopt rows first, queued intent second, command scratches last.
   // Registration itself is CAS, so a fresh runtime occupant always wins over
   // every startup candidate regardless of this disk ordering.
-  const active = sessions
+  let active = sessions
     .filter(s => s.status === 'active')
     // Idempotency quarantine (at-most-once): a session the boot reconcile just
     // terminalized as `dispatch_unknown` (or dropped as a pre-dispatch reserved
@@ -2073,6 +2133,87 @@ export async function restoreActiveSessions(
     .filter(s => !quarantinedSessionIds.has(s.sessionId))
     .sort((a, b) => restorePriority(b) - restorePriority(a));
 
+  // LOAD-BEARING ORDER: validate and contain the narrow XPI shared-cwd state
+  // before stale-pid sweeping, backend probes, registration, card recovery, or
+  // any worker fork. One stale legacy record quarantines only its session; an
+  // ambiguous authority quarantines only its explicit group. Every unrelated
+  // session continues through ordinary restore.
+  let xpiQuarantineNotices: XpiSharedCwdStartupNotice[] = [];
+  if (active.length > 0) {
+    const groups = new Map<string, Session[]>();
+    const standalone: Session[][] = [];
+    for (const session of active) {
+      const groupId = session.xpiSharedCwdAdmissionGroupId;
+      if (groupId) {
+        const members = groups.get(groupId) ?? [];
+        members.push(session);
+        groups.set(groupId, members);
+        continue;
+      }
+      const hasStandaloneRecoveryState = !!session.xpiSharedCwdQuarantine
+        || (session.crossPrincipalInterruptions?.length ?? 0) > 0
+        || !!session.xpiSharedCwdAdmissionCoordinatorSessionId
+        || !!session.xpiSharedCwdAdmissionLease
+        || (session.xpiSharedCwdQueuedTurns?.length ?? 0) > 0;
+      if (hasStandaloneRecoveryState) standalone.push([session]);
+    }
+    const partitions = [
+      ...[...groups.entries()].map(([key, members]) => ({ scope: 'group' as const, key, members })),
+      ...standalone.map(members => ({ scope: 'session' as const, key: members[0]!.sessionId, members })),
+    ];
+    const quarantinedSessionIds = new Set<string>();
+    for (const partition of partitions) {
+      try {
+        let result: ReturnType<typeof reconcileXpiSharedCwdRecovery> | undefined;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            ({ result } = sessionStore.mutateOwnedSessionsAtomically(
+              partition.members.map(session => session.sessionId),
+              fresh => reconcileXpiSharedCwdRecovery([...fresh.values()], Date.now()),
+              { nonblocking: true },
+            ));
+            break;
+          } catch (error) {
+            if (!(error instanceof sessionStore.SessionStoreBusyError) || attempt === 2) throw error;
+            await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+          }
+        }
+        if (!result) throw new Error('XPI shared-cwd recovery transaction returned no result');
+        xpiQuarantineNotices.push(...result.notices);
+        xpiQuarantineNotices.push(...result.dispatchUnknownNotices);
+        for (const sessionId of result.quarantinedSessionIds) quarantinedSessionIds.add(sessionId);
+        for (const notice of result.notices) {
+          logger.error(`[xpi-shared-cwd] recovery_quarantine ${JSON.stringify(notice)}`);
+        }
+      } catch (error) {
+        const detail = `XPI shared-cwd ${partition.scope} ${partition.key} recovery persistence failed: `
+          + `${error instanceof Error ? error.message : String(error)}`;
+        logger.error(`[xpi-shared-cwd] recovery_partition_failure ${JSON.stringify({
+          scope: partition.scope,
+          key: partition.key,
+          sessionIds: partition.members.map(session => session.sessionId),
+          detail,
+        })}`);
+        for (const session of partition.members) {
+          // The write lock is unavailable, so this marker cannot be durable in
+          // this attempt. listSessions() exposes the owned in-memory cache;
+          // stamping it still reserves the route for this daemon lifetime and
+          // prevents a replacement session beside an unverified old backing.
+          // The next boot retries the durable reconcile before opening ingress.
+          session.restoreQuarantinedAt ??= new Date().toISOString();
+          quarantinedSessionIds.add(session.sessionId);
+          xpiQuarantineNotices.push({
+            sessionId: session.sessionId,
+            scope: partition.scope,
+            reason: 'recovery_persistence_failure',
+            detail,
+          });
+        }
+      }
+    }
+    active = active.filter(session => !quarantinedSessionIds.has(session.sessionId));
+  }
+
   // Sweep dead CLI-pid markers regardless of whether we have sessions to restore:
   // the landmine files (recycled-PID misroute source) accumulate across every
   // daemon run, and a run with zero active sessions is still a fresh start that
@@ -2081,7 +2222,7 @@ export async function restoreActiveSessions(
 
   if (active.length === 0) {
     logger.info('No active sessions to restore');
-    return;
+    return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
   }
 
   // Kill any stale CLI processes from previous daemon run
@@ -2509,7 +2650,7 @@ export async function restoreActiveSessions(
       announceSessionRow(ds);
       if (restoredPendingRepo) {
         try {
-          await resumeRestoredPendingRepoSetup(ds, activeSessions);
+          await resumeRestoredPendingRepoSetup(ds, activeSessions, options.prepareTurn);
         } catch (err) {
           // One unavailable scan/Lark send/worktree import must not abort the
           // entire daemon restore. Rebuild volatile buffers from the retained
@@ -2541,7 +2682,9 @@ export async function restoreActiveSessions(
       spawnedAt: sessionCreatedAtMs(session),
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: sessionLastMessageAtMs(session),
-      hasHistory: session.cliLaunchSnapshot?.state === 'pending'
+      hasHistory: session.headless && !session.cliId && !session.lastCliInput && !session.backendType
+        ? false
+        : session.cliLaunchSnapshot?.state === 'pending'
         ? false
         : session.queuedActivationPending
           ? (session.queuedActivationResume ?? false)
@@ -2958,6 +3101,7 @@ export async function restoreActiveSessions(
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
+  return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
 }
 
 /** Re-attaching to a pane that is already alive: the worker only has to reconnect. */
@@ -3357,32 +3501,6 @@ export function resolveScheduledTaskExecutionPosition(
   return task.scope !== 'chat' && task.rootMessageId ? 'topic' : 'top-level';
 }
 
-/**
- * Identity a scheduled turn runs as: the task's creator, as captured at
- * creation time. The turn itself is authenticated by the daemon-minted
- * `schedule:<taskId>:<uuid>` turn id (see scheduled-turn-provenance) — this
- * only decides WHICH identity that authenticated turn carries.
- *
- * Returns undefined when the task has no creator union_id (legacy tasks,
- * CLI-created tasks, bot-created tasks). That is deliberate and is the whole
- * fail-closed story: with no identity on the turn, identity-bound tools refuse
- * to run instead of falling back to the bot's own access, while everything that
- * does not need a user identity keeps working.
- */
-function trustedCallerForScheduledTask(
-  task: ScheduledTask,
-  larkAppId: string,
-): CliTurnPayload['trustedCaller'] | undefined {
-  if (!task.ownerUnionId) return undefined;
-  return {
-    ...(task.ownerOpenId ? { requestUserOpenId: task.ownerOpenId } : {}),
-    requestUserUnionId: task.ownerUnionId,
-    requestLarkAppId: task.creatorLarkAppId ?? task.larkAppId ?? larkAppId,
-    source: 'schedule_creator',
-    taskId: task.id,
-  };
-}
-
 async function buildScheduledTargetNotice(params: {
   kind: 'chat' | 'thread';
   taskName: string;
@@ -3656,6 +3774,13 @@ export async function executeScheduledTask(
   const firePrompt = silent
     ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
     : effectivePrompt;
+  // Per-task model / effort, resolved against the bot that is about to run it.
+  // Stale intent is dropped with a warning rather than failing the run.
+  const modelOverride = resolveScheduleModelOverride(task, bot.config);
+  for (const warning of modelOverride.warnings) {
+    logger.warn(`[scheduler] Task "${task.name}" (${task.id}): ${warning}`);
+  }
+
   const key = sessionKey(anchor, larkAppId);
   return withActiveSessionKeyLock(activeSessions, key, async () => {
     // Reuse the canonical owner only when it is an actual conversation.  A
@@ -3702,6 +3827,18 @@ export async function executeScheduledTask(
       const resumableOwner = isRelayableRealSession(existing)
         || !!existing.session.suspendedColdResume;
       if (isContinuation && resumableOwner) {
+        // Model and effort are CLI process launch arguments, so a fire that
+        // reuses this task's existing session runs on whatever that process
+        // started with. Documented as fresh-spawn-only (ScheduledTask.model) and
+        // announced at creation; logged here so a surprising run is explainable
+        // from the daemon log alone.
+        if (modelOverride.model || modelOverride.reasoningEffort) {
+          logger.info(
+            `[scheduler] Task "${task.name}" reuses session ${existing.session.sessionId}; `
+            + `its per-task model/effort applies only to a fresh session `
+            + `(running on ${existing.session.model ?? 'the CLI default'})`,
+          );
+        }
         markSessionActivity(existing);
         ensureSessionWhiteboard(existing);
         if (sharedTopicRootId) {
@@ -3779,7 +3916,7 @@ export async function executeScheduledTask(
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
-    const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group');
+    const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group', undefined, { source: 'schedule' });
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
@@ -3793,6 +3930,10 @@ export async function executeScheduledTask(
       };
     }
     session.lastMessageAt = new Date(now).toISOString();
+    // Effort is persisted with the session (mirroring trigger-session): unlike
+    // the model it is not re-resolved from the bot on every spawn, so a later
+    // resume of this scheduled session must find it here.
+    if (modelOverride.reasoningEffort) session.reasoningEffort = modelOverride.reasoningEffort;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -3812,6 +3953,10 @@ export async function executeScheduledTask(
       workingDir: task.workingDir,
       initialStartPending: true,
       pendingPrompt: firePrompt,
+      // In-memory only, exactly like the trigger API's per-turn model: persisting
+      // it would let it outrank the bot's configured model for every later
+      // resume of this session (see resolveSessionLaunchModel).
+      ...(modelOverride.model ? { spawnModelOverride: modelOverride.model } : {}),
     };
     if (sharedTopicRootId) {
       beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);
@@ -4240,6 +4385,84 @@ export async function spawnDashboardSession(
   // in_progress：立即开跑或弹 /repo 卡片（没钉目录时）。userContent 已按角色包装好。
   logger.info(`[createSession] spawned session ${session.sessionId.substring(0, 8)} (bot=${larkAppId}, chat=${chatId}, role=${role}, pendingRepo=${!!ds.pendingRepo})`);
   return { ok: true, sessionId: session.sessionId };
+}
+
+export interface CreateHeadlessSessionArgs {
+  larkAppId: string;
+  title?: string;
+  workingDir?: string;
+  model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+}
+
+export async function createHeadlessSession(
+  activeSessions: Map<string, DaemonSession>,
+  refreshCliVersion: RefreshCliVersion | undefined,
+  args: CreateHeadlessSessionArgs,
+): Promise<{ ok: true; headlessId: string; sessionId: string } | { ok: false; error: string }> {
+  const { larkAppId } = args;
+  let bot: ReturnType<typeof getBot>;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
+  const rawWorkingDir = args.workingDir ?? effectiveDefaultWorkingDir(bot.config) ?? process.cwd();
+  const wd = validateWorkingDir(rawWorkingDir, localeForBot(larkAppId));
+  if (!wd.ok) return { ok: false, error: wd.error };
+  refreshCliVersion?.(bot.config);
+
+  const headlessId = newHeadlessId();
+  const chatId = headlessChatId(headlessId);
+  const title = args.title?.trim() || 'Headless session';
+  const key = sessionKey(chatId, larkAppId);
+  const registered = await withActiveSessionKeyLock(activeSessions, key, () => {
+    if (activeSessions.has(key)) return undefined;
+    const session = sessionStore.createSession(chatId, chatId, title, 'group');
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    session.larkAppId = larkAppId;
+    session.scope = 'chat';
+    session.headless = {
+      id: headlessId,
+      createdAt: nowIso,
+      source: 'cli',
+    };
+    session.lastMessageAt = nowIso;
+    session.workingDir = wd.resolvedPath;
+    if (args.reasoningEffort) session.reasoningEffort = args.reasoningEffort;
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(chatId);
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: wd.resolvedPath,
+      ownerOpenId: session.ownerOpenId,
+    };
+    if (args.model) ds.spawnModelOverride = args.model;
+    activeSessions.set(key, ds);
+    const record = createHeadlessRecord({
+      id: headlessId,
+      sessionId: session.sessionId,
+      larkAppId,
+      title,
+      workingDir: wd.resolvedPath,
+      model: args.model,
+      reasoningEffort: args.reasoningEffort,
+      now: new Date(now),
+    });
+    saveHeadlessSession(record);
+    dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+    return { sessionId: session.sessionId };
+  });
+  if (!registered) return { ok: false, error: 'session_exists' };
+  return { ok: true, headlessId, sessionId: registered.sessionId };
 }
 
 /** 激活一条 parked（待办池）会话：把暂存的 queuedPrompt 当首轮发给 CLI，清掉 queued

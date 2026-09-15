@@ -23,6 +23,20 @@ import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
+/** Reasoning levels a task may pin. Mirrors CODEX_REASONING_EFFORTS; spelled out
+ *  here because this module is the storage layer and must not depend on the CLI
+ *  adapter services. */
+export type ScheduleReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+
+const SCHEDULE_REASONING_EFFORTS: readonly ScheduleReasoningEffort[] = [
+  'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+];
+
+export function isScheduleReasoningEffort(value: unknown): value is ScheduleReasoningEffort {
+  return typeof value === 'string'
+    && SCHEDULE_REASONING_EFFORTS.includes(value as ScheduleReasoningEffort);
+}
+
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
 
 /**
@@ -90,6 +104,8 @@ export function canonicalScheduleInput(t: {
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
+  model?: string;
+  reasoningEffort?: ScheduleReasoningEffort;
 }): unknown {
   const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
@@ -129,6 +145,11 @@ export function canonicalScheduleInput(t: {
     // computeInputHash) so pre-existing tasks keep their canonical hash.
     silent: t.silent === true ? true : undefined,
     followActive: t.followActive === true ? true : undefined,
+    // Which model this task's runs ask for is caller input, not runtime state.
+    // Absent on every pre-existing task, so `computeInputHash` drops both slots
+    // and their canonical JSON stays byte-for-byte what it was.
+    model: t.model?.trim() || undefined,
+    reasoningEffort: t.reasoningEffort,
   };
 }
 
@@ -349,6 +370,13 @@ function migrate(raw: any): ScheduledTask | null {
     deliver: raw.deliver === 'local' ? 'local' : 'origin',
     silent: raw.silent === true ? true : undefined,
     followActive: raw.followActive === true ? true : undefined,
+    // Rebuilt explicitly like every other field here: omitting them would let
+    // `createTask` persist a per-task model and then have the next reload drop
+    // it, so the task silently degrades back to the bot's model (the exact way
+    // `ownerOpenId` broke once). A hand-edited junk value is dropped rather
+    // than carried to fire time, where it could only produce a CLI error.
+    model: typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : undefined,
+    reasoningEffort: isScheduleReasoningEffort(raw.reasoningEffort) ? raw.reasoningEffort : undefined,
   };
 }
 
@@ -560,6 +588,8 @@ export function createTask(params: {
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
   followActive?: boolean;
+  model?: string;
+  reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
   const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
   // Route to the OWNING bot's file: a task explicitly created for another bot
@@ -623,6 +653,8 @@ export function createTask(params: {
       deliver: params.deliver === 'local' ? 'local' : 'origin',
       silent: params.silent === true ? true : undefined,
       followActive: params.followActive === true ? true : undefined,
+      model: params.model?.trim() || undefined,
+      reasoningEffort: params.reasoningEffort,
     };
     working.set(task.id, task);
     return { result: task, changed: true };
@@ -646,7 +678,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId'
+    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): void {
@@ -797,15 +829,14 @@ export function appendOutputLog(taskId: string, content: string): string {
 }
 
 /**
- * Watch schedules.json for changes from external processes (e.g. `botmux
- * schedule add` running outside the daemon) and emit dashboard events for
- * the diff. Idempotent — calling twice is a no-op.
+ * Reconcile committed schedules.json changes into dashboard events, including
+ * writes made by this daemon. Idempotent — calling twice is a no-op.
  *
- * The existing `load()` already reloads when the on-disk file identity differs
- * from `cachedFileVersion`, so this watcher snapshots the in-memory map, calls
- * `load()` to refresh, then diffs and publishes. fs.watch can fire multiple
- * events for one logical write — the identity guard inside `load()` makes
- * redundant fires no-ops, and an unchanged diff produces no events anyway.
+ * Keep the publication baseline separate from the business cache: mutations
+ * and ordinary reads can refresh that cache before fs.watch runs. Comparing
+ * against it would consume changes without notifying dashboard subscribers.
+ * Reconcile on the watcher turn so synchronous compound writes/rollbacks have
+ * finished; repeated filesystem notifications produce no additional diff.
  */
 let watcherStarted = false;
 export function startExternalWriteWatcher(): void {
@@ -822,9 +853,16 @@ export function startExternalWriteWatcher(): void {
       mutateTasks(working => ({ result: undefined, changed: !existsSync(fp) && working.size === 0 }));
     } catch { /* best effort */ }
   }
-  // Prime the cached file identity so the first watcher fire is comparable.
   load();
-  const state = stateFor(fp);
+  // Serialized public rows are immutable even if a caller retains a task
+  // object, and never retain protected precondition references in events.
+  const snapshot = (): Map<string, string> => new Map(
+    [...stateFor(fp).tasks].map(([id, { preconditionRef, ...task }]) => [
+      id, JSON.stringify({ ...task, hasPrecondition: !!preconditionRef }),
+    ]),
+  );
+  let published = snapshot();
+  const announced = new Set(published.keys());
 
   try {
     // Watch the directory, not the file inode: every commit atomically replaces
@@ -834,38 +872,45 @@ export function startExternalWriteWatcher(): void {
       try {
         if (filename && filename.toString() !== basename(fp)) return;
         if (!existsSync(fp)) return;
-        if (fileVersion(fp) === state.version) return;
-
-        // Snapshot in-memory state, then let load() refresh from disk.
-        // load() compares file identity internally and updates the cache.
-        const before = new Map<string, ScheduledTask>();
-        for (const [k, v] of state.tasks) before.set(k, v);
         load();
+        const current = snapshot();
+        const before = published;
+        published = current;
 
-        // Diff and publish.
-        for (const [id, t] of state.tasks) {
-          const prev = before.get(id);
-          if (!prev) {
-            const { preconditionRef: _preconditionRef, ...schedule } = t;
-            dashboardEventBus.publish({
-              type: 'schedule.created',
-              body: { schedule: { ...schedule, hasPrecondition: !!t.preconditionRef } },
-            });
-          } else if (JSON.stringify(prev) !== JSON.stringify(t)) {
-            const { preconditionRef: _preconditionRef, ...patch } = t;
-            dashboardEventBus.publish({
-              type: 'schedule.updated',
-              body: { id, patch: { ...patch, hasPrecondition: !!t.preconditionRef } },
-            });
+        for (const [id, serialized] of current) {
+          const previous = before.get(id);
+          if (previous === serialized) continue;
+          const row = JSON.parse(serialized) as Record<string, unknown>;
+          if (!announced.has(id)) {
+            dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: row } });
+          } else {
+            // JSON omits undefined. Explicit nulls clear fields such as an old
+            // error or thread bookmark in the dashboard's merge-based cache.
+            const patch = { ...row };
+            for (const key of Object.keys(JSON.parse(previous ?? '{}'))) {
+              if (!(key in row)) patch[key] = null;
+            }
+            dashboardEventBus.publish({ type: 'schedule.updated', body: { id, patch } });
           }
         }
         for (const id of before.keys()) {
-          if (!state.tasks.has(id)) {
+          if (!current.has(id)) {
             dashboardEventBus.publish({ type: 'schedule.deleted', body: { id } });
           }
         }
       } catch (err) {
         logger.debug(`[schedule-store] watch handler error: ${err}`);
+      }
+    });
+    // Dashboard mutations can announce a richer row before fs.watch runs.
+    // Reconcile it with an update, not another create that would replace its
+    // presentation metadata. Track lifecycle only: a partial eager update
+    // must not consume other committed fields still awaiting publication.
+    dashboardEventBus.subscribe(event => {
+      if (event.type === 'schedule.created' && stateFor(fp).tasks.has(event.body.schedule.id)) {
+        announced.add(event.body.schedule.id);
+      } else if (event.type === 'schedule.deleted') {
+        announced.delete(event.body.id);
       }
     });
     logger.info(`[schedule-store] Watching ${fp} for external writes`);
