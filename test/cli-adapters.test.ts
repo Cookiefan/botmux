@@ -258,6 +258,8 @@ describe('claude-code buildArgs', () => {
     for (const prompt of [systemPrompt, shellHints]) {
       expect(prompt).toContain('--response-kind final');
       expect(prompt).toContain('feedback buttons');
+      expect(prompt).toContain('--as independent');
+      expect(prompt).toContain('--as suggestion');
     }
   });
 
