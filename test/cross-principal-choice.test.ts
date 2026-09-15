@@ -1,12 +1,17 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  crossPrincipalAgentHint,
+  crossPrincipalBotClassifyNotice,
+  crossPrincipalClassificationOptions,
   embedCrossPrincipalAsToken,
   isCrossPrincipalChoiceOnlyText,
   parseCrossPrincipalAsFlag,
   parseCrossPrincipalChoiceText,
   stripCrossPrincipalAsToken,
 } from '../src/core/cross-principal-choice.js';
+import { messages as enMessages } from '../src/i18n/en.js';
+import { messages as zhMessages } from '../src/i18n/zh.js';
 
 const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
@@ -60,5 +65,52 @@ describe('cross-principal choice wiring', () => {
     expect(cliSource).toContain("argValue(rest, '--as')");
     expect(cliSource).toContain('embedCrossPrincipalAsToken');
     expect(cliSource).toContain('xpi.send.as_needed_hint');
+  });
+});
+
+describe('cross-principal choice copy', () => {
+  it('keeps the human card to exactly two short options', () => {
+    const zh = crossPrincipalClassificationOptions('zh');
+    expect(zh).toEqual([
+      { key: 'independent', label: '另开任务' },
+      { key: 'suggestion', label: '留给当前任务' },
+    ]);
+
+    const en = crossPrincipalClassificationOptions('en');
+    expect(en).toEqual([
+      { key: 'independent', label: 'Start a new task' },
+      { key: 'suggestion', label: 'Leave it for the current task' },
+    ]);
+  });
+
+  it('tells agents to choose with botmux send --as, not a card', () => {
+    const zhHint = crossPrincipalAgentHint('zh');
+    expect(zhHint).toContain('botmux send --as independent');
+    expect(zhHint).toContain('botmux send --as suggestion');
+    expect(zhHint).toContain('另开任务');
+    expect(zhHint).toContain('留给当前任务');
+
+    const notice = crossPrincipalBotClassifyNotice('ou_bot', 'zh');
+    expect(notice).toContain('<at id=ou_bot></at>');
+    expect(notice).toContain(zhHint);
+    expect(notice).not.toContain('请选一种处理方式');
+  });
+
+  it('keeps zh/en send-hint keys aligned', () => {
+    for (const key of [
+      'xpi.card.classify.independent',
+      'xpi.card.classify.suggestion',
+      'xpi.agent.hint',
+      'xpi.send.as_needed_hint',
+      'ai.routing.xpi_as_hint',
+      'ai.shell.xpi_as_hint',
+    ] as const) {
+      expect(zhMessages[key]).toBeTruthy();
+      expect(enMessages[key]).toBeTruthy();
+    }
+    expect(zhMessages['xpi.send.as_needed_hint']).toContain('--as independent');
+    expect(zhMessages['xpi.send.as_needed_hint']).toContain('--as suggestion');
+    expect(enMessages['xpi.send.as_needed_hint']).toContain('--as independent');
+    expect(enMessages['xpi.send.as_needed_hint']).toContain('--as suggestion');
   });
 });
