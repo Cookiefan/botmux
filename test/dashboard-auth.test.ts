@@ -1665,6 +1665,9 @@ describe('平台会话链路（协管者经 OpenAPI 派任务）', () => {
   const OBSERVE_ROUTES: Array<[string, string]> = [
     ['GET', '/api/sessions/s1/trigger-result'],
     ['GET', '/api/sessions/s1/insight'],
+    // insight 的子路径:洞察页点开某一轮的 prompt 详情走这条(见 web/insights.ts
+    // 的 fetchTurnPrompt)。锚死 `insight$` 会让 dispatch 档点开 turn 也 401。
+    ['GET', '/api/sessions/s1/insight/turn/3'],
     ['GET', '/api/bots'],
   ];
 
@@ -1784,5 +1787,22 @@ describe('平台会话链路（协管者经 OpenAPI 派任务）', () => {
       redirect: 'manual',
     });
     expect(trigger.status).toBe(200);
+  });
+
+  // 放宽 insight 的子路径不等于「后面随便跟什么都行」。trigger-result 没有子路由,
+  // 保持精确匹配;insight 的子路径只覆盖 daemon 真有的那一条(turn/:i)。
+  it('子路径放宽只给了 insight:trigger-result 后面挂东西仍 401', async () => {
+    const base = await startGate(new DashboardSessionStore({ ttlMs: 600_000 }));
+    for (const pathname of [
+      '/api/sessions/s1/trigger-result/extra',
+      '/api/sessions/s1/insightful',
+      '/api/sessions/s1/insight-export',
+    ]) {
+      const r = await fetch(`${base}${pathname}`, {
+        headers: platformHeaders(DEFAULT_SCOPES),
+        redirect: 'manual',
+      });
+      expect(r.status, `GET ${pathname}`).toBe(401);
+    }
   });
 });

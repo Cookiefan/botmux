@@ -418,8 +418,12 @@ export function platformSessionsCapability(
   if (m === 'POST' && /^\/api\/sessions\/[^/]+\/close$/.test(pathname)) return 'sessions.dispatch';
 
   // 轮询任务结果 / 会话洞察（含 conversation 分页）。daemon 侧已安全投影。
+  // insight 后面允许再跟子路径（`/turn/:i` 的 prompt 详情弹窗），不能用 `$`
+  // 锚死：锚死了 dispatch 档点开 turn 也是 401。trigger-result 没有子路径，
+  // 保持精确匹配，别顺手放宽。
   if ((m === 'GET' || m === 'HEAD')
-    && /^\/api\/sessions\/[^/]+\/(trigger-result|insight)$/.test(pathname)) {
+    && (/^\/api\/sessions\/[^/]+\/trigger-result$/.test(pathname)
+      || /^\/api\/sessions\/[^/]+\/insight(\/[^?]*)?$/.test(pathname))) {
     return 'sessions.observe';
   }
   // 列 bot：选 agent 用。平台机器列表里的 bot 形状太薄（没有 cliId），所以要这条。
