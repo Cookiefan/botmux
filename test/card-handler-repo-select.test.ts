@@ -1414,6 +1414,36 @@ describe('TraeX 统一初始化卡', () => {
     expect(ds.pendingTraexInitialization).toBeUndefined();
   });
 
+  it('启动方式卡允许 canOperate 管理员代发起人选择并启动', async () => {
+    const ds = makeTraexDs('mode');
+    ds.workingDir = '/repos/beta';
+    ds.session.workingDir = '/repos/beta';
+    ds.repoCardMessageId = 'om_mode_card';
+    ds.pendingTraexInitialization!.selection = {
+      kind: 'directory',
+      path: '/repos/beta',
+      label: 'beta (main)',
+      pinWorkingDir: true,
+    };
+    vi.mocked(canOperate).mockReturnValueOnce(true);
+    const { deps } = makeDeps(ds);
+
+    const result = await handleCardAction(
+      makeTraexSelectEvent('traex_init_mode', 'forge-pipeline', 'ou_admin', 'om_mode_card'),
+      deps,
+      APP_ID,
+    );
+
+    expect(canOperate).toHaveBeenCalledWith(APP_ID, CHAT_ID, 'ou_admin');
+    expect(result?.toast?.type).toBe('success');
+    expect(ds.session.traexForgeMode).toBe('forge-pipeline');
+    expect(forkWorker).toHaveBeenCalledWith(
+      ds,
+      { content: 'mock-prompt' },
+      { turnId: 'om_initial_turn' },
+    );
+  });
+
   it('repo 卡阶段若 Forge 变为不可用，则退回 master 普通 TraeX 启动', async () => {
     vi.mocked(checkForgeTraexStartupAvailability).mockReturnValue({ available: false, reason: 'doctor failed' });
     const ds = makeTraexDs('repo');
@@ -1794,20 +1824,17 @@ describe('TraeX 统一初始化卡', () => {
     );
   });
 
-  it('非发起人不能操作，旧卡空提示词不覆盖原始消息，成功后重复提交不会再次 fork', async () => {
+  it('非发起人且非管理员不能操作，旧卡空提示词不覆盖原始消息，成功后重复提交不会再次 fork', async () => {
     const ds = makeTraexDs();
     const { deps } = makeDeps(ds);
 
+    vi.mocked(canOperate).mockReturnValueOnce(false);
     const denied = await handleCardAction(
-      makeTraexInitEvent('traex_init_start', {
-        operator: 'ou_other',
-        mode: 'forge-pilot',
-        prompt: '任务',
-      }),
+      makeTraexSelectEvent('traex_init_mode', 'forge-pilot', 'ou_other'),
       deps,
       APP_ID,
     );
-    expect(denied?.toast?.content).toContain('仅本次会话的发起人');
+    expect(denied?.toast?.content).toContain('Bot 管理员');
     expect(forkWorker).not.toHaveBeenCalled();
 
     const started = await handleCardAction(

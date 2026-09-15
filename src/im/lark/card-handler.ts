@@ -491,6 +491,16 @@ function traexStartupModeConfirmText(mode: TraexInitializationMode, locale?: Loc
   }, locale);
 }
 
+function canOperateTraexInitialization(
+  ds: DaemonSession,
+  pending: NonNullable<DaemonSession['pendingTraexInitialization']>,
+  operatorOpenId: string | undefined,
+): boolean {
+  if (!operatorOpenId) return false;
+  if (operatorOpenId === pending.ownerOpenId || operatorOpenId === ds.session.ownerOpenId) return true;
+  return canOperate(ds.larkAppId, ds.chatId, operatorOpenId);
+}
+
 function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string | undefined): void {
   if (!larkAppId || !messageId) return;
   // Let the card-action promise resolve so the SDK can send its callback ACK
@@ -2602,7 +2612,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!ds || !pending || pending.nonce !== value.nonce || !ds.pendingRepo) {
       return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
     }
-    if (!operatorOpenId || operatorOpenId !== pending.ownerOpenId || operatorOpenId !== ds.session.ownerOpenId) {
+    if (!canOperateTraexInitialization(ds, pending, operatorOpenId)) {
       return { toast: { type: 'warning', content: t('card.traex_init.owner_only', undefined, loc) } };
     }
     if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
@@ -2699,7 +2709,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!ds || !pending || pending.nonce !== value.nonce || !ds.pendingRepo) {
       return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
     }
-    if (!operatorOpenId || operatorOpenId !== pending.ownerOpenId || operatorOpenId !== ds.session.ownerOpenId) {
+    if (!canOperateTraexInitialization(ds, pending, operatorOpenId)) {
       return { toast: { type: 'warning', content: t('card.traex_init.owner_only', undefined, loc) } };
     }
     if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {
@@ -2777,7 +2787,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!ds || !pending || pending.nonce !== value.nonce || !ds.pendingRepo) {
       return { toast: { type: 'warning', content: t('card.traex_init.expired', undefined, loc) } };
     }
-    if (!operatorOpenId || operatorOpenId !== pending.ownerOpenId || operatorOpenId !== ds.session.ownerOpenId) {
+    if (!canOperateTraexInitialization(ds, pending, operatorOpenId)) {
       return { toast: { type: 'warning', content: t('card.traex_init.owner_only', undefined, loc) } };
     }
     if (cardMessageId && !isActiveRepoCard(ds, cardMessageId)) {

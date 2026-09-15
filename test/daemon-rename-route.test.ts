@@ -1844,6 +1844,62 @@ describe('/rename production routing — must not pre-create a session (review P
     });
   });
 
+  it('TraeX human new topic treats `/summary` as host prompt and skips startup mode card', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_summary_new', '/summary'),
+      {
+        ...makeCtx('om_traex_summary_new', 'om_traex_summary_new'),
+        promptOverride: '<summary_command>总结这个话题</summary_command>',
+        summaryCommand: { name: 'summary-command', chatKind: 'regularGroup' },
+      },
+    );
+
+    expect(repliedText()).not.toContain('选择 TraeX 启动方式');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({ turnId: 'om_traex_summary_new' });
+    const openingInput = JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1]);
+    expect(openingInput).toContain('<summary_command>总结这个话题</summary_command>');
+    const ds = activeSessions.get(sessionKey('om_traex_summary_new', APP));
+    expect(ds?.pendingTraexInitialization).toBeUndefined();
+  });
+
+  it('TraeX human new topic treats command trigger templates as host prompt and skips startup mode card', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_traex_cmd_trigger_new', '/solve 登录超时'),
+      {
+        ...makeCtx('om_traex_cmd_trigger_new', 'om_traex_cmd_trigger_new'),
+        commandTrigger: { cmd: '/solve', prompt: '先复现再修复：{args}', args: '登录超时' },
+      },
+    );
+
+    expect(repliedText()).not.toContain('选择 TraeX 启动方式');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({ turnId: 'om_traex_cmd_trigger_new' });
+    const openingInput = JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1]);
+    expect(openingInput).toContain('先复现再修复：登录超时');
+    expect(openingInput).not.toContain('/solve 登录超时');
+    const ds = activeSessions.get(sessionKey('om_traex_cmd_trigger_new', APP));
+    expect(ds?.pendingTraexInitialization).toBeUndefined();
+  });
+
   it('TraeX human new topic with scanned projects shows the master repo card first', async () => {
     const bot = registerBot({
       larkAppId: APP,
@@ -2578,6 +2634,62 @@ describe('/rename production routing — must not pre-create a session (review P
     } finally {
       delete process.env.BOTMUX_WORKFLOW_ENABLED;
     }
+  });
+
+  it('TraeX thread safety-net treats `/summary` as host prompt and skips startup mode card', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleThreadReply(
+      makeEventData('om_traex_summary_reply', '/summary', 'om_traex_summary_root'),
+      {
+        ...makeCtx('om_traex_summary_root', 'om_traex_summary_reply'),
+        promptOverride: '<summary_command>总结这个话题</summary_command>',
+        summaryCommand: { name: 'summary-command', chatKind: 'regularGroup' },
+      },
+    );
+
+    expect(repliedText()).not.toContain('选择 TraeX 启动方式');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({ turnId: 'om_traex_summary_reply' });
+    const openingInput = JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1]);
+    expect(openingInput).toContain('<summary_command>总结这个话题</summary_command>');
+    const ds = activeSessions.get(sessionKey('om_traex_summary_root', APP));
+    expect(ds?.pendingTraexInitialization).toBeUndefined();
+  });
+
+  it('TraeX thread safety-net treats command trigger templates as host prompt and skips startup mode card', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'traex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleThreadReply(
+      makeEventData('om_traex_cmd_trigger_reply', '/solve 登录超时', 'om_traex_cmd_trigger_root'),
+      {
+        ...makeCtx('om_traex_cmd_trigger_root', 'om_traex_cmd_trigger_reply'),
+        commandTrigger: { cmd: '/solve', prompt: '先复现再修复：{args}', args: '登录超时' },
+      },
+    );
+
+    expect(repliedText()).not.toContain('选择 TraeX 启动方式');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({ turnId: 'om_traex_cmd_trigger_reply' });
+    const openingInput = JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1]);
+    expect(openingInput).toContain('先复现再修复：登录超时');
+    expect(openingInput).not.toContain('/solve 登录超时');
+    const ds = activeSessions.get(sessionKey('om_traex_cmd_trigger_root', APP));
+    expect(ds?.pendingTraexInitialization).toBeUndefined();
   });
 
   it('TraeX existing Lark thread reply bypasses initialization card and continues directly', async () => {

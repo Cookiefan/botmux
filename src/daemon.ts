@@ -19017,10 +19017,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const newTopicCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
+  const newTopicPromptOverride = ctx.promptOverride?.trim() || undefined;
+  const newTopicHostPrompt = newTopicPromptOverride ?? newTopicCommandPrompt;
   // 改写前的原文 = 命令解析车道。没有模板时它与 followupContent 逐字相同，
   // 所以这里不需要分支。
   const newTopicCommandLane = parsed.content.trim();
-  if (newTopicCommandPrompt) parsed.content = newTopicCommandPrompt;
+  if (newTopicHostPrompt) parsed.content = newTopicHostPrompt;
 
   const followupContent = parsed.content.trim();
   let content = composeForwardFollowupContent(forwardSeedContent, followupContent);
@@ -19173,7 +19175,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // legacy model prompt. Codex App clean-input must keep those original bytes
   // as the visible UserMessage and move the generated skill prompt into hidden
   // untrusted context.
-  const codexAppVisibleText = content;
+  const codexAppVisibleText = newTopicHostPrompt ? newTopicCommandLane : content;
   let workflowGrillPrompt: string | undefined;
   const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
   if (newTopicGrill) {
@@ -19521,7 +19523,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     : '';
   // 话题 hint 同样前置到 codex-app 结构化 sidecar lane（与 quote hint 一致双 lane
   // 下发），否则 codex-app（clean input）bot 走 sidecar 时会静默丢掉该 hint。
-  const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');
+  const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? newTopicHostPrompt ?? '');
   const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
@@ -19765,8 +19767,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       // R7-B1: positive real-human gate — senderType must be 'user' AND not a
       // known peer bot (cross-ref fallback, matching the thread twin's foreign-bot
       // definition; an anomalous/missing sender_type from a known peer must not
-      // be authorized). controlRewrite reflects the ACTUAL v3-grill trigger, not
-      // a hardcoded false — a rewritten /workflow prompt stays serial.
+      // be authorized). controlRewrite reflects actual host prompt rewrites
+      // (/workflow, /summary, command trigger templates), not a hardcoded false.
       humanSender: parsed.senderType === 'user'
         && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId),
       adopted: false,
@@ -19775,7 +19777,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       isBotSenderType,
       explicitBotSteer: botSteerDirective.requested,
       substituteTrigger: !!substituteTrigger,
-      controlRewrite: !!newTopicGrill,
+      controlRewrite: !!newTopicGrill || !!newTopicHostPrompt,
       messageListener: !!messageListener,
       vcMeetingReceiver: false,
       vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
@@ -19840,6 +19842,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     && !isBotSenderType
     && !messageListener
     && !substituteTrigger
+    && !ctx.commandTrigger
+    && !ctx.promptOverride
     && !workflowGrillPrompt
     && !explicitForgePrompt
     && !topicHeaderIdleStart
@@ -20903,13 +20907,16 @@ async function handleThreadReplyAdmitted(
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
-  // 免@ 斜杠命令（续聊路径）：与新话题路径同源、同理由——模板渲染结果只进 CLI
-  // 正文，命令解析车道（下面的 cmdContent）保留闸门校验过的触发词原文。
+  // Host-owned command rewrite（续聊路径）：模板 / summary prompt 只进 CLI 正文；
+  // 命令解析车道（下面的 cmdContent）保留闸门校验过的触发词原文。
   const threadCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
+  const threadPromptOverride = ctx.promptOverride?.trim() || undefined;
+  const threadHostPrompt = threadPromptOverride ?? threadCommandPrompt;
   const threadCommandLane = parsed.content.trim();
-  if (threadCommandPrompt) parsed.content = threadCommandPrompt;
+  if (threadHostPrompt) parsed.content = threadHostPrompt;
+  const threadCodexAppVisibleText = threadHostPrompt ? threadCommandLane : parsed.content;
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
   const botSenderPrefix = isForeignBot
@@ -20924,7 +20931,9 @@ async function handleThreadReplyAdmitted(
     + initialCodexAppApplicationContext
     + parsed.content;
   let promptContent = initialPromptContent;
-  let rewrittenCodexAppMessageContext: string | undefined;
+  let rewrittenCodexAppMessageContext: string | undefined = threadHostPrompt
+    ? initialCodexAppMessageContext + threadHostPrompt
+    : undefined;
   if (!prepared) {
     const existingHookSession = activeSessions.get(sessionKey(anchor, larkAppId));
     emitHookEvent('thread.reply', {
@@ -21619,7 +21628,7 @@ async function handleThreadReplyAdmitted(
   // of them return before the later existing-owner branch. Explicit positive
   // only for a plain-human-interactive turn or a foreign bot carrying an
   // explicit `@steer` directive. Plain @mentions, reports, other bot traffic,
-  // substitute-rewrite, v3-grill, message-listener, VC and adopt stay serial.
+  // substitute-rewrite, host prompt rewrites, message-listener, VC and adopt stay serial.
   // Never inferred from the delivery sink;
   // ignored by acceptCodexAppDispatch for non-codex-app CLIs. A new-topic root
   // must FREEZE this into its opening payload — forkReservedInitialSession is
@@ -21634,7 +21643,7 @@ async function handleThreadReplyAdmitted(
     isBotSenderType,
     explicitBotSteer: botSteerDirective.requested,
     substituteTrigger: !!substituteTrigger,
-    controlRewrite: !!threadGrill,
+    controlRewrite: !!threadGrill || !!threadHostPrompt,
     messageListener: !!ctx.messageListener,
     vcMeetingReceiver: ds?.session.vcMeetingReceiver !== undefined,
     vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
@@ -21668,7 +21677,7 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
-          codexAppText: parsed.content,
+          codexAppText: threadCodexAppVisibleText,
           codexAppApplicationContext,
           codexAppMessageContext,
           sessionBackendType: ds.session.backendType,
@@ -21771,7 +21780,7 @@ async function handleThreadReplyAdmitted(
         // durable opening instead of an impossible successor to an empty ACK.
         ds.pendingPrompt = promptContent;
         ds.pendingTurnId = parsed.messageId;
-        ds.pendingCodexAppText = parsed.content;
+        ds.pendingCodexAppText = threadCodexAppVisibleText;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
         ds.pendingCodexAppMessageContext = codexAppMessageContext;
         ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
@@ -21804,7 +21813,7 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
-          codexAppText: parsed.content,
+          codexAppText: threadCodexAppVisibleText,
           codexAppApplicationContext,
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
@@ -21871,7 +21880,7 @@ async function handleThreadReplyAdmitted(
     if (!ds.pendingFollowUpTurnIds) ds.pendingFollowUpTurnIds = [];
     ds.pendingFollowUpTurnIds.push(parsed.messageId);
     if (!ds.pendingCodexAppFollowUps) ds.pendingCodexAppFollowUps = [];
-    ds.pendingCodexAppFollowUps.push(parsed.content);
+    ds.pendingCodexAppFollowUps.push(threadCodexAppVisibleText);
     if (!ds.pendingCodexAppFollowUpContexts) ds.pendingCodexAppFollowUpContexts = [];
     ds.pendingCodexAppFollowUpContexts.push(codexAppFollowUpContextParts.join('\n\n'));
     if (!ds.pendingCodexAppFollowUpGateAccepted) {
@@ -22010,7 +22019,7 @@ async function handleThreadReplyAdmitted(
       pendingRepo: !pinnedWorkingDir || autoWt,
       pendingPrompt: promptContent,
       pendingTurnId: parsed.messageId,
-      pendingCodexAppText: parsed.content,
+      pendingCodexAppText: threadCodexAppVisibleText,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -22067,6 +22076,8 @@ async function handleThreadReplyAdmitted(
       botCfg.cliId === 'traex'
       && !isForeignBot
       && !substituteTrigger
+      && !ctx.commandTrigger
+      && !ctx.promptOverride
       && !explicitForgePrompt
       && !threadGrill
       && !isExistingLarkThreadReply(parsed);
@@ -22347,7 +22358,7 @@ async function handleThreadReplyAdmitted(
             chatId: ds.session.chatId,
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
-            codexAppText: parsed.content,
+            codexAppText: threadCodexAppVisibleText,
             codexAppApplicationContext,
             codexAppMessageContext,
             // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
@@ -22367,7 +22378,7 @@ async function handleThreadReplyAdmitted(
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
-          codexAppText: parsed.content,
+          codexAppText: threadCodexAppVisibleText,
           codexAppApplicationContext,
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
@@ -22487,7 +22498,7 @@ async function handleThreadReplyAdmitted(
             chatId: ds.session.chatId,
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
-            codexAppText: parsed.content,
+            codexAppText: threadCodexAppVisibleText,
             codexAppApplicationContext,
             codexAppMessageContext,
             sessionBackendType: ds.session.backendType,
