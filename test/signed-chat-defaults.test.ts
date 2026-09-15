@@ -47,9 +47,27 @@ describe('signed chat defaults', () => {
     await expect(ensureSignedChatDefault('app', chat, 'group')).rejects.toThrow('Invalid chat registry response');
     expect(resolveGroupMentionMode('app', chat)).toBe('topic');
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', {status:503})));
-    await expect(ensureSignedChatDefault('app', chat, 'group')).rejects.toThrow('unavailable');
+    await expect(ensureSignedChatDefault('app', chat + '-outage', 'group')).rejects.toThrow('unavailable');
     await expect(fetchRegisteredChatDefault('http://example.com', 'app', chat, 'secret')).rejects.toThrow('Invalid');
     expect(resolveGroupMentionMode('app', chat)).toBe('topic');
+  });
+  it('backs off failed context and registry lookups', async () => {
+    const contextFailureChat = 'context-failure' + n;
+    context.mockResolvedValue({ fetchStatus: 'unavailable' });
+    await ensureSignedChatDefault('app', contextFailureChat, 'group');
+    await ensureSignedChatDefault('app', contextFailureChat, 'group');
+    expect(context).toHaveBeenCalledTimes(1);
+
+    vi.clearAllMocks();
+    cfg.signedChatDefaultsRegistryUrl = 'https://registry.example/lookup';
+    const registryFailureChat = 'registry-failure' + n;
+    context.mockResolvedValue({ fetchStatus: 'ok', mode: 'group', description: null });
+    const fetcher = vi.fn().mockResolvedValue(new Response('', { status: 503 }));
+    vi.stubGlobal('fetch', fetcher);
+    await expect(ensureSignedChatDefault('app', registryFailureChat, 'group')).rejects.toThrow('unavailable');
+    await expect(ensureSignedChatDefault('app', registryFailureChat, 'group')).resolves.toBeUndefined();
+    expect(context).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
   it('rejects a previously valid registry response on a new request', async () => {
     let previousBody = '';

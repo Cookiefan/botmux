@@ -2797,6 +2797,8 @@ async function maybeApplySharedTopicSeed(input: {
   // (unconditional) or 'ambient' — but for 'ambient' NOT when the message
   // @mentions another specific member (person/bot) without @ing us: that is a
   // redirect to someone else, so we back off (mentionsAnotherMember).
+  // Bot-originated seeds can precede an authorized human turn. A cold signed
+  // default intentionally falls back to the stricter global mention mode.
   const seedMentionMode = resolveGroupMentionMode(larkAppId, chatId);
   if (!isBotMentioned(larkAppId, message, senderOpenId)
       && !(seedMentionMode === 'never'
@@ -3578,6 +3580,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       dispatchPersistedForwardFollowup(record.messageId, payload);
     const remainingMs = record.dueAt - Date.now();
     const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
+    // Startup restore precedes signed-default hydration; cold cache is
+    // deliberately fail-closed until the next authorized human message.
     const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId, chatId));
     if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
       larkAppId,
@@ -3947,11 +3951,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const senderOpenId = sender?.sender_id?.open_id as string | undefined;
       // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMember）要用。
       const humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
-      // Trusted creator metadata affects addressing only; all existing talk and
-      // operation gates below remain in force. Also covers missed join events.
-      await ensureSignedChatDefault(larkAppId, chatId, chatType).catch(err =>
-        logger.warn(`[signed-chat-default] lookup failed: ${err instanceof Error ? err.message : String(err)}`),
-      );
       // defaultOncall 自动绑定必须在 canTalk 权限判断前完成，否则已开 defaultOncall
       // 的群首次 @bot 时 oncallChats 中还没有该 chat → evaluateTalk 判无权限 → 误弹
       // 自助授权申请卡。ensureDefaultOncallBound 本身带 fast-path 短路且 idempotent。
@@ -3961,6 +3960,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
       // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
       const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);
+      // Trusted creator metadata affects addressing only. Unauthorized senders
+      // must not trigger Lark/registry I/O; operation gates stay unchanged.
+      if (isAllowed) {
+        await ensureSignedChatDefault(larkAppId, chatId, chatType).catch(err =>
+          logger.warn(`[signed-chat-default] lookup failed: ${err instanceof Error ? err.message : String(err)}`),
+        );
+      }
 
       // /introduce — collaboration handshake. Intercept before any routing
       // so the command never reaches a CLI session (each @ed bot's daemon

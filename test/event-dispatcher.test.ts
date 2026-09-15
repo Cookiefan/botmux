@@ -5090,10 +5090,12 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
         content: JSON.stringify({ text: 'hello without mentioning this bot' }),
         mentions: scenario === 'redirect' ? [{ key: '@_other', name: 'Other', id: { open_id: 'ou_other' } }] : [],
       });
+      const signedContextCallsBefore = mockSignedChatContext.mock.calls.length;
       await capturedHandlers['im.message.receive_v1'](event);
       await flushEventWork();
       if (scenario === 'plain') expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({ scope: 'chat', anchor: chatId }));
       else expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(mockSignedChatContext.mock.calls.length - signedContextCallsBefore).toBe(scenario === 'denied' ? 0 : 1);
       expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     },
   );

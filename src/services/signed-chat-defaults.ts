@@ -38,9 +38,34 @@ export async function fetchRegisteredChatDefault(endpoint: string, appId: string
 
 const cache = new Map<string, { until: number; ambient: boolean }>();
 const pending = new Map<string, Promise<void>>();
+const POSITIVE_TTL_MS = 60_000;
+const NEGATIVE_TTL_MS = 2_000;
+const FAILURE_TTL_MS = 10_000;
+const MAX_CACHE_ENTRIES = 2_000;
+
+function readFreshCache(key: string): { until: number; ambient: boolean } | undefined {
+  const entry = cache.get(key);
+  if (!entry || entry.until <= Date.now()) {
+    if (entry) cache.delete(key);
+    return undefined;
+  }
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry;
+}
+
+function writeCache(key: string, ambient: boolean, ttlMs: number): void {
+  cache.delete(key);
+  while (cache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = cache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+  cache.set(key, { ambient, until: Date.now() + ttlMs });
+}
+
 export function signedChatMentionDefault(appId: string, chatId?: string): 'ambient' | undefined {
-  const entry = cache.get(`${appId}:${chatId}`);
-  return entry && entry.until > Date.now() && entry.ambient ? 'ambient' : undefined;
+  return readFreshCache(`${appId}:${chatId}`)?.ambient ? 'ambient' : undefined;
 }
 
 /** Rehydrate from legacy proof or cloud registry; explicit /mention-mode wins. */
@@ -48,20 +73,24 @@ export async function ensureSignedChatDefault(appId: string, chatId: string, cha
   const cfg = getBot(appId).config;
   if (chatType !== 'group' || cfg.signedChatDefaults !== true || cfg.chatMentionModes?.[chatId]) return;
   const key = `${appId}:${chatId}`;
-  if ((cache.get(key)?.until ?? 0) > Date.now()) return;
+  if (readFreshCache(key)) return;
   if (pending.has(key)) return pending.get(key);
   const task = (async () => {
     const context = await getChatContext(appId, chatId);
-    // Fail closed on lookup failure, but allow immediate retry next message.
-    if (context.fetchStatus !== 'ok') { cache.delete(key); return; }
+    // Fail closed and briefly back off instead of amplifying an upstream outage.
+    if (context.fetchStatus !== 'ok') { writeCache(key, false, FAILURE_TTL_MS); return; }
     let ambient = context.mode === 'group'
       && verifySignedChatDefault(context.description, appId, chatId, cfg.larkAppSecret);
     if (!ambient && context.mode === 'group' && cfg.signedChatDefaultsRegistryUrl) {
       // On outages retain the global mention gate, never infer trust from a name.
-      ambient = await fetchRegisteredChatDefault(cfg.signedChatDefaultsRegistryUrl, appId, chatId, cfg.larkAppSecret);
+      try {
+        ambient = await fetchRegisteredChatDefault(cfg.signedChatDefaultsRegistryUrl, appId, chatId, cfg.larkAppSecret);
+      } catch (err) {
+        writeCache(key, false, FAILURE_TTL_MS);
+        throw err;
+      }
     }
-    if (cache.size >= 2000) cache.delete(cache.keys().next().value!);
-    cache.set(key, { ambient, until: Date.now() + (ambient ? 60_000 : 2_000) });
+    writeCache(key, ambient, ambient ? POSITIVE_TTL_MS : NEGATIVE_TTL_MS);
   })();
   pending.set(key, task);
   try { await task; } finally { pending.delete(key); }
