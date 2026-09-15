@@ -18393,15 +18393,21 @@ async function trySettleCrossPrincipalProposerChoice(
   ds: DaemonSession,
   proposer: TrustedCaller | undefined,
   text: string,
+  mentions?: LarkMention[],
 ): Promise<boolean> {
   if (!proposer) return false;
   const record = findPendingCrossPrincipalForProposer(ds, proposer);
   if (!record) return false;
   const kind = record.phase === 'awaiting_classification' ? 'classification' : 'wait';
-  const tokenChoice = stripCrossPrincipalAsToken(text).choice;
+  // A proposer answering in a group @s the bot, so the inbound body reads
+  // "@<bot> 另开任务". Normalising here (rather than at each call site) keeps
+  // every settle path accepting the same spellings as the host-ask gate; the
+  // `--as` marker sits at the end of the body and is unaffected.
+  const body = stripLeadingMentions(text.trim(), mentions);
+  const tokenChoice = stripCrossPrincipalAsToken(body).choice;
   const choice = tokenChoice ?? (
-    isCrossPrincipalChoiceOnlyText(text, kind)
-      ? parseCrossPrincipalChoiceText(text, kind)
+    isCrossPrincipalChoiceOnlyText(body, kind)
+      ? parseCrossPrincipalChoiceText(body, kind)
       : undefined
   );
   if (!choice) return false;
@@ -18417,7 +18423,7 @@ async function stageCrossPrincipalInterruption(args: {
 }): Promise<boolean> {
   const { ds, ownerTurnId, owner, proposer } = args;
   const { message, choice } = sanitizeCrossPrincipalMessage(args.message);
-  if (await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text)) {
+  if (await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text, args.message.mentions)) {
     return true;
   }
   const staged = stageCrossPrincipalInterruptionRecord({
@@ -18452,9 +18458,9 @@ async function stageCrossPrincipalInterruption(args: {
         message.turnId,
       ).catch(err => logger.warn(`[${tag(ds)}] Failed to acknowledge cross-principal handoff: ${err}`));
     }
-    staged.record.classificationDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
+    staged.record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
     persistCrossPrincipalQueue(ds);
-    scheduleCrossPrincipalOwnerWait(ds, staged.record.classificationDeadlineAt);
+    scheduleCrossPrincipalOwnerWait(ds, staged.record.botClassifyDeadlineAt);
     return true;
   }
   void sessionReply(
@@ -18922,22 +18928,22 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         return;
       }
       if (record.proposer.senderType === 'bot') {
-        if (record.classificationDeadlineAt && Date.now() >= record.classificationDeadlineAt) {
+        if (record.botClassifyDeadlineAt && Date.now() >= record.botClassifyDeadlineAt) {
           removeCrossPrincipalRecord(ds, record.id);
           await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
           return;
         }
-        if (!record.classificationDeadlineAt) {
+        if (!record.botClassifyDeadlineAt) {
           await sessionReply(
             sessionAnchorId(ds),
             crossPrincipalBotClassifyNotice(proposerId, loc),
             'text',
             ds.larkAppId,
           );
-          record.classificationDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
+          record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
           persistCrossPrincipalQueue(ds);
         }
-        scheduleCrossPrincipalOwnerWait(ds, record.classificationDeadlineAt);
+        scheduleCrossPrincipalOwnerWait(ds, record.botClassifyDeadlineAt);
         return;
       }
       const result = await registerHostAsk({
@@ -22295,7 +22301,11 @@ async function handleThreadReplyAdmitted(
   logger.info(`Reply in ${scope}-scope session ${anchor.substring(0, 12)}: ${content.substring(0, 100)} (resources: ${resources.length})`);
 
   let ds = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (ds && threadTrustedCaller && await trySettleCrossPrincipalProposerChoice(ds, threadTrustedCaller, content)) {
+  // cmdContent (mention-stripped), matching the host-ask gate below: a raw
+  // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
+  // record would time out, and the notice would ask for the answer just sent.
+  if (ds && threadTrustedCaller
+    && await trySettleCrossPrincipalProposerChoice(ds, threadTrustedCaller, cmdContent, parsed.mentions)) {
     markIngressAdmitted(ctx);
     return;
   }

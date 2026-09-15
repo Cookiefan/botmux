@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import type { CrossPrincipalChoiceKind } from '../src/core/cross-principal-choice.js';
 import {
   crossPrincipalAgentHint,
   crossPrincipalBotClassifyNotice,
@@ -54,6 +55,65 @@ describe('cross-principal choice vocabulary', () => {
   it('does not treat arbitrary business text as a host-ask answer', () => {
     expect(parseCrossPrincipalChoiceText('建议先把测试补上再合', 'classification')).toBeUndefined();
     expect(isCrossPrincipalChoiceOnlyText('建议先把测试补上再合', 'classification')).toBe(false);
+  });
+
+  // The gate decides whether an ordinary chat message is swallowed as a card
+  // answer. Its name promises "only text", and these inputs are the ones that
+  // can actually break that promise: each one DOES parse as a leading keyword,
+  // so nothing but the stricter whole-body check stands between the sender and
+  // a card click they never made.
+  it('rejects business text that merely starts with a choice keyword', () => {
+    const swallowed: Array<[string, CrossPrincipalChoiceKind]> = [
+      ['ok 那我先去忙别的了', 'owner'],
+      ['是 这样的，我先看下日志', 'owner'],
+      ['执行 完记得同步一下结论', 'owner'],
+      ['n 个测试没跑', 'owner'],
+      ['y 轴的刻度不对', 'owner'],
+      ['否，这条先不改', 'owner'],
+      ['独立任务，这个说法我不太确定', 'classification'],
+      ['另开任务 之前先确认下影响面', 'classification'],
+      ['建议 先把测试补上', 'classification'],
+      ['继续等待 对方回复就行', 'wait'],
+    ];
+    for (const [text, kind] of swallowed) {
+      // Guards the guard: if a rewrite stops these parsing, this case would
+      // pass for the wrong reason and cover nothing.
+      expect(parseCrossPrincipalChoiceText(text, kind)).toBeDefined();
+      expect(isCrossPrincipalChoiceOnlyText(text, kind)).toBe(false);
+    }
+  });
+
+  it('accepts a bare choice however the proposer punctuates or spaces it', () => {
+    const answers: Array<[string, CrossPrincipalChoiceKind]> = [
+      ['独立任务', 'classification'],
+      ['独立任务。', 'classification'],
+      ['独立任务！', 'classification'],
+      ['  另开任务  ', 'classification'],
+      ['留给当前任务', 'classification'],
+      // Wording older builds printed in their own staged notice; a bot that
+      // answers with the text it was shown must still be understood.
+      ['对当前任务的建议', 'classification'],
+      ['继续等', 'wait'],
+      ['ok', 'owner'],
+      ['采纳并重新执行', 'owner'],
+    ];
+    for (const [text, kind] of answers) {
+      expect(isCrossPrincipalChoiceOnlyText(text, kind)).toBe(true);
+    }
+  });
+
+  // `botmux send --as independent -- "<prose>"` is a deliberate answer to this
+  // card, so the prose must not disqualify it — otherwise the documented way for
+  // a bot to answer fails exactly when the bot also explains itself.
+  it('honours an --as marker even when the visible body is business text', () => {
+    const marked = embedCrossPrincipalAsToken('顺带说一句，这条我想单独做', 'independent');
+    expect(isCrossPrincipalChoiceOnlyText(marked, 'classification')).toBe(true);
+    expect(parseCrossPrincipalChoiceText(marked, 'classification')).toBe('independent');
+    expect(isCrossPrincipalChoiceOnlyText(marked, 'wait')).toBe(true);
+    // An owner card only takes accept/reject; an independent/suggestion marker
+    // is not an answer to it, with or without a body.
+    expect(isCrossPrincipalChoiceOnlyText(marked, 'owner')).toBe(false);
+    expect(isCrossPrincipalChoiceOnlyText(embedCrossPrincipalAsToken('', 'independent'), 'owner')).toBe(false);
   });
 });
 

@@ -22,11 +22,49 @@ export type CrossPrincipalChoiceKind = 'classification' | 'wait' | 'owner';
 
 const AS_TOKEN_RE = /(?:^|\n)\s*<!--botmux-as:(independent|suggestion)-->\s*$/;
 
-const INDEPENDENT_TEXT = /^(?:独立任务|另开任务)(?:[\s，。,.!！]|$)/i;
-const SUGGESTION_TEXT = /^(?:对\s*A\s*的建议|留给当前任务|建议)(?:[\s，。,.!！]|$)/i;
-const ACCEPT_TEXT = /^(?:确认|同意|采纳并重新执行|采纳|执行|是|yes|y|ok|accept)(?:[\s，。,.!！]|$)/i;
-const REJECT_TEXT = /^(?:拒绝|不采纳|否|no|n|reject)(?:[\s，。,.!！]|$)/i;
-const CONTINUE_WAITING_TEXT = /^(?:继续等待|继续等)(?:[\s，。,.!！]|$)/i;
+/**
+ * One source of truth per choice, consumed at two different strictnesses:
+ *
+ *  - {@link parseCrossPrincipalChoiceText} matches a **leading** keyword. It
+ *    reads a card's free-text comment, where the proposer already committed to
+ *    answering this card, so trailing prose is harmless.
+ *  - {@link isCrossPrincipalChoiceOnlyText} requires the **whole** body to be
+ *    that keyword. It decides whether an ordinary chat message gets consumed as
+ *    a card answer, so "建议先把测试补上再合" must stay business text.
+ *
+ * Keeping both spellings in one table is what stops the two from drifting.
+ */
+const CHOICE_ALTERNATIVES: Record<CrossPrincipalChoice, string> = {
+  // 对当前任务的建议 is the label older builds printed in their staged notice;
+  // a bot that answers with the wording it was shown must still be understood.
+  independent: '独立任务|另开任务',
+  suggestion: '对当前任务的建议|对\\s*A\\s*的建议|留给当前任务|建议',
+  accept: '确认|同意|采纳并重新执行|采纳|执行|是|yes|y|ok|accept',
+  reject: '拒绝|不采纳|否|no|n|reject',
+  continue_waiting: '继续等待|继续等',
+};
+
+/** Keyword at the head of the body, followed by a separator or end of string. */
+const leadingChoiceRe = (choice: CrossPrincipalChoice): RegExp =>
+  new RegExp(`^(?:${CHOICE_ALTERNATIVES[choice]})(?:[\\s，。,.!！]|$)`, 'i');
+
+/** Body is the keyword and nothing else but trailing punctuation/whitespace. */
+const onlyChoiceRe = (choice: CrossPrincipalChoice): RegExp =>
+  new RegExp(`^(?:${CHOICE_ALTERNATIVES[choice]})[\\s，。,.!！]*$`, 'i');
+
+const INDEPENDENT_TEXT = leadingChoiceRe('independent');
+const SUGGESTION_TEXT = leadingChoiceRe('suggestion');
+const ACCEPT_TEXT = leadingChoiceRe('accept');
+const REJECT_TEXT = leadingChoiceRe('reject');
+const CONTINUE_WAITING_TEXT = leadingChoiceRe('continue_waiting');
+
+const ONLY_CHOICE: Record<CrossPrincipalChoice, RegExp> = {
+  independent: onlyChoiceRe('independent'),
+  suggestion: onlyChoiceRe('suggestion'),
+  accept: onlyChoiceRe('accept'),
+  reject: onlyChoiceRe('reject'),
+  continue_waiting: onlyChoiceRe('continue_waiting'),
+};
 
 export function isCrossPrincipalAsChoice(value: string): value is CrossPrincipalAsChoice {
   return value === 'independent' || value === 'suggestion';
@@ -97,7 +135,21 @@ export function parseCrossPrincipalChoiceText(
   return undefined;
 }
 
-/** True when the inbound body is only a classification/wait/owner choice. */
+/**
+ * True when the inbound body is *only* a classification/wait/owner choice.
+ *
+ * This is the gate that decides whether an ordinary chat message is consumed as
+ * an answer to a host-owned cross-principal card instead of being staged as a
+ * new interruption. A message that merely *starts* with a keyword is not an
+ * answer: "建议先把测试补上再合" is business text, and swallowing it would make
+ * the proposer's message disappear into a card click it never intended.
+ *
+ * An explicit `--as` marker is authoritative — the sender ran
+ * `botmux send --as …` to address this card on purpose, so it settles even when
+ * it rides along with a body. It still has to be an answer this card accepts:
+ * {@link parseCrossPrincipalChoiceText} does not read the marker for an owner
+ * card, whose only answers are accept/reject.
+ */
 export function isCrossPrincipalChoiceOnlyText(
   text: string,
   kind: CrossPrincipalChoiceKind,
@@ -105,8 +157,8 @@ export function isCrossPrincipalChoiceOnlyText(
   const stripped = stripCrossPrincipalAsToken(text);
   const choice = parseCrossPrincipalChoiceText(text, kind);
   if (!choice) return false;
-  if (!stripped.text.trim()) return true;
-  return parseCrossPrincipalChoiceText(stripped.text, kind) === choice;
+  if (stripped.choice) return true;
+  return ONLY_CHOICE[choice].test(stripped.text.trim());
 }
 
 export function crossPrincipalAsKeyword(
