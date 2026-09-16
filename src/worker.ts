@@ -168,7 +168,11 @@ import {
   resolveUsageDisplay,
   type BotConfig,
 } from './bot-registry.js';
-import { readGlobalConfig, isWorkflowFeatureEnabled } from './global-config.js';
+import {
+  readGlobalConfig,
+  isCrossPrincipalInterruptionEnabled,
+  isWorkflowFeatureEnabled,
+} from './global-config.js';
 import {
   stopSessionScope,
   wrapCommandInSessionScope,
@@ -3128,13 +3132,64 @@ function turnAuthorityIdentity(input: {
   };
 }
 
+/**
+ * Experimental XPI switch (default OFF) — the one seam that turns the whole
+ * cross-principal isolation on and off inside this worker.
+ *
+ * `blocks()`, `reserve()` and `markStarted()` all deny through the same
+ * `mayControlActiveTurn` predicate, so gating the read here is what makes the
+ * feature-off path coherent: skipping only the rejection below would let the
+ * message enqueue and then die in `markActiveTurnStarted`, which THROWS
+ * `turn authority mismatch before CLI write` on exactly the mismatch this
+ * predicate reports. Reporting "not blocked" instead means reserve/markStarted
+ * are never reached with a tuple they would refuse.
+ *
+ * Off ⇒ pre-#1348 behavior: a different principal's input is delivered to the
+ * active turn like any other message. Same-principal serialization, type-ahead
+ * batching and the authority tuple itself are untouched either way — those
+ * exist for turn attribution, not for the cross-principal gate.
+ */
+function crossPrincipalIsolationOn(): boolean {
+  return isCrossPrincipalInterruptionEnabled();
+}
+
 function activeTurnBlocks(input: {
   turnId?: string;
   dispatchAttempt?: number;
   trustedCaller?: TrustedCaller;
   trustedController?: TrustedCaller;
 }): boolean {
+  if (!crossPrincipalIsolationOn()) return false;
   return activeTurnAuthority.blocks(turnAuthorityIdentity(input));
+}
+
+/**
+ * Second half of the XPI off-switch: the authority must also stop REFUSING.
+ *
+ * `activeTurnBlocks` keeps the message from being rejected, but `reserve()` and
+ * `markStarted()` consult `mayControlActiveTurn` on their own, so a delivered
+ * cross-principal turn would still fail them — and `markActiveTurnStarted`
+ * turns that into a thrown `turn authority mismatch before CLI write`. With the
+ * feature off there is no principal gate to honour, so the incoming turn simply
+ * takes the tuple over, which is what pre-#1348 code did by overwriting
+ * `currentBotmuxTurnId` outright. Taking over (rather than leaving the stale
+ * tuple in place) keeps the tuple describing the turn that is really writing,
+ * which is what the MCP gateway signs with and the sandbox relay publishes.
+ *
+ * Returns false only when the authority refuses even after the takeover, which
+ * cannot happen for a turnId-bearing identity — the callers keep their existing
+ * failure handling rather than assuming that.
+ */
+function adoptActiveTurnWhenIsolationOff(identity: TurnAuthorityIdentity): boolean {
+  if (crossPrincipalIsolationOn()) return false;
+  const active = activeTurnAuthority.snapshot();
+  activeTurnAuthority.clear();
+  if (!activeTurnAuthority.reserve(identity)) return false;
+  log(
+    `Adopted turn ${identity.turnId?.slice(0, 12) ?? '-'} over turn `
+    + `${active?.turnId?.slice(0, 12) ?? '-'} (cross-principal isolation disabled)`,
+  );
+  return true;
 }
 
 function reserveActiveTurn(input: {
@@ -3147,6 +3202,7 @@ function reserveActiveTurn(input: {
   if (!identity.turnId) return true;
   const reserved = activeTurnAuthority.reserve(identity);
   if (reserved) return true;
+  if (adoptActiveTurnWhenIsolationOff(identity)) return true;
   const active = activeTurnAuthority.snapshot();
   log(
     `Rejected turn ${identity.turnId.slice(0, 12)} from this worker while turn `
@@ -3163,9 +3219,11 @@ function markActiveTurnStarted(input: {
 }): void {
   const identity = turnAuthorityIdentity(input);
   if (!identity.turnId) return;
-  if (!activeTurnAuthority.reserve(identity) || !activeTurnAuthority.markStarted(identity)) {
-    throw new Error(`turn authority mismatch before CLI write (${identity.turnId})`);
-  }
+  if (activeTurnAuthority.reserve(identity) && activeTurnAuthority.markStarted(identity)) return;
+  // Isolation off ⇒ no principal gate to enforce, so a mismatch is a takeover,
+  // not an error. Only an enforcing authority may throw here.
+  if (adoptActiveTurnWhenIsolationOff(identity) && activeTurnAuthority.markStarted(identity)) return;
+  throw new Error(`turn authority mismatch before CLI write (${identity.turnId})`);
 }
 
 function releaseActiveTurnAuthority(

@@ -1058,6 +1058,8 @@ interface ResolvedDashboardSettings {
   };
   /** Experimental anti-resend guidance in botmux routing hints. Default OFF. */
   noVisibleOutputHint: boolean;
+  /** Experimental cross-principal turn isolation (XPI). Default OFF. */
+  crossPrincipalInterruption: boolean;
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -1644,6 +1646,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
         && registry.list().some(bot => bot.larkAppId === global.hostOverloadAlert?.targetBotAppId),
     },
     noVisibleOutputHint: dashboard.noVisibleOutputHint === true, // default OFF; opt-in anti-resend guidance
+    crossPrincipalInterruption: dashboard.crossPrincipalInterruption === true, // default OFF; opt-in cross-principal isolation
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       larkCliVersion: larkCli?.version ?? null,
