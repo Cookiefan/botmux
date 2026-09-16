@@ -173,6 +173,7 @@ import {
   workbenchEntryUrl,
   type DashboardUrls,
 } from './core/dashboard-url.js';
+import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/workbench-shell.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
@@ -1013,6 +1014,7 @@ interface ResolvedDashboardSettings {
    *  source the SPA can offer as a one-click fill; never persisted unless picked. */
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
@@ -1615,6 +1617,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       recommendedRef: TRAEX_RECOMMENDED_REF,
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
+    autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: dashboard.hideCodexRateLimitModelNudge !== false,
@@ -4112,10 +4115,12 @@ const server = createServer(async (req, res) => {
     // `/s/<id>?token=` URL; ours carried `#/agent-workbench`, and a fragment is
     // the one structural difference between the two. Clients that re-encode or
     // truncate an AppLink's `url` lose it and land on the Dashboard home, so
-    // offer a path that survives regardless.
+    // offer a path that survives regardless. These are direct entries, so the
+    // target hash carries the immersive (chrome-less) marker — the sidebar's
+    // own `#/agent-workbench` keeps the normal shell (core/workbench-shell.ts).
     if ((req.method === 'GET' || req.method === 'HEAD')
       && (url.pathname === '/workbench' || url.pathname === '/workbench/dock')) {
-      const target = url.pathname === '/workbench/dock' ? '#/agent-workbench-dock' : '#/agent-workbench';
+      const target = url.pathname === '/workbench/dock' ? WORKBENCH_DOCK_IMMERSIVE_HASH : WORKBENCH_IMMERSIVE_HASH;
       const token = url.searchParams.get('t');
       const query = token ? `?t=${encodeURIComponent(token)}` : '';
       res.writeHead(302, { location: `/${query}${target}`, 'cache-control': 'no-store' });
