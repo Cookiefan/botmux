@@ -144,3 +144,5 @@ The table below compares only **verifiable integration boundaries** — it does 
 - 📄 **License**: [MIT](LICENSE)
 
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
+
+External agent loops can use experimental [constrained background invocations](docs/constrained-invocations.md): isolated Codex reasoning, disabled native tools, structured results, idempotency, and deadline cancellation. The first release requires the dedicated core-only configuration described in the guide.
