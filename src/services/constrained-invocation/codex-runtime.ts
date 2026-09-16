@@ -1,5 +1,4 @@
-import { spawn, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -47,13 +46,14 @@ export function isolatedInvocationEnv(home: string, codexHome: string, source: N
   return env;
 }
 
-/** Model metadata can independently enable tools. Freeze an unmodified native
- * catalog entry with no experimental tools; refuse future catalog drift. */
-export function isolatedCatalog(raw: unknown): { models: unknown[] } {
+/** Model metadata can independently enable tools even when feature flags are
+ * disabled. Disable those tools in the per-invocation catalog copy, preserving
+ * the model identity, transport (including Responses Lite) and other metadata. */
+export function isolatedCatalog(raw: unknown, modelId: string): { models: unknown[] } {
   if (!isObject(raw) || !Array.isArray(raw.models)) throw new Error('native_catalog_missing');
-  const model = raw.models.find((m: any) => m?.slug === 'gpt-5.5');
-  if (!model || !Array.isArray(model.experimental_supported_tools) || model.experimental_supported_tools.length !== 0 || model.use_responses_lite !== false || (model.tool_mode != null && model.tool_mode !== 'direct')) throw new Error('native_catalog_unsupported');
-  return { models: [model] };
+  const model = raw.models.find((m: any) => m?.slug === modelId);
+  if (!model) throw new Error('native_model_not_found');
+  return { models: [{ ...model, experimental_supported_tools: [], tool_mode: 'direct' }] };
 }
 
 export async function runCodexInvocation(
@@ -63,10 +63,9 @@ export async function runCodexInvocation(
 ): Promise<NativeInvocationOutput> {
   signal.throwIfAborted();
   const startedAt = Date.now();
-  const version = await promisify(execFile)(runtime.executable, ['--version'], { timeout: 5000, signal, maxBuffer: 16_384 });
-  assertConstrainedRuntime('codex', version.stdout);
+  assertConstrainedRuntime('codex');
   if (readSecureHostFileSync(join(runtime.authHome, 'auth.json')) === null) throw new Error('native_auth_missing');
-  const catalog = isolatedCatalog(JSON.parse(readFileSync(runtime.catalogPath, 'utf8')));
+  const catalog = isolatedCatalog(JSON.parse(readFileSync(runtime.catalogPath, 'utf8')), request.model);
   const root = mkdtempSync(join(tmpdir(), 'botmux-invocation-'));
   const home = join(root, 'home');
   const work = join(root, 'work');
@@ -173,8 +172,7 @@ export async function runIsolatedCodex(request: InvocationRequest, runtime: {
   try {
     if (child.pid) runtime.onSpawn?.(child.pid);
     if (signal.aborted) abort();
-    const init = await rpc('initialize', { clientInfo: { name: 'botmux-constrained', version: '1' }, capabilities: { experimentalApi: true } });
-    if (!String(init.userAgent).includes('/0.153.4 ')) throw new Error('constrained_capability_unsupported');
+    await rpc('initialize', { clientInfo: { name: 'botmux-constrained', version: '1' }, capabilities: { experimentalApi: true } });
     const requirements = await rpc('configRequirements/read', {});
     if (requirements.requirements != null) throw new Error('managed_requirements_unsupported');
     const effective = await rpc('config/read', { includeLayers: true });

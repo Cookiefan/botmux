@@ -10,6 +10,7 @@ import { runCodexInvocation } from '../src/services/constrained-invocation/codex
 const authHome = process.env.BOTMUX_CONSTRAINED_AUTH_HOME;
 if (!authHome) throw new Error('Set BOTMUX_CONSTRAINED_AUTH_HOME explicitly to opt into native subscription inference');
 const executable = process.env.BOTMUX_CONSTRAINED_CODEX ?? 'codex';
+const model = process.env.BOTMUX_CONSTRAINED_MODEL ?? 'gpt-5.5';
 const directory = mkdtempSync(join(tmpdir(), 'botmux-invocation-smoke-'));
 const service = new InvocationService({ directory, run: (request, signal) => runCodexInvocation(request, {
   executable, authHome, catalogPath: join(authHome, 'models_cache.json'),
@@ -23,7 +24,7 @@ const outputSchema = {
   }, required: ['content', 'tool_calls'], additionalProperties: false,
 };
 async function invoke(requestId: string, prompt: string) {
-  const request = { requestId, prompt, model: 'gpt-5.5', reasoningEffort: 'high', deadlineMs: 120_000, outputSchema };
+  const request = { requestId, prompt, model, reasoningEffort: 'high', deadlineMs: 120_000, outputSchema };
   service.start(request);
   // The repeated request must attach to exactly the same accepted inference.
   service.start(request);

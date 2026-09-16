@@ -1,12 +1,10 @@
-/** Version-scoped runtime policy, not a prompt-based restriction. No PTY fallback. */
-export const CODEX_CONSTRAINED_VERSION = '0.153.4';
-export const CODEX_CONSTRAINED_MODEL = 'gpt-5.5';
+/** Runtime capability checks, not a CLI-version or model-name allowlist. */
 export const constrainedCapabilities = {
   schemaVersion: 1,
   mode: 'structured_reasoning',
   cli: 'codex',
-  versions: [CODEX_CONSTRAINED_VERSION],
-  models: [CODEX_CONSTRAINED_MODEL],
+  versionPolicy: 'runtime_capabilities',
+  modelPolicy: 'caller_selected_native_catalog',
   platforms: ['darwin', 'linux'],
   hostTools: 'disabled',
   customization: 'isolated_home_no_project_no_skills_no_history',
@@ -17,7 +15,6 @@ export const constrainedCapabilities = {
 } as const;
 
 export const CONSTRAINED_CODEX_CONFIG = `
-model="gpt-5.5"
 web_search="disabled"
 project_doc_max_bytes=0
 cli_auth_credentials_store="file"
@@ -55,8 +52,8 @@ tool_suggest=false
 workspace_dependencies=false
 `;
 
-export function assertConstrainedRuntime(cliId: string, version: string, platform = process.platform): void {
-  if (cliId !== 'codex' || version.trim() !== `codex-cli ${CODEX_CONSTRAINED_VERSION}` || !['darwin', 'linux'].includes(platform)) {
+export function assertConstrainedRuntime(cliId: string, platform = process.platform): void {
+  if (cliId !== 'codex' || !['darwin', 'linux'].includes(platform)) {
     throw new Error('constrained_capability_unsupported');
   }
 }

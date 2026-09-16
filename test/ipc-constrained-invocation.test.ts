@@ -18,7 +18,7 @@ async function start(cliId = 'codex') {
   server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
   return server;
 }
-const request = { requestId: 'ipc-round', prompt: 'Synthetic fixture', model: 'gpt-5.5', deadlineMs: 1000, outputSchema: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false } };
+const request = { requestId: 'ipc-round', prompt: 'Synthetic fixture', model: 'fixture-reasoner', deadlineMs: 1000, outputSchema: { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false } };
 it('requires host authentication even with core-only public routes enabled', async () => {
   const s = await start();
   for (const [method, path] of [['GET', '/capabilities'], ['POST', ''], ['GET', '/ipc-round'], ['POST', '/ipc-round/cancel']]) {
@@ -35,6 +35,7 @@ it('accepts, retrieves and deduplicates using the authenticated daemon bot scope
   expect((await call('POST', path, { ...request, prompt: 'different round' })).status).toBe(409);
   const result = await (await call('GET', `${path}/ipc-round`)).json() as any;
   expect(result.result.output).toEqual({ content: request.prompt });
+  expect(result.result.configuredModel).toBe(request.model);
   expect(runCodexInvocation).toHaveBeenCalledTimes(1);
   expect(vi.mocked(runCodexInvocation).mock.calls[0][1]).toMatchObject({ ownerOpenId: undefined });
   expect((await call('POST', path, { ...request, requestId: 'forged-owner', ownerOpenId: 'ou_forged' })).status).toBe(400);

@@ -3,7 +3,7 @@ import { createServer, type Server } from 'node:http';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runIsolatedCodex, isolatedInvocationEnv } from '../src/services/constrained-invocation/codex-runtime.js';
+import { runIsolatedCodex, isolatedCatalog, isolatedInvocationEnv } from '../src/services/constrained-invocation/codex-runtime.js';
 import { CONSTRAINED_CODEX_CONFIG } from '../src/services/constrained-invocation/codex-profile.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import type { InvocationRequest } from '../src/services/constrained-invocation/contract.js';
@@ -22,7 +22,7 @@ const schema = {
     tool_calls: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'string' } }, required: ['name', 'arguments'], additionalProperties: false } },
   }, required: ['content', 'tool_calls'], additionalProperties: false,
 };
-async function harness(reply: (body: any, index: number) => any) {
+async function harness(reply: (body: any, index: number) => any, model = 'gpt-5.5', responsesLite = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-native-fixture-')); roots.push(root);
   for (const name of ['home', 'codex', 'work']) mkdirSync(join(root, name), { mode: 0o700 });
   const requests: any[] = [];
@@ -44,23 +44,52 @@ async function harness(reply: (body: any, index: number) => any) {
   servers.push(server);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address() as { port: number };
-  writeFileSync(join(root, 'codex', 'config.toml'), `${CONSTRAINED_CODEX_CONFIG}\n[model_providers.fixture]\nname="fixture"\nbase_url="http://127.0.0.1:${address.port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n` .replace('model="gpt-5.5"', 'model="gpt-5.5"\nmodel_provider="fixture"'));
-  const run = (prompt: string, signal = AbortSignal.timeout(15_000)) => runIsolatedCodex({ requestId: 'fixture', prompt, model: 'gpt-5.5', deadlineMs: 15_000, outputSchema: schema } as InvocationRequest, {
+  // Synthetic native metadata deliberately advertises tools and code mode.
+  // Exercise the same catalog normalization used in production without auth.
+  const catalog = isolatedCatalog({ models: [{
+    slug: model, display_name: 'Fixture', description: 'Synthetic test model',
+    default_reasoning_level: 'high', supported_reasoning_levels: [{ effort: 'high', description: 'Fixture' }],
+    shell_type: 'unified_exec', visibility: 'list', supported_in_api: true, priority: 0,
+    base_instructions: 'Return the requested structured answer.',
+    support_verbosity: false, default_reasoning_summary: 'none',
+    truncation_policy: { mode: 'tokens', limit: 10000 }, context_window: 272000,
+    experimental_supported_tools: ['clock', 'send_user_message_async'],
+    tool_mode: 'code_mode_only', use_responses_lite: responsesLite,
+    input_modalities: ['text'],
+  }] }, model);
+  const catalogPath = join(root, 'models.json');
+  writeFileSync(catalogPath, JSON.stringify(catalog));
+  writeFileSync(join(root, 'codex', 'config.toml'), `model_catalog_json=${JSON.stringify(catalogPath)}\nmodel_provider="fixture"\n${CONSTRAINED_CODEX_CONFIG}\n[model_providers.fixture]\nname="fixture"\nbase_url="http://127.0.0.1:${address.port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n`);
+  const run = (prompt: string, signal = AbortSignal.timeout(15_000)) => runIsolatedCodex({ requestId: 'fixture', prompt, model, deadlineMs: 15_000, outputSchema: schema } as InvocationRequest, {
     executable: executable!, cwd: join(root, 'work'), env: isolatedInvocationEnv(join(root, 'home'), join(root, 'codex'), { PATH: process.env.PATH, NO_PROXY: '127.0.0.1' }),
   }, signal);
   return { run, requests, root };
 }
 const assistant = (value: unknown) => ({ type: 'message', role: 'assistant', id: 'fixture-final', content: [{ type: 'output_text', text: JSON.stringify(value) }] });
 
-it.skipIf(!executable)('real native runtime has no host tools and rejects a forced shell call', async () => {
+it.skipIf(!executable)('forwards a caller-selected model to native inference without adding host tools', async () => {
+  const h = await harness(() => assistant({ content: 'done', tool_calls: [] }), 'fixture-reasoner');
+  const result = await h.run('Return JSON');
+  expect(result.configuredModel).toBe('fixture-reasoner');
+  expect(h.requests).toHaveLength(1);
+  expect(h.requests[0].model).toBe('fixture-reasoner');
+  expect(h.requests[0].tools).toEqual([]);
+});
+
+it.skipIf(!executable).each([false, true])('real native runtime has no host tools and rejects a forced shell call (Responses Lite: %s)', async responsesLite => {
   let marker = '';
   const h = await harness((_body, index) => index === 1
     ? { type: 'function_call', call_id: 'hostile-call', name: 'exec_command', arguments: JSON.stringify({ cmd: `touch ${marker}` }) }
-    : assistant({ content: 'done', tool_calls: [] }));
+    : assistant({ content: 'done', tool_calls: [] }), 'fixture-reasoner', responsesLite);
   marker = join(h.root, 'must-not-exist');
   const result = await h.run('Perform the supplied reasoning.');
   expect(h.requests.length).toBe(2);
-  expect(h.requests.every(request => request.tools.length === 0)).toBe(true);
+  for (const request of h.requests) {
+    expect(request.tools ?? []).toEqual([]);
+    const toolItems = request.input.filter((item: any) => item.type === 'additional_tools');
+    expect(toolItems).toHaveLength(responsesLite ? 1 : 0);
+    expect(toolItems.every((item: any) => item.tools.length === 0)).toBe(true);
+  }
   expect(existsSync(marker)).toBe(false);
   expect(JSON.stringify(h.requests[1])).toMatch(/unknown|unsupported|unrecognized|not found/i);
   expect(result.usage?.inputTokens).toBe(20);

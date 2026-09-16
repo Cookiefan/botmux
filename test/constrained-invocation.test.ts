@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InvocationService } from '../src/services/constrained-invocation/service.js';
 import { parseInvocation, matchesSchema } from '../src/services/constrained-invocation/contract.js';
-import { assertConstrainedRuntime } from '../src/services/constrained-invocation/codex-profile.js';
+import { assertConstrainedRuntime, constrainedCapabilities } from '../src/services/constrained-invocation/codex-profile.js';
 import { nativeUsage, isolatedCatalog, isolatedInvocationEnv } from '../src/services/constrained-invocation/codex-runtime.js';
 import { parseInvokeArgs } from '../src/cli/session-invoke-command.js';
 
@@ -32,16 +32,30 @@ describe('constrained invocation contract', () => {
     expect(matchesSchema({ content: 5 }, schema)).toBe(false);
     expect(matchesSchema({ content: 'ok', extra: true }, schema)).toBe(false);
   });
-  it('rejects other CLIs, versions and platforms without fallback', () => {
-    expect(() => assertConstrainedRuntime('claude-code', '2.1', 'linux')).toThrow();
-    expect(() => assertConstrainedRuntime('codex', 'codex-cli 0.154.0', 'linux')).toThrow();
-    expect(() => assertConstrainedRuntime('codex', 'codex-cli 0.153.4', 'win32')).toThrow();
-    expect(() => assertConstrainedRuntime('codex', 'codex-cli 0.153.4', 'linux')).not.toThrow();
+  it('checks CLI and platform without advertising a version or model allowlist', () => {
+    expect(() => assertConstrainedRuntime('claude-code', 'linux')).toThrow();
+    expect(() => assertConstrainedRuntime('codex', 'win32')).toThrow();
+    expect(() => assertConstrainedRuntime('codex', 'linux')).not.toThrow();
+    expect(constrainedCapabilities.versionPolicy).toBe('runtime_capabilities');
+    expect(constrainedCapabilities).not.toHaveProperty('versions');
+    expect(constrainedCapabilities).not.toHaveProperty('models');
   });
-  it('fences model catalog tool drift', () => {
-    expect(() => isolatedCatalog({ models: [{ slug: 'gpt-5.5', experimental_supported_tools: ['clock'], use_responses_lite: false }] })).toThrow();
-    expect(() => isolatedCatalog({ models: [{ slug: 'gpt-5.5', experimental_supported_tools: [], use_responses_lite: false, tool_mode: 'code_mode_only' }] })).toThrow();
-    expect(isolatedCatalog({ models: [{ slug: 'gpt-5.5', experimental_supported_tools: [], use_responses_lite: false }] }).models).toHaveLength(1);
+  it('accepts caller-selected models and keeps model changes in the idempotency contract', async () => {
+    expect(parseInvocation({ ...request(), model: 'fixture-reasoner' }).model).toBe('fixture-reasoner');
+    expect(() => parseInvocation({ ...request(), model: ' ' })).toThrow();
+    const run = vi.fn(async (request: { model: string }) => ({ ...output, configuredModel: request.model }));
+    const { instance } = service(run);
+    instance.start({ ...request(), model: 'fixture-reasoner' });
+    expect(() => instance.start(request())).toThrow('idempotency_conflict');
+    expect((await instance.wait('first', 1000))?.configuredModel).toBe('fixture-reasoner');
+  });
+  it('disables model-advertised tools in a copy while preserving the selected model and transport', () => {
+    const selected = { slug: 'fixture-reasoner', experimental_supported_tools: ['clock', 'send_user_message_async'], use_responses_lite: true, tool_mode: 'code_mode_only', context_window: 272000 };
+    const catalog = { models: [{ ...selected, slug: 'gpt-5.5' }, selected] };
+    expect(isolatedCatalog(catalog, 'fixture-reasoner').models).toEqual([{ ...selected, experimental_supported_tools: [], tool_mode: 'direct' }]);
+    expect(selected.experimental_supported_tools).toEqual(['clock', 'send_user_message_async']);
+    expect(selected.tool_mode).toBe('code_mode_only');
+    expect(() => isolatedCatalog(catalog, 'missing-model')).toThrow('native_model_not_found');
   });
   it('removes inherited credentials, hooks and owner overrides', () => {
     const env = isolatedInvocationEnv('/isolated', '/isolated/codex', { PATH: '/bin', OPENAI_API_KEY: 'do-not-forward', NODE_OPTIONS: '--import hook', CODEX_HOME: '/foreign', BOTMUX_OWNER_OPEN_ID: 'ou_other', __OWNER_OPEN_ID: 'ou_other' });

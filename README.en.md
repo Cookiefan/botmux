@@ -145,4 +145,4 @@ The table below compares only **verifiable integration boundaries** — it does 
 
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
 
-External agent loops can use experimental [constrained background invocations](docs/constrained-invocations.md): isolated Codex reasoning, disabled native tools, structured results, idempotency, and deadline cancellation. The first release requires the dedicated core-only configuration described in the guide.
+Programs can use experimental [Codex background reasoning tasks](docs/constrained-invocations.md) to submit prompts, retrieve JSON results, and inspect or cancel tasks. Codex reasons; the caller executes any proposed tools. There is no CLI-version or model-name allowlist. The first release requires the dedicated core-only configuration described in the guide.
