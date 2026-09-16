@@ -177,8 +177,9 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: '/cli', sessionPolicy: 'default', argShape: 'split', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
 ];
 
-/** 话题路由元命令：由 `parseTopicHeader` 在命令表之前拦截，不在 `DAEMON_COMMANDS` 里。 */
-export const FORCE_TOPIC_COMMANDS: ReadonlySet<string> = new Set(['/t', '/topic']);
+/** 话题路由元命令：由 `parseTopicHeader` 在命令表之前拦截，不在 `DAEMON_COMMANDS` 里。
+ *  `/th` `/tw` 是生命周期别名（= `/t here` / `/t worktree`），同样是保留命令（触发 API 里须 @）。 */
+export const FORCE_TOPIC_COMMANDS: ReadonlySet<string> = new Set(['/t', '/topic', '/th', '/tw']);
 
 function namesOf(spec: CommandSpec): string[] {
   return [spec.name, ...(spec.aliases ?? [])];

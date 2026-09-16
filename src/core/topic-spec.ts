@@ -24,7 +24,7 @@ import {
 import { isGitWorkTree, isValidBranchName, resolveWorktreePathForBranch } from '../services/git-worktree.js';
 import { botAcceptsLaunchModel } from './launch-model-capability.js';
 import { resolveRepoSelection } from './repo-selection.js';
-import type { TopicHeader } from './topic-header.js';
+import type { TopicHeader, TopicLifecycle } from './topic-header.js';
 
 /**
  * 模型名的**语法**边界。刻意不拿 `modelChoices` 当白名单：那是 setup / dashboard 的
@@ -39,6 +39,8 @@ const MODEL_TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]*(\[[A-Za-z0-9_.-]+\])?$/;
 const MODEL_TOKEN_MAX = 64;
 
 export type TopicSpecError =
+  /** `/th` `/tw`（`/t here|worktree`）已经指定「当前目录」，又写了 `/repo …`——相斥，不做静默优先级。 */
+  | { kind: 'lifecycle_conflicts_repo'; lifecycle: TopicLifecycle }
   /** `/repo 2` —— 数字形式只对选仓卡片有意义，头部里没有卡片。 */
   | { kind: 'repo_numeric'; arg: string }
   /** `/repo X` 没解析出任何存在的目录。 */
@@ -71,6 +73,9 @@ export interface TopicSpecWorktree {
 
 export interface TopicSpec {
   ok: true;
+  /** 生命周期变体：`here` 从当前群会话目录起，`worktree` 先从该目录建话题 worktree。
+   *  目录本身由 daemon 按群/会话状态解析（这里没有会话），与 `workingDir` / `worktree` 互斥。 */
+  lifecycle?: TopicLifecycle;
   /** 会话标题，来源 `user`（`updateSessionTitle` 会同步 CLI 原生会话名）。 */
   title?: string;
   /** 已解析的绝对目录；缺席表示头部没写 `/repo`，按 bot 现有的钉目录/选仓逻辑走。 */
@@ -108,6 +113,14 @@ export async function resolveTopicSpec(header: TopicHeader, ctx: TopicSpecContex
   const { botCfg } = ctx;
 
   if (header.title) spec.title = header.title;
+  if (header.lifecycle) {
+    spec.lifecycle = header.lifecycle;
+    // 主干曾对 `/th /repo x` 静默让生命周期目录优先、把 `/repo` 丢掉；指令头是 fail closed 的
+    //（D5），相斥就拒，其余错误照常一并收齐。
+    if (header.directives.repo !== undefined || header.worktree) {
+      errors.push({ kind: 'lifecycle_conflicts_repo', lifecycle: header.lifecycle });
+    }
+  }
 
   const repoDirective = header.directives.repo;
   // 裸 `/repo`（写了指令但没带参数）—— 解析器记成 null。既有语义原样保留。

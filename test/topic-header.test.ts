@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { parseTopicHeader, type TopicHeaderParse } from '../src/core/topic-header.js';
+import { parseTopicHeader, isTopicHeader, topicHeaderDeclaresSpec, type TopicHeaderParse } from '../src/core/topic-header.js';
 
 /** 头部对象的可断言快照（省掉 ok/sentinel 噪音，直接比语义三件套）。 */
 function shape(parsed: TopicHeaderParse) {
@@ -406,4 +406,52 @@ describe('parseTopicHeader —— /repo wt <目标> [分支]', () => {
       expect(shape(parseTopicHeader(input))).toEqual(expected);
     });
   }
+});
+
+describe('parseTopicHeader —— 生命周期变体（/th /tw /t here|worktree）', () => {
+  it('/th /tw 是分隔符别名，自带 lifecycle', () => {
+    expect(parseTopicHeader('/th 检查实现')).toMatchObject({ ok: true, sentinel: '/th', lifecycle: 'here', prompt: '检查实现' });
+    expect(parseTopicHeader('/tw 检查实现')).toMatchObject({ ok: true, sentinel: '/tw', lifecycle: 'worktree', prompt: '检查实现' });
+    expect(parseTopicHeader('/TW')).toMatchObject({ ok: true, sentinel: '/tw', lifecycle: 'worktree', prompt: '' });
+  });
+
+  it('/t /topic 紧跟的裸 here / worktree 一词被吃成变体，大小写不敏感', () => {
+    expect(parseTopicHeader('/t here 检查实现')).toMatchObject({ sentinel: '/t', lifecycle: 'here', prompt: '检查实现' });
+    expect(parseTopicHeader('/topic worktree 检查实现')).toMatchObject({ sentinel: '/topic', lifecycle: 'worktree', prompt: '检查实现' });
+    expect(parseTopicHeader('/t Worktree')).toMatchObject({ lifecycle: 'worktree', prompt: '' });
+  });
+
+  it('变体词只认紧跟分隔符的那一个；别名之后不再吃', () => {
+    expect(parseTopicHeader('/th here')).toMatchObject({ lifecycle: 'here', prompt: 'here' });
+    expect(parseTopicHeader('/t /model sonnet here')).toMatchObject({ directives: { model: 'sonnet' }, prompt: 'here' });
+    expect(parseTopicHeader('/t /model sonnet here')).not.toHaveProperty('lifecycle');
+  });
+
+  it('引号包裹的 "here" 是字面量正文', () => {
+    const parsed = parseTopicHeader('/t "here" 干活');
+    expect(parsed).toMatchObject({ prompt: '"here" 干活' });
+    expect(parsed).not.toHaveProperty('lifecycle');
+  });
+
+  it('标题、/model、/effort 可与变体同用；/repo 的相斥留给语义层', () => {
+    expect(parseTopicHeader('日常 /tw /model sonnet 干活')).toMatchObject({
+      title: '日常', lifecycle: 'worktree', directives: { model: 'sonnet' }, prompt: '干活',
+    });
+    // 语法层照常解析出 /repo，让 resolveTopicSpec 一次收齐全部错误。
+    expect(parseTopicHeader('/tw /repo botmux 干活')).toMatchObject({ lifecycle: 'worktree', directives: { repo: 'botmux' } });
+  });
+
+  it('写了变体就算「已写头部」：未知 /xxx fail closed', () => {
+    expect(parseTopicHeader('/tw /modle sonnet 干活')).toEqual({ ok: false, sentinel: '/tw', kind: 'unknown_directive', token: '/modle' });
+  });
+
+  it('/two /three 不是分隔符', () => {
+    expect(parseTopicHeader('/two 干活')).toBeNull();
+    expect(parseTopicHeader('/three 干活')).toBeNull();
+  });
+
+  it('在已有会话里，变体算作声明了规格（thread 路径会提示只在新话题第一条生效）', () => {
+    const parsed = parseTopicHeader('/tw 干活');
+    expect(isTopicHeader(parsed) && topicHeaderDeclaresSpec(parsed)).toBe(true);
+  });
 });

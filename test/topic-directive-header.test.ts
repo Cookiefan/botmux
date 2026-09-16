@@ -985,4 +985,17 @@ describe('指令头：/repo wt 建 worktree 再开会话', () => {
     expect(texts).toHaveLength(1);
     expect(texts[0]).toContain('已存在');
   });
+
+  it('/tw 与 /repo 同写 → 开话题前拒绝，零副作用（不再静默让生命周期目录优先）', async () => {
+    await handleNewTopic(groupEvent('/tw /repo wt botmux ci/x 干活', 'om_tw_repo'), groupCtx('om_tw_repo'));
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+    expect(mocks.createdSessions).toHaveLength(0);
+    expect(activeSessions.size).toBe(0);
+    const texts = sentContents();
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toContain('/tw');
+    expect(texts[0]).toContain('/repo');
+  });
 });

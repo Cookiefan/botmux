@@ -68,10 +68,26 @@ export interface TopicHeaderWorktree {
   branch?: string;
 }
 
+/** 分隔符：`/t` `/topic` 是通用形式；`/th` `/tw` 是生命周期别名（等价 `/t here` / `/t worktree`）。 */
+export type TopicHeaderSentinel = '/t' | '/topic' | '/th' | '/tw';
+
+/**
+ * 生命周期变体：话题从**当前群会话的工作目录**起（`here`），或先从该目录建一个按话题
+ * 确定性命名的 worktree 再起（`worktree`）。写法四选一：`/th` `/tw` `/t here` `/t worktree`
+ * （`/topic` 同 `/t`）。它与 `/repo …` 相斥——一个说「用当前目录」，一个点名仓库；
+ * 相斥的组合由 resolveTopicSpec 拒绝，不做静默优先级。
+ */
+export type TopicLifecycle = 'here' | 'worktree';
+
+const SENTINEL_LIFECYCLE: Partial<Record<TopicHeaderSentinel, TopicLifecycle>> = { '/th': 'here', '/tw': 'worktree' };
+const LIFECYCLE_BY_TOKEN: ReadonlyMap<string, TopicLifecycle> = new Map([['here', 'here'], ['worktree', 'worktree']]);
+
 export interface TopicHeader {
   ok: true;
   /** 用户实际敲的分隔符（已归一化大小写），供日志与授权提示复用原文措辞。 */
-  sentinel: '/t' | '/topic';
+  sentinel: TopicHeaderSentinel;
+  /** 生命周期变体（见 {@link TopicLifecycle}）；通用 `/t` 缺席。 */
+  lifecycle?: TopicLifecycle;
   /** 归一化后的可读标题；没写标题时缺席。 */
   title?: string;
   /** 头部指令的**原始参数**（已脱掉包裹的双引号），语义校验留给 resolveTopicSpec。
@@ -92,7 +108,7 @@ export type TopicHeaderErrorReason =
   | { kind: 'missing_worktree_target' };
 
 /** 拒绝结果一并带上用户实际敲的分隔符，授权提示与错误文案都用它的原文措辞。 */
-export type TopicHeaderError = { ok: false; sentinel: '/t' | '/topic' } & TopicHeaderErrorReason;
+export type TopicHeaderError = { ok: false; sentinel: TopicHeaderSentinel } & TopicHeaderErrorReason;
 
 export type TopicHeaderParse = TopicHeader | TopicHeaderError | null;
 
@@ -122,7 +138,7 @@ export function isTopicHeaderError(parsed: TopicHeaderParse): parsed is TopicHea
  * 只有 thread 路径用它。新话题路径不看这个谓词——那里任何解析成功的头部都照常生效。
  */
 export function topicHeaderDeclaresSpec(header: TopicHeader): boolean {
-  if (Object.keys(header.directives).length > 0 || header.worktree !== undefined) return true;
+  if (Object.keys(header.directives).length > 0 || header.worktree !== undefined || header.lifecycle !== undefined) return true;
   return header.title !== undefined && header.prompt === '';
 }
 
@@ -164,11 +180,11 @@ function tokenize(content: string): Token[] {
   return tokens;
 }
 
-/** 完整 token 形式的 `/t` / `/topic`（大小写不敏感）；`/tea` `/topical` 不匹配。 */
-function sentinelOf(token: Token): '/t' | '/topic' | undefined {
+/** 完整 token 形式的 `/t` `/topic` `/th` `/tw`（大小写不敏感）；`/tea` `/topical` `/two` 不匹配。 */
+function sentinelOf(token: Token): TopicHeaderSentinel | undefined {
   if (token.quoted) return undefined;
   const lower = token.text.toLowerCase();
-  return lower === '/t' ? '/t' : lower === '/topic' ? '/topic' : undefined;
+  return lower === '/t' || lower === '/topic' || lower === '/th' || lower === '/tw' ? lower : undefined;
 }
 
 /**
@@ -212,6 +228,14 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
   const directives: Partial<Record<TopicHeaderDirective, string | null>> = {};
   let worktree: TopicHeaderWorktree | undefined;
   let i = sentinelIndex + 1;
+  // 生命周期变体：`/th` `/tw` 自带；`/t` `/topic` 紧跟的裸 `here` / `worktree` 一词被吃掉
+  //（引号包裹的是字面量正文）。别名之后不再吃变体词：`/th here` 的正文就是 `here`。
+  let lifecycle: TopicLifecycle | undefined = SENTINEL_LIFECYCLE[sentinel];
+  const variant = tokens[i];
+  if (lifecycle === undefined && variant && !variant.quoted) {
+    lifecycle = LIFECYCLE_BY_TOKEN.get(variant.text.toLowerCase());
+    if (lifecycle !== undefined) i += 1;
+  }
   for (; i < tokens.length; i += 1) {
     const token = tokens[i]!;
     if (token.quoted) break;
@@ -220,7 +244,7 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
       // 「用户已经写了头部」才对未知 `/xxx` fail closed。否则这只是今天的
       // `/t <文案>`：`/t /goal 干活`、`/t /close` 等既有冷启动/命令用法必须原样
       // 落到 parseSlashCommandInvocation，不能被解析器提前拒掉（D9 向后兼容）。
-      const claimed = title !== undefined || worktree !== undefined || Object.keys(directives).length > 0;
+      const claimed = title !== undefined || worktree !== undefined || lifecycle !== undefined || Object.keys(directives).length > 0;
       if (claimed && token.text.startsWith('/')) {
         return { ok: false, sentinel, kind: 'unknown_directive', token: token.text };
       }
@@ -277,6 +301,7 @@ export function parseTopicHeader(content: string): TopicHeaderParse {
   return {
     ok: true,
     sentinel,
+    ...(lifecycle !== undefined ? { lifecycle } : {}),
     ...(title !== undefined ? { title } : {}),
     directives,
     ...(worktree !== undefined ? { worktree } : {}),

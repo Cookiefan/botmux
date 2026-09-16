@@ -225,3 +225,23 @@ describe('resolveTopicSpec —— /repo wt', () => {
       .toEqual(['branch_invalid', 'model_invalid']);
   });
 });
+
+describe('resolveTopicSpec —— 生命周期变体', () => {
+  it('/tw、/t here 透传 lifecycle，不解析目录（目录由 daemon 按群会话状态决定）', async () => {
+    const wt = await resolve('/tw 干活', CLAUDE);
+    expect(wt).toMatchObject({ ok: true, lifecycle: 'worktree' });
+    expect(wt).not.toHaveProperty('workingDir');
+    expect(await resolve('/t here /model sonnet 干活', CLAUDE)).toMatchObject({ ok: true, lifecycle: 'here', model: 'sonnet' });
+  });
+
+  it('变体与 /repo（含 /repo wt、裸 /repo）相斥 → lifecycle_conflicts_repo，不做静默优先级', async () => {
+    expect(errorKinds(await resolve('/tw /repo botmux 干活', CLAUDE))).toEqual(['lifecycle_conflicts_repo']);
+    expect(errorKinds(await resolve('/th /repo wt botmux ci/x 干活', CLAUDE))).toEqual(['lifecycle_conflicts_repo']);
+    expect(errorKinds(await resolve('/t here /repo', CLAUDE))).toEqual(['lifecycle_conflicts_repo']);
+  });
+
+  it('相斥之外的错误照常一并收齐', async () => {
+    expect(errorKinds(await resolve('/tw /repo botmux /model 命令为啥坏了', CLAUDE)))
+      .toEqual(['lifecycle_conflicts_repo', 'model_invalid']);
+  });
+});

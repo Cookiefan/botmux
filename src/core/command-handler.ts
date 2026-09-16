@@ -477,11 +477,9 @@ function buildCloseWorktreeConfirmCard(args: {
 // for existing callers, same as `validateWorkingDir` above.
 export { resolveRepoSelection } from './repo-selection.js';
 
-// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让原本
-// 找 `parseForceTopicInvocation` 的调用方在同一个模块面上拿到它的升级版。
-//
-// 主路由由 `parseTopicHeader` 负责可读标题与指令头；旧解析器只保留为
-// `/th`、`/tw`、`/t here|worktree` 生命周期兼容面的纯函数与测试入口。
+// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让命令面上的
+// 调用方在同一个模块面上拿到它。`/th` `/tw` `/t here|worktree` 生命周期变体同样由它解析
+//（`header.lifecycle`），不再有第二份正则。
 export {
   parseTopicHeader,
   isTopicHeader,
@@ -494,28 +492,6 @@ export {
   type TopicHeaderParse,
   type TopicHeaderDirective,
 } from './topic-header.js';
-
-export type ForceTopicMode = 'default' | 'here' | 'worktree';
-
-/** Parse lifecycle aliases retained by the worktree command surface. */
-export function parseForceTopicInvocation(content: string): { prompt: string; mode: ForceTopicMode } | null {
-  const trimmed = content.trimStart();
-  const alias = /^\/(th|tw)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  if (alias) return {
-    prompt: (alias[2] ?? '').trim(),
-    mode: alias[1]!.toLowerCase() === 'tw' ? 'worktree' : 'here',
-  };
-  const match = /^\/(t|topic)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  if (!match) return null;
-  const rawPrompt = (match[2] ?? '').trim();
-  const variant = /^(here|worktree)(?:\s+([\s\S]*))?$/i.exec(rawPrompt);
-  return variant
-    ? {
-        prompt: (variant[2] ?? '').trim(),
-        mode: variant[1]!.toLowerCase() === 'worktree' ? 'worktree' : 'here',
-      }
-    : { prompt: rawPrompt, mode: 'default' };
-}
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
