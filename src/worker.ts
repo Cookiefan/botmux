@@ -12693,6 +12693,7 @@ function sendToPty(
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
+    startupComplete: idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   }) && cliAdapter.mergeQueuedInput === true;
   const mergedQueued = shouldMergeQueued && mergeQueuedCliInput(pendingMessages, next);
@@ -12724,15 +12725,15 @@ function sendToPty(
   // parks them but steers into the active turn — CodexBridgeQueue's
   // HOL-block-drop attributes the (possibly merged) result correctly.
   // Type-ahead lets the message write while the CLI is BUSY — but only once the
-  // TUI has booted. During startup / tmux re-attach (awaitingFirstPrompt) even a
-  // type-ahead write is dropped (no input box yet) — markPromptReady()'s flush
-  // delivers queued messages instead. See input-gate.ts; this fixes dispatch's
-  // brief reaching Codex before its first idle and never landing.
+  // TUI has booted. First-ready or positive initialization evidence proves
+  // this; keep that evidence available to messages arriving after the startup
+  // observer's one-time queue flush, even if resyncs prevent ordinary idle.
   if (!sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
     awaitingFirstPrompt,
+    startupComplete: idleDetector?.isStartupComplete(),
     holdForRunnerReload: shouldHoldCodexRunnerInput(codexRunnerFreshness),
   })) {
     if (!mergedQueued) log(`Writing to PTY: "${content.substring(0, 80)}"`);

@@ -298,6 +298,11 @@ export class IdleDetector {
     return this.startupPending && !this.startupComplete;
   }
 
+  /** Positive initialization evidence, retained across resync/turn resets. */
+  isStartupComplete(): boolean {
+    return this.startupComplete;
+  }
+
   /**
    * Startup-banner evidence read from an authoritative screen snapshot.
    *
@@ -312,9 +317,9 @@ export class IdleDetector {
    *
    * Deliberately narrower than feed(): it touches ONLY the startup latch, never
    * outputTail / readySeen / spinner / quiescence state, and it neither arms
-   * nor fires a timer. Releasing the hold is not a claim that the CLI can
-   * accept a submit — readyPattern plus quiescence (or the worker's hard cap)
-   * still gate that independently. It does lift a veto: a quiescence check that
+   * nor fires a timer. Initialization allows the worker's existing type-ahead
+   * path, but does not prove idle: readyPattern plus quiescence still gate that
+   * independently. It does lift a veto: a quiescence check that
    * fed data had already armed, and that isStartupPending() was rejecting, can
    * complete afterwards. That is the point of the hold, not a bypass of it —
    * the evidence behind that check still came from feed().

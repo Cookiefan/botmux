@@ -9,9 +9,9 @@ import { resolveNodeExecutable, spawnTsEvalWithRepoImports } from './helpers/ts-
 
 // Real worker IPC, real ZMX history/resync, and a deterministic CLI stdin sink.
 // No model/API/Feishu traffic; no HOME override or live ZMX socket access.
-it.skipIf(process.platform === 'win32' || !ZmxBackend.isAvailable())(
-  'delivers startup-queued input once after a ZMX initialized repaint, without waiting for the first-prompt timeout',
-  async () => {
+it.skipIf(process.platform === 'win32' || !ZmxBackend.isAvailable()).each(['before', 'after'] as const)(
+  'delivers input arriving %s a ZMX initialized repaint without waiting for the first-prompt timeout',
+  async (arrival) => {
     const root = mkdtempSync('/tmp/bmx-startup-');
     const home = join(root, 'home');
     const dataDir = join(root, 'data');
@@ -102,14 +102,29 @@ const poll = setInterval(() => {
       await waitFor(() => existsSync(loadingFile) && messages.some(m => m.type === 'ready'));
       // Let the initial loading capture arrive before the ordinary IM input.
       await new Promise(r => setTimeout(r, 500));
-      child.send({ type: 'message', content: 'say-hi-startup-probe', turnId: 'om_startup' } satisfies DaemonToWorker);
-      await waitFor(() => logs.join('').includes('still booting'));
+      const sendInput = () => child!.send({
+        // Ordinary IM delivery; dispatchAttempt belongs to durable dispatch,
+        // whose independent no-type-ahead fence must remain intact.
+        type: 'message', content: 'say-hi-startup-probe', turnId: 'om_startup',
+      } satisfies DaemonToWorker);
+      if (arrival === 'before') {
+        sendInput();
+        await waitFor(() => logs.join('').includes('still booting'));
+      }
       await new Promise(r => setTimeout(r, 2_200));
       expect(input()).toBe('');
       expect(messages.some(m => m.type === 'prompt_ready')).toBe(false);
 
-      const releasedAt = Date.now();
+      let releasedAt = Date.now();
       writeFileSync(releaseFile, 'loaded');
+      await waitFor(() => logs.join('').includes('initialized banner observed'));
+      // An empty queue at initialization must not consume the only wake-up.
+      // A subsequent resync also resets idle evidence, but not startup evidence.
+      if (arrival === 'after') {
+        await new Promise(r => setTimeout(r, 700));
+        releasedAt = Date.now();
+        sendInput();
+      }
       await waitFor(() => input().includes('say-hi-startup-probe') && input().includes('\r'), 6_000);
       expect(Date.now() - releasedAt).toBeLessThan(6_000);
       await new Promise(r => setTimeout(r, 700));

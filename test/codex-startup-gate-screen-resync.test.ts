@@ -176,6 +176,21 @@ describe('codex 启动闸：快照后端下的复现与修复', () => {
     expect(detector.isStartupPending()).toBe(false);
   });
 
+  it.each(['feed', 'observeStartupScreen'] as const)('通过 %s 得到的初始化证据跨 resync/turn reset 保留，新进程重新等待', (observe) => {
+    const { detector, idle } = newDetector();
+    expect(detector.isStartupPending()).toBe(false);
+    expect(detector.isStartupComplete()).toBe(false);
+    detector[observe](INITIALIZED_SCREEN);
+    detector.reset();
+    detector.resetReadyEvidence();
+    expect(detector.isStartupComplete()).toBe(true);
+    expect(idle).not.toHaveBeenCalled();
+    const replacement = newDetector().detector;
+    expect(replacement.isStartupComplete()).toBe(false);
+    replacement.dispose();
+    detector.dispose();
+  });
+
   it('尚未见过 loading 横幅时，观察屏幕不会凭空制造 pending 状态', () => {
     const { detector } = newDetector();
     expect(detector.isStartupPending()).toBe(false);
