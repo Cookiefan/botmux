@@ -4,9 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InvocationService } from '../src/services/constrained-invocation/service.js';
 import { parseInvocation, matchesSchema } from '../src/services/constrained-invocation/contract.js';
-import { assertConstrainedRuntime, constrainedCapabilities } from '../src/services/constrained-invocation/codex-profile.js';
+import { assertConstrainedRuntime } from '../src/services/constrained-invocation/codex-profile.js';
+import { modelOnlyCapabilities } from '../src/services/constrained-invocation/adapters.js';
 import { nativeUsage, isolatedCatalog, isolatedInvocationEnv } from '../src/services/constrained-invocation/codex-runtime.js';
 import { parseInvokeArgs } from '../src/cli/session-invoke-command.js';
+import { claudeUsage } from '../src/services/constrained-invocation/claude-runtime.js';
 
 const schema = { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false };
 const request = (requestId = 'first') => ({ requestId, prompt: 'Reason about the supplied fixture', model: 'gpt-5.5', deadlineMs: 1000, outputSchema: schema });
@@ -36,9 +38,9 @@ describe('constrained invocation contract', () => {
     expect(() => assertConstrainedRuntime('claude-code', 'linux')).toThrow();
     expect(() => assertConstrainedRuntime('codex', 'win32')).toThrow();
     expect(() => assertConstrainedRuntime('codex', 'linux')).not.toThrow();
-    expect(constrainedCapabilities.versionPolicy).toBe('runtime_capabilities');
-    expect(constrainedCapabilities).not.toHaveProperty('versions');
-    expect(constrainedCapabilities).not.toHaveProperty('models');
+    expect(modelOnlyCapabilities.versionPolicy).toBe('runtime_capabilities');
+    expect(modelOnlyCapabilities).not.toHaveProperty('versions');
+    expect(modelOnlyCapabilities).not.toHaveProperty('models');
   });
   it('accepts caller-selected models and keeps model changes in the idempotency contract', async () => {
     expect(parseInvocation({ ...request(), model: 'fixture-reasoner' }).model).toBe('fixture-reasoner');
@@ -67,6 +69,12 @@ describe('constrained invocation contract', () => {
     expect(nativeUsage({ inputTokens: 4, outputTokens: -1 })).toBeNull();
     expect(nativeUsage({ inputTokens: 4, outputTokens: 1, cachedInputTokens: 8 })).toBeNull();
     expect(nativeUsage({ inputTokens: 4, outputTokens: 1 })).toEqual({ inputTokens: 4, outputTokens: 1, cachedInputTokens: null, cacheWriteInputTokens: null });
+  });
+  it('normalizes Claude cache accounting without inventing missing metrics', () => {
+    expect(claudeUsage({ input_tokens: 4, output_tokens: 2, cache_read_input_tokens: 6, cache_creation_input_tokens: 3 })).toEqual({ inputTokens: 13, outputTokens: 2, cachedInputTokens: 6, cacheWriteInputTokens: 3 });
+    expect(claudeUsage({ input_tokens: 4, output_tokens: 2 })?.cachedInputTokens).toBeNull();
+    expect(claudeUsage({ input_tokens: 4, output_tokens: 2, cache_read_input_tokens: -1 })).toBeNull();
+    expect(claudeUsage(undefined)).toBeNull();
   });
   it('keeps wait and deadline separate at the CLI boundary', () => {
     expect(parseInvokeArgs(['result', '--bot', 'fixture', '--request-id', 'r1', '--wait-ms', '50']).waitMs).toBe(50);

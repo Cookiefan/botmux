@@ -5,9 +5,10 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { readSecureHostFileSync } from '../../platform/secure-host-file.js';
 import { provisionCodexAuth } from '../codex-auth-sync.js';
-import { applySessionOwnerEnv } from '../../utils/child-env.js';
 import { assertConstrainedRuntime, CONSTRAINED_CODEX_CONFIG } from './codex-profile.js';
 import { isObject, matchesSchema, type InvocationRequest, type InvocationResult } from './contract.js';
+import { isolatedModelEnv, NativeInvocationError, type NativeInvocationOutput } from './runtime.js';
+export { NativeInvocationError, type NativeInvocationOutput } from './runtime.js';
 
 export interface CodexInvocationRuntime {
   executable: string;
@@ -17,10 +18,6 @@ export interface CodexInvocationRuntime {
   /** Only transport environment; no inherited CLI customization or credentials. */
   env?: NodeJS.ProcessEnv;
 }
-export class NativeInvocationError extends Error {
-  constructor(message: string, readonly telemetry: NativeInvocationOutput) { super(message); }
-}
-export type NativeInvocationOutput = Pick<InvocationResult, 'output' | 'configuredModel' | 'actualModel' | 'reasoningEffort' | 'usage' | 'usageSource' | 'startupMs'>;
 
 /** Native events report cumulative thread totals. A fresh thread per invocation
  * lets us replace each snapshot instead of summing duplicate/last-turn updates. */
@@ -36,13 +33,8 @@ export function nativeUsage(value: unknown): InvocationResult['usage'] {
 }
 
 export function isolatedInvocationEnv(home: string, codexHome: string, source: NodeJS.ProcessEnv, owner?: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const key of ['PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'all_proxy', 'no_proxy']) {
-    if (source[key]) env[key] = source[key];
-  }
-  env.HOME = home;
+  const env = isolatedModelEnv(home, source, owner);
   env.CODEX_HOME = codexHome;
-  applySessionOwnerEnv(env, owner);
   return env;
 }
 

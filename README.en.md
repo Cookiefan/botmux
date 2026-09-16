@@ -145,4 +145,4 @@ The table below compares only **verifiable integration boundaries** — it does 
 
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
 
-Programs can use experimental [Codex background reasoning tasks](docs/constrained-invocations.md) to submit prompts, retrieve JSON results, and inspect or cancel tasks. Codex reasons; the caller executes any proposed tools. There is no CLI-version or model-name allowlist. The first release requires the dedicated core-only configuration described in the guide.
+Tools with their own agent loop can use experimental [model-only mode](docs/constrained-invocations.md). The caller owns context and tool execution; Botmux provides CLI-backed inference, task status, cancellation, and deduplication. The interface covers all CLI identities; Codex and Claude Code currently have native implementations. Capability discovery reports which adapters are available.

@@ -3,11 +3,17 @@ vi.mock('../src/services/constrained-invocation/codex-runtime.js', async importO
   ...await importOriginal<typeof import('../src/services/constrained-invocation/codex-runtime.js')>(),
   runCodexInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
 }));
+vi.mock('../src/services/constrained-invocation/claude-runtime.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/services/constrained-invocation/claude-runtime.js')>(),
+  runClaudeInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
+}));
 import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { closeConstrainedInvocations } from '../src/services/constrained-invocation/daemon.js';
 import { runCodexInvocation } from '../src/services/constrained-invocation/codex-runtime.js';
+import { runClaudeInvocation } from '../src/services/constrained-invocation/claude-runtime.js';
+import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 
 let server: IpcServerHandle | undefined;
 const secret = 'constrained-invocation-test-secret';
@@ -27,25 +33,39 @@ it('requires host authentication even with core-only public routes enabled', asy
   }
   expect(runCodexInvocation).not.toHaveBeenCalled();
 });
-it('accepts, retrieves and deduplicates using the authenticated daemon bot scope', async () => {
-  const s = await start(); const path = '/api/headless/invocations';
+it.each(['codex', 'claude-code'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
+  const s = await start(cli); const path = '/api/headless/invocations';
+  const run = cli === 'codex' ? runCodexInvocation : runClaudeInvocation;
+  const invocation = { ...request, requestId: `round-${cli}` };
   const call = (method: string, target: string, body?: unknown) => fetchDaemonIpc(s.port, target, { method, ...(body ? { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } } : {}) }, secret);
-  expect((await call('POST', path, request)).status).toBe(202);
-  const duplicate = await call('POST', path, request); expect([200, 202]).toContain(duplicate.status);
-  expect((await call('POST', path, { ...request, prompt: 'different round' })).status).toBe(409);
-  const result = await (await call('GET', `${path}/ipc-round`)).json() as any;
+  expect((await call('POST', path, invocation)).status).toBe(202);
+  const duplicate = await call('POST', path, invocation); expect([200, 202]).toContain(duplicate.status);
+  expect((await call('POST', path, { ...invocation, prompt: 'different round' })).status).toBe(409);
+  const result = await (await call('GET', `${path}/${invocation.requestId}`)).json() as any;
   expect(result.result.output).toEqual({ content: request.prompt });
   expect(result.result.configuredModel).toBe(request.model);
-  expect(runCodexInvocation).toHaveBeenCalledTimes(1);
-  expect(vi.mocked(runCodexInvocation).mock.calls[0][1]).toMatchObject({ ownerOpenId: undefined });
+  expect(run).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(run).mock.calls[0][1]).toMatchObject({ ownerOpenId: undefined });
+  expect(vi.mocked(run).mock.calls[0][1].authHome).toMatch(cli === 'codex' ? /\/codex$/ : /\/claude$/);
   expect((await call('POST', path, { ...request, requestId: 'forged-owner', ownerOpenId: 'ou_forged' })).status).toBe(400);
 });
 it('rejects an unsupported CLI without launching a worker', async () => {
-  const s = await start('claude-code');
+  const s = await start('gemini');
   const response = await fetchDaemonIpc(s.port, '/api/headless/invocations', { method: 'POST', body: JSON.stringify(request), headers: { 'content-type': 'application/json' } }, secret);
   expect(response.status).toBe(400);
   expect(await response.json()).toMatchObject({ error: 'constrained_capability_unsupported' });
   expect(runCodexInvocation).not.toHaveBeenCalled();
+  expect(runClaudeInvocation).not.toHaveBeenCalled();
+});
+
+it('reports the selected CLI and every registered CLI without claiming unsupported adapters work', async () => {
+  const s = await start('claude-code');
+  const response = await fetchDaemonIpc(s.port, '/api/headless/invocations/capabilities', {}, secret);
+  const body = await response.json() as any;
+  const capability = body.capability;
+  expect(capability).toMatchObject({ cli: 'claude-code', mode: 'model_only', loopOwner: 'caller', supported: true, runtimeVerified: false });
+  expect(capability.adapters.map((item: any) => item.cli)).toEqual(ALL_CLI_IDS);
+  expect(capability.adapters.find((item: any) => item.cli === 'gemini')).toMatchObject({ supported: false, reason: 'native_model_only_adapter_not_implemented' });
 });
 
 it.each([

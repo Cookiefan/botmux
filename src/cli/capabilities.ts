@@ -10,6 +10,7 @@ export interface BotmuxCapabilitiesDocument {
     current_actor_v2: true;
     headless_session_v1: true;
     constrained_invocation_v1: true;
+    model_only_invocation_v1: true;
   };
 }
 
@@ -40,6 +41,7 @@ export function botmuxCapabilities(): BotmuxCapabilitiesDocument {
       current_actor_v2: true,
       headless_session_v1: true,
       constrained_invocation_v1: true,
+      model_only_invocation_v1: true,
     },
   };
 }

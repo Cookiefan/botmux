@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { readDurableProcessIdentity } from '../../utils/process-identity.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { parseInvocation, type InvocationRequest, type InvocationResult } from './contract.js';
-import { NativeInvocationError, type NativeInvocationOutput } from './codex-runtime.js';
+import { NativeInvocationError, type NativeInvocationOutput } from './runtime.js';
 
 interface StoredInvocation { fingerprint: string; lease: string; ownerPid: number; ownerIdentity?: string; result: InvocationResult }
 export interface InvocationServiceOptions {

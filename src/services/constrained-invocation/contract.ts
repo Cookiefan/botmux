@@ -4,7 +4,7 @@ export const invocationRequest = z.object({
   requestId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
   prompt: z.string().min(1).max(512_000),
   model: z.string().trim().min(1).max(200),
-  reasoningEffort: z.enum(['low', 'medium', 'high', 'xhigh']).optional(),
+  reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional(),
   deadlineMs: z.number().int().min(100).max(300_000),
   outputSchema: z.record(z.unknown()),
 }).strict();
@@ -23,7 +23,7 @@ export interface InvocationResult {
   actualModel: string | null;
   reasoningEffort: string | null;
   usage: { inputTokens: number; outputTokens: number; cachedInputTokens: number | null; cacheWriteInputTokens: number | null } | null;
-  usageSource: 'native_thread_total' | null;
+  usageSource: 'native_thread_total' | 'native_result' | null;
 }
 
 /** Deliberately bounded JSON Schema subset. Unknown keywords never silently pass. */

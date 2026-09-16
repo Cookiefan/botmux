@@ -1,28 +1,36 @@
-# 程序调用 Codex 后台推理任务（实验版 v1）
+# 仅模型模式：接入自带 loop 的工具（实验版 v1）
 
-程序可以通过 `botmux session invoke` 提交一个问题，让 Codex 在后台思考并按指定 JSON 格式交回答案。程序可以查询结果、取消任务，也可以让 Codex 返回工具调用建议：例如 Codex 提议做加法，调用方执行加法，再把结果交给下一次推理。Codex 不直接操作宿主文件或执行命令。
+一些工具已经有自己的 Agent loop：它们负责组织上下文、选择并执行工具、检查结果，再决定是否继续调用模型。接入 Botmux 时，这类工具需要的是 CLI 背后的模型能力；如果直接使用普通编程会话，CLI 还会加载自己的工具、项目规则和历史，形成两套同时控制任务的循环。
 
-调用使用已有 Codex 原生登录。返回的 `tool_calls` 是调用方定义的数据，Botmux 不执行它们；这是通过原生 Agent 协议提供的调用入口。
+仅模型模式把这两个职责分开：**调用方掌握 loop，Botmux 提供统一的模型调用和任务管理入口，各 CLI 适配器负责原生登录与推理协议。** 调用方提交输入和期望的 JSON 格式，获得模型回答或工具调用建议，自行执行后再发起下一轮。工具名称、参数和业务流程由调用方定义，Botmux 不替调用方运行工具或拼接历史。
+
+例如：外部工具请求计算 19＋23 → 通过 Botmux 调用模型 → 模型返回加法建议 → 外部工具算出 42 → 再调用模型生成最终回答。换一个 CLI 应当只需要换 Bot 配置，外部 loop 使用的提交、查询、取消和去重契约保持一致。
+
+这是面向所有 CLI 的通用能力，不是 Codex 专用协议。当前实际实现了 Codex 与 Claude Code；能力查询会列出仓库全部 CLI，并明确标记其他适配器尚未实现，不能把统一接口理解成所有 CLI 已经可用。该接口也不等于任意第三方 SDK 可以直接替换 endpoint：调用方仍需对接本页的 `session invoke` / 签名 IPC 契约。
 
 ## 支持范围与前置条件
 
 | 条件 | 本版支持 |
 |---|---|
-| CLI | 原版 Codex；不设版本号白名单，运行时检查所需协议和隔离配置 |
-| 模型 | 调用方通过 `model` 指定，无名称白名单；从原生目录选择对应条目，保留原生传输方式并在本次调用中关闭工具 |
+| CLI | Codex、Claude Code；不设版本号白名单，使用各自原生协议 |
+| 模型 | 调用方通过 `model` 指定，无名称白名单；由对应 CLI 解析模型标识 |
 | 平台 | macOS、Linux；不支持 Windows |
-| Bot | 专用 `apiOnly: true`、`cliId: codex`、`codexAuthSync: isolated` |
-| 原生身份 | 专用 Bot 的原生 `auth.json`；不回退到全局或其他 Bot 登录 |
+| Bot | 专用 `apiOnly: true`；Codex 另需 `codexAuthSync: isolated` |
+| 原生身份 | Bot 专用目录下的原生凭证文件；不主动复制全局或其他 Bot 登录 |
 | 包装器/分发变体/自定义环境/启动命令 | 不支持；明确拒绝 |
 | 实例池、既有 app-server、触发人身份、显式后端/worker 限额、OS 沙箱配置 | 不支持；拒绝，避免绕过原有执行/身份策略 |
-| 其他 CLI | 暂未接入；普通交互模式不变 |
+| 其他 CLI | 统一能力发现已覆盖，原生执行适配尚未实现时明确返回不支持；普通交互模式不变 |
 | 管理策略 | 存在 managed requirements 或额外非空配置层时拒绝，不能绕过管理员配置 |
 
 首版只开放可信宿主 CLI → 签名 daemon IPC，不提供匿名 HTTP、IM 调用、按请求指定 owner、任意凭证目录或模型 endpoint。`applySessionOwnerEnv` 明确移除两个继承的 owner 变量。IM 用户身份委托、触发人凭证切换、普通会话续聊及 workflow trigger 接入暂不支持。
 
 调用是 headless 命名空间下独立的一次性资源，不是可发布/绑定的交互会话。它不进入普通 PTY/tmux worker 和交互 trigger 队列，不能通过 invocation ID 向普通会话 send/resume/steer。复用宿主 IPC 鉴权、Bot 配置/隔离身份、Bot admission gate、原生凭证 provisioning 和 daemon shutdown；专门的 invocation service 持有原生子进程及结果。进程复用/预热暂不支持。
 
-## 原生约束
+## 各 CLI 的原生适配
+
+通用服务只管理请求、并发、去重、deadline 和结果，不依赖 Codex 协议。`ModelOnlyAdapter` 定义原生执行、身份准入及专用凭证目录；新增适配器不会改变调用方接口。能力目录从 `ALL_CLI_IDS` 派生，新增 CLI 不会因漏填列表而从发现接口消失。
+
+### Codex
 
 每次调用独立 HOME、CODEX_HOME、空工作目录、临时原生线程，既不加载项目目录，也不 resume 历史。只通过已有 `provisionCodexAuth` 整体提供原生凭证文件，不提取 token，不自行调用订阅内部端点。临时刷新不会写回原 Bot 的原生登录，需由原登录目录维护凭证有效性。
 
@@ -31,6 +39,18 @@
 在发起模型请求前检查 config layers、effective features、managed requirements、空 instructionSources 和空 runtimeWorkspaceRoots。任何无法证明的条件都失败，不退回提示词约束、普通会话或自动批准。原生 server→client 工具/审批请求全部拒绝并终止调用。
 
 这些配置依赖原生协议能力，不再通过版本字符串判定兼容性。所需接口或隔离配置不可用时，调用会返回错误；放开版本和模型名称不代表已验证所有组合。管理员应选择可信的原版可执行文件，并在升级时运行下述空工具与恶意调用测试。
+
+### Claude Code
+
+通过原生 `--print --input-format stream-json --output-format stream-json` 执行一次推理，使用 `--tools ""` 关闭宿主工具、`--safe-mode` 关闭定制加载、`--strict-mcp-config` 配合空 MCP 配置，并关闭会话持久化。凭证整体复制到本次临时 `CLAUDE_CONFIG_DIR`，输入通过 stdin 传入，结果用原生 `--json-schema` 与本地校验双重约束。
+
+Claude 使用原生 `--tools ""` 关闭工具的接口见[官方 CLI 参考](https://code.claude.com/docs/en/cli-reference)。
+
+Claude 可能使用内部 `StructuredOutput` 工具完成 JSON 序列化；这不是文件、命令或调用方的业务工具。适配器只允许该内部工具，发现其他原生工具调用会终止任务。初始化中的工具列表及 MCP 列表也会检查。用量来自原生最终 result；缓存读写与未缓存输入合计为 `inputTokens`。
+
+### 其他 CLI
+
+所有已注册 CLI 使用同一能力发现接口；未实现原生适配的条目返回 `supported:false` 与 `native_model_only_adapter_not_implemented`。Claude 的 fork、Codex 的 fork、远端 Agent 服务和纯 TUI 不能仅凭血缘或相似参数自动标为支持：它们的登录、协议及工具开关需要分别验证。接入时实现 `ModelOnlyAdapter` 并增加原生工具隔离、输出校验与取消测试，生命周期和 IPC 不需要复制。
 
 ## 接入
 
@@ -57,9 +77,13 @@ botmux session invoke result --bot local_reasoner --request-id round-1 --wait-ms
 botmux session invoke cancel --bot local_reasoner --request-id round-1 --json
 ```
 
-build capability `constrained_invocation_v1` 声明接口存在；Bot capability 的 `supported` 声明配置可被准入，`runtimeVerified:false` 提醒尚未探测实际进程。每次 start 都重新检查实际原生运行时，不能仅凭 capability 响应认定订阅可用。
+build capability `model_only_invocation_v1` 声明接口存在（保留 `constrained_invocation_v1` 兼容标识）；Bot capability 的 `supported` 声明配置可被准入，`runtimeVerified:false` 提醒尚未探测实际进程。每次 start 都重新检查实际原生运行时，不能仅凭 capability 响应认定订阅可用。
 
-`request.json` 示例（`model` 可替换为原生目录中的其他模型名称）：
+Claude Code 使用同一启动方式，将 `BOTMUX_CORE_CLI` 改为 `claude-code`，在 `$STATE_DIR/bots/local_reasoner/claude` 放置该 Bot 的原生 `.credentials.json` 登录文件，请求中的 `model` 使用 Claude 支持的模型名称。该入口不读取 settings 中的 API key 或执行认证 helper；其他认证来源需要另外适配。
+
+`capabilities` 的 `mode` 为 `model_only`、`loopOwner` 为 `caller`，`adapters` 列出全部已注册 CLI 的接通状态。`supported:true` 仍不代表已经在线验证当前账号。
+
+`request.json` 示例（更换 CLI 时替换 `model`）：
 
 ```json
 {
@@ -104,20 +128,21 @@ build capability `constrained_invocation_v1` 声明接口存在；Bot capability
 
 同一 Bot 内相同 requestId + 相同规范化请求返回原记录；不同请求复用 ID 返回 409 `idempotency_conflict`。请求在推理前写入保留记录；不同 Bot 分目录。默认每个 Bot 最多 4 个并发，无隐藏排队。最大 deadline 300 秒，从服务接受时计算，包含启动。
 
-`--wait-ms` 到期返回 `running`，不取消后台调用。deadline 或 cancel 会终止整个原生进程组，1 秒后以 SIGKILL 兜底，确认子进程退出并清理临时目录后才写终态。终态为 `completed/failed/cancelled/timed_out`，可反复读取。daemon 正常关闭会取消所有 invocation；daemon 意外退出后的已接受请求标为 `interrupted_unknown_outcome`，不会自动重复推理。原生 stdio 在宿主进程死亡时关闭，原生进程退出；SIGKILL 可能留下权限为 0700 的临时目录，应由宿主临时目录保留策略清理。结果记录默认保留，不自动删除；删除记录也会删除该 ID 的幂等保护。
+`--wait-ms` 到期返回 `running`，不取消后台调用。deadline 或 cancel 会终止整个原生进程组，1 秒后以 SIGKILL 兜底，确认子进程退出并清理临时目录后才写终态。终态为 `completed/failed/cancelled/timed_out`，可反复读取。daemon 正常关闭会取消所有 invocation；daemon 意外退出后的已接受请求标为 `interrupted_unknown_outcome`，不会自动重复推理。Codex 在宿主输入管道关闭后退出；Claude 由独立的 POSIX 进程组守护器检查宿主进程身份，宿主死亡后终止整组进程；SIGKILL 可能留下权限为 0700 的临时目录，应由宿主临时目录保留策略清理。结果记录默认保留，不自动删除；删除记录也会删除该 ID 的幂等保护。
 
 返回指标：
 
-- `configuredModel` / `reasoningEffort`：原生 thread/start 回读；`actualModel:null` 表示协议未提供独立的实际执行模型证明。
-- `startupMs`：准备目录、启动进程及 thread/start 的总时间；`durationMs` 包含回收。均为实测，没有估计值。
-- `usage`：原生 `thread/tokenUsage/updated.total` 快照。每个 invocation 一个新线程，更新时替换，不累加通知；`inputTokens` 包含缓存输入，`cachedInputTokens` 是其中的子集，不能再加一次。
-- 未观测用量为 `usage:null`，缓存指标未知为 null，绝不补 0。`usageSource` 明确标为 `native_thread_total`。schema 校验等后期失败保留已观测的用量。
+- `configuredModel` / `reasoningEffort`：原生初始化回读；Codex 的 `actualModel:null` 表示协议未提供独立的实际执行模型证明，Claude 从原生 assistant 事件读取执行模型。
+- `startupMs`：准备目录、启动进程及原生初始化的总时间；`durationMs` 包含回收。均为实测，没有估计值。
+- `usage`：Codex 使用原生 `thread/tokenUsage/updated.total` 快照。每个 invocation 一个新线程，更新时替换，不累加通知；`inputTokens` 包含缓存输入，`cachedInputTokens` 是其中的子集，不能再加一次。
+- 未观测用量为 `usage:null`，缓存指标未知为 null，绝不补 0。`usageSource` 区分 Codex 的 `native_thread_total` 与 Claude 的 `native_result`。schema 校验等后期失败保留已观测的用量。
 
 ## 可复现验证
 
 ```bash
 bun run test -- test/constrained-invocation.test.ts test/ipc-constrained-invocation.test.ts
 BOTMUX_CONSTRAINED_CODEX=codex bun x vitest run --project e2e test/constrained-codex.e2e.ts
+BOTMUX_MODEL_ONLY_CLAUDE=claude bun x vitest run --project e2e test/model-only-claude.e2e.ts
 bun run build
 # 以下明确消耗现有订阅；只用合成加法 fixture，不发送 IM：
 BOTMUX_CONSTRAINED_AUTH_HOME="$NATIVE_CODEX_HOME" BOTMUX_CONSTRAINED_MODEL="$MODEL" bun scripts/smoke-constrained-invocation.ts

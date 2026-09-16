@@ -1,19 +1,4 @@
-/** Runtime capability checks, not a CLI-version or model-name allowlist. */
-export const constrainedCapabilities = {
-  schemaVersion: 1,
-  mode: 'structured_reasoning',
-  cli: 'codex',
-  versionPolicy: 'runtime_capabilities',
-  modelPolicy: 'caller_selected_native_catalog',
-  platforms: ['darwin', 'linux'],
-  hostTools: 'disabled',
-  customization: 'isolated_home_no_project_no_skills_no_history',
-  processReuse: false,
-  deadlineCancels: true,
-  waitTimeoutCancels: false,
-  schemaSubset: ['type', 'properties', 'required', 'additionalProperties:false', 'items', 'enum', 'description'],
-} as const;
-
+/** Codex-specific native configuration for the shared model-only contract. */
 export const CONSTRAINED_CODEX_CONFIG = `
 web_search="disabled"
 project_doc_max_bytes=0

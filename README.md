@@ -168,9 +168,9 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 
 自助建群服务可通过应用与群绑定的签名，为普通群声明默认 `ambient` 模式：无需 @ 即可对话，只 @ 其他成员时保持安静。功能默认关闭，群级显式设置优先，现有对话与操作权限仍然生效。配置、注册表协议和缓存限制见 [可信群默认模式](docs/signed-chat-defaults.md)。
 
-## 程序调用 Codex 后台推理
+## 接入自带 loop 的工具
 
-程序可通过实验版 [后台推理任务](docs/constrained-invocations.md) 提交问题、获取 JSON 结果、查询或取消任务。Codex 负责推理，工具调用建议由调用方执行。CLI 版本和模型名称没有白名单；首版使用文档列出的专用 core-only 配置。
+自带 Agent loop 的工具可使用实验版 [仅模型模式](docs/constrained-invocations.md)：调用方管理上下文和工具执行，Botmux 通过 CLI 提供模型推理、任务查询、取消及去重。接口面向所有 CLI，当前接通 Codex 与 Claude Code；其他 CLI 的实际支持状态由能力查询返回。
 
 ## 文档 · 社区 · 贡献
 
