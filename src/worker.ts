@@ -8442,12 +8442,12 @@ function clearPostHookEvidenceFallback(): void {
  * 快照型后端（ZMX 用 `zmx history` 取当前屏）不会把「原地重绘」当成 PTY 追加
  * 输出，已初始化的横幅只会走 screen resync，永远到不了 feed()，启动闸因此无法
  * 解除。这里主动拉一次权威画面补上这条证据；与 screenShowsReadyPattern() 同样
- * 必须用 rawSnapshot()：snapshot() 会过滤裸提示符行，scrollback 日志则会把
- * 早已被擦掉的旧横幅当成现状。
+ * 只读当前渲染视口，并保留横幅边框与列间距：默认 rawSnapshot() 仍会清理
+ * box drawing，导致适配器的结构正则永远不匹配；scrollback 日志则可能含旧横幅。
  */
 function observeStartupBannerOnScreen(): boolean {
   let screen = '';
-  try { screen = renderer?.rawSnapshot() ?? ''; } catch { return false; }
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
   if (!screen) return false;
   return idleDetector?.observeStartupScreen(screen) === true;
 }

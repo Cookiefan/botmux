@@ -15,6 +15,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { IdleDetector, stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
+import { normaliseZmxHistory } from '../src/adapters/backend/zmx-backend.js';
 
 const INITIALIZED_SCREEN = readFileSync(
   join(process.cwd(), 'test/fixtures/codex-startup/zmx-history-initialized.txt'),
@@ -46,6 +48,41 @@ function newDetector() {
   detector.onIdle(idle);
   return { detector, idle };
 }
+
+describe('codex 启动闸：真实 renderer 到检测器的链路', () => {
+  it.each(['\n', '\r\n'])('ZMX %j 换行的初始化横幅经 120x24 renderer 后仍能开闸', async (eol) => {
+    const renderer = new TerminalRenderer(120, 24);
+    const { detector } = newDetector();
+    try {
+      detector.feed(LOADING_SCREEN);
+      // 与 worker resync 一样：新 renderer + 等待解析完成；不能把夹具直接交给检测器。
+      await renderer.writeAndFlush(normaliseZmxHistory(INITIALIZED_SCREEN.replace(/\r?\n/g, eol)));
+      expect(detector.isStartupPending()).toBe(true);
+      expect(detector.observeStartupScreen(renderer.rawSnapshot({ preserveFormatting: true }))).toBe(true);
+      expect(detector.isStartupPending()).toBe(false);
+    } finally {
+      detector.dispose();
+      renderer.dispose();
+    }
+  });
+
+  it('旧的已初始化横幅滚出视口后不能给仍在 loading 的当前画面开闸', async () => {
+    const renderer = new TerminalRenderer(120, 24);
+    const { detector } = newDetector();
+    try {
+      detector.feed(LOADING_SCREEN);
+      await renderer.writeAndFlush(normaliseZmxHistory(`${INITIALIZED_SCREEN}\n${'old output\n'.repeat(24)}${LOADING_SCREEN}`));
+      const screen = renderer.rawSnapshot({ preserveFormatting: true });
+      expect(screen).not.toContain('model:       gpt-6-astra');
+      expect(screen).toContain('model:        loading');
+      expect(detector.observeStartupScreen(screen)).toBe(false);
+      expect(detector.isStartupPending()).toBe(true);
+    } finally {
+      detector.dispose();
+      renderer.dispose();
+    }
+  });
+});
 
 describe('codex 启动闸：夹具与适配器正则的契约', () => {
   const adapter = createCodexAdapter('/bin/codex');
@@ -158,7 +195,7 @@ describe('codex 启动闸：worker 侧接线', () => {
     const start = source.indexOf('function observeStartupBannerOnScreen');
     expect(start).toBeGreaterThan(-1);
     const body = source.slice(start, source.indexOf('\n}\n', start));
-    expect(body).toContain('renderer?.rawSnapshot()');
+    expect(body).toContain('renderer?.rawSnapshot({ preserveFormatting: true })');
     expect(body).toContain('idleDetector?.observeStartupScreen(');
     expect(body).not.toContain('recentTerminalLogTail');
     expect(body).not.toContain('renderer?.snapshot()');
