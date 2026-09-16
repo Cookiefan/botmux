@@ -7,6 +7,14 @@ vi.mock('../src/services/constrained-invocation/claude-runtime.js', async import
   ...await importOriginal<typeof import('../src/services/constrained-invocation/claude-runtime.js')>(),
   runClaudeInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
 }));
+vi.mock('../src/services/constrained-invocation/pi-runtime.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/services/constrained-invocation/pi-runtime.js')>(),
+  runPiInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
+}));
+vi.mock('../src/services/constrained-invocation/minimax-runtime.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/services/constrained-invocation/minimax-runtime.js')>(),
+  runMinimaxInvocation: vi.fn(async (request: any) => ({ output: { content: request.prompt }, configuredModel: request.model, actualModel: null, reasoningEffort: null, usage: null, usageSource: null, startupMs: 1 })),
+}));
 import { startIpcServer, setLarkAppId, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
@@ -33,9 +41,9 @@ it('requires host authentication even with core-only public routes enabled', asy
   }
   expect(runCodexInvocation).not.toHaveBeenCalled();
 });
-it.each(['codex', 'codex-app', 'claude-code'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
+it.each(['codex', 'codex-app', 'claude-code', 'pi', 'minimax'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
   const s = await start(cli); const path = '/api/headless/invocations';
-  const run = cli.startsWith('codex') ? runCodexInvocation : runClaudeInvocation;
+  const run = cli.startsWith('codex') ? runCodexInvocation : cli === 'pi' ? runPiInvocation : cli === 'minimax' ? runMinimaxInvocation : runClaudeInvocation;
   const invocation = { ...request, requestId: `round-${cli}` };
   const call = (method: string, target: string, body?: unknown) => fetchDaemonIpc(s.port, target, { method, ...(body ? { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } } : {}) }, secret);
   expect((await call('POST', path, invocation)).status).toBe(202);
@@ -46,7 +54,7 @@ it.each(['codex', 'codex-app', 'claude-code'])('accepts, retrieves and deduplica
   expect(result.result.configuredModel).toBe(request.model);
   expect(run).toHaveBeenCalledTimes(1);
   expect(vi.mocked(run).mock.calls[0][1]).toMatchObject({ ownerOpenId: undefined });
-  expect(vi.mocked(run).mock.calls[0][1].authHome).toMatch(cli.startsWith('codex') ? /\/codex$/ : /\/claude$/);
+  expect(vi.mocked(run).mock.calls[0][1].authHome).toMatch(new RegExp(`/${cli.startsWith('codex') ? 'codex' : cli === 'claude-code' ? 'claude' : cli}$`));
   expect((await call('POST', path, { ...request, requestId: 'forged-owner', ownerOpenId: 'ou_forged' })).status).toBe(400);
 });
 it('rejects an unsupported CLI without launching a worker', async () => {
@@ -79,3 +87,7 @@ it.each([
   expect(response.status).toBe(400);
   expect(runCodexInvocation).not.toHaveBeenCalled();
 });
+
+import { runPiInvocation } from '../src/services/constrained-invocation/pi-runtime.js';
+
+import { runMinimaxInvocation } from '../src/services/constrained-invocation/minimax-runtime.js';
