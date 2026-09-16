@@ -119,6 +119,7 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 
 - **命令注册只在 `src/core/command-schema.ts`**：名字/别名、会话政策（无会话时预建 / 不建 / 只对已有会话）、两条入口的前置特判位置、多行豁免、help 键。`DAEMON_COMMANDS` 等五个集合都从这张表推导，别再手写集合或在入口里加 `if (cmd === '/xxx')`。加命令 = 加一行 + `handleCommand` 加 case，`test/command-schema.test.ts` 会红到两边对齐。
 - **路由判定的任何变化都会让 `test/command-router-oracle-diff.test.ts` 变红**：它把 `test/legacy-oracle/` 里冻结的老判定（零 src import）与新路由器在 ≈269 万组输入上逐字差分。红了先判断是回归还是有意变化；有意变化要同时登记到差分测试的 `INTENTIONAL` 名单和设计文档 §9 的有意变化表，别去改 oracle。
+- **话题指令头也只在 `src/core/topic-header.ts` 解析**：`/t` `/topic` 与生命周期别名 `/th` `/tw`（= `/t here|worktree`）、`/repo wt <目标> [分支]` 都由它给出 `TopicHeader`，入口不做正则预判；相斥组合（生命周期变体 + `/repo`）由 `topic-spec.ts` 拒绝，不做静默优先级。
 - **会话相位**（`session-phase.ts`）由现有旗标推导，`ds.cliReady` / `cliReadyGeneration` 只由 worker 的 `prompt_ready` 置位、不由 `ready` 清零；runtime 级联（`cli-idle-wait.ts` + daemon 的 `runPassthroughCascade`）只在 PTY 家族后端、非 adopt 会话上跑。
 
 ## 飞书 owner 身份边界（setup/onboarding 改动必读）

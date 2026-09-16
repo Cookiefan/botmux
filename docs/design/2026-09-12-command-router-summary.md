@@ -41,3 +41,13 @@
 - 验证：`bun run build`；`bun run vitest run test/command-schema.test.ts test/command-router-oracle-diff.test.ts test/legacy-oracle test/daemon-rename-route.test.ts test/topic-directive-header.test.ts`；全量单测与 master 基线一致（红的只有环境相关的 e2e）。真实 CLI 时序按设计文档 §10 手动项 dogfood。
 - 加一条 daemon 命令：`command-schema.ts` 加一行 → `handleCommand` 加 case → 两个测试红了照着改 → 改 `slash-commands.md`（doc-sync 守卫会提醒）。
 - 改路由判定：差分红了先判断是回归还是有意变化；有意变化同时写进 `INTENTIONAL` 名单与设计文档 §9，不要改 oracle。
+
+## 6. 2026-09-16 更新：rebase 到主干后又收了两口
+
+分支 rebase 到 dc7b4e63（40 个主干提交）。语义化合并里最重要的一条：主干 #956 已经把 `/tw` 做成了
+"force + 显式分支 + 落盘可恢复"的建 worktree 机制，本分支自己那份更弱的头部 worktree 腿被删掉、改为
+复用它——头部 `/repo wt` 从此重启可恢复。合并后顺手把主干散在入口里的 `/th` `/tw` `/t here|worktree`
+正则预判收进了指令头解析器（解析只有一处），`/tw /repo x` 这种相斥组合由静默丢 `/repo` 改为拒绝；
+schema 里没有消费者的 `argShape` / `subcommands` 删掉了——一张表只说它守得住的话。理想终态的六条
+与到达路径见设计文档 §16。
+

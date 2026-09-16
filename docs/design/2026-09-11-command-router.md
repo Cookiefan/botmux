@@ -166,6 +166,8 @@ type SessionPhase =
 
 矩阵一旦成文，路由里的前置特判（含两条路径今天的不一致，§3 第 9 层）、`isInitialSessionPassthrough`、`topicHeaderDeclaresSpec` 都由它替代。
 
+**2026-09-16 收敛**：上面这句没有兑现，也不再打算兑现。路由器只消费两个谓词（`phaseHasSession` / `phaseHasLiveWorker`），本表是**行为文档**而不是代码里的数据；九相位枚举为日志/看板与 `deriveSessionPhase` 的直接测试保留（§16.1 第 4 条）。要把某一格从"今天行为"改成"矩阵行为"，走 §9 有意变化。
+
 ## 6. 计划与执行
 
 解析结果（AST）经 planner 变成有序效果列表：
@@ -234,6 +236,11 @@ type SessionPhase =
 | `/repo wt` 用法串与帮助行不一致（zh/en） | 两条互相矛盾 | 由 schema 生成一条 | 自相矛盾的东西修好必然改掉一条 | PR-2 |
 | thread 路径 `/card` `/cot` 的前置特判 | 与新话题路径不一致（§3 第 9 层） | 两条路径同一张矩阵 | 收敛；行为上 `/card`/`/cot` 在 thread 里本就不需要会话 | PR-2 |
 | 会话内"命令行 ⏎ 正文" | `parseSlashCommandInvocation` 因多行拒掉，整条当纯文本转发，`/xxx` 成为 prompt 里的字面文字 | 逐行排队（§6 级联） | 今天的行为几乎不可能是用户意图；这是唯一一处对"今天已接受输入"的语义变化 | PR-3 |
+| 头部 `/repo wt` 的落盘形状 | PR-1 首版：按 `picker` 落盘（重启后回选仓卡） | `auto_worktree` + `force` + `branch`（与主干 `/tw` 同形；重启后按分支重建，目录已存在则 fail closed 停在 pendingRepo） | 复用主干 #956 的机制，不再自带一份更弱的 | rebase 2026-09-16 |
+| `/tw /repo x`、`/th /repo wt …`（生命周期变体 + `/repo`） | 主干：静默按生命周期目录、把 `/repo` 丢掉 | 拒（`lifecycle_conflicts_repo`） | fail closed（D5）；一个说"用当前目录"、一个点名仓库 | rebase 2026-09-16 |
+| `标题 /tw 干活` | 主干：正则锚在行首，不识别为生命周期头部（topic 模式群里按普通消息开话题，无标题、无 worktree） | 带标题的生命周期头部 | 解析只有一处（§16.1 第 1 条） | rebase 2026-09-16 |
+| chat 模式群里的 `/tw` `/th` | 主干：不是 `/t` 头部，不强制开话题（落进群会话） | 与 `/t` 同：强制开新话题；触发 API 里同为保留命令（`FORCE_TOPIC_COMMANDS`） | 同上 | rebase 2026-09-16 |
+| 已有会话的话题里发 `/tw 干活` | 主干：当普通输入送进 CLI（`/tw` 成为字面文本） | 回「指令头只在新话题第一条生效」 | `topicHeaderDeclaresSpec` 计入 lifecycle | rebase 2026-09-16 |
 
 ## 10. 验证
 
@@ -385,3 +392,41 @@ PR-2 收口（有意变化落地）：thread 入口的 `/card` `/cot` 改为与�
 - riff / mojo / adopt 上的多行透传消息从"整条转发"变成 `cascade_unsupported` 拒绝——这是设计选择（fail closed 而非静默错序），已在 §9/§13 登记；若 dogfood 里发现有人依赖旧行为，退回整条转发是一行改动。
 
 补测（2026-09-12 03:00，额度窗口重置后的 re-trigger）：`test/session-phase.test.ts` 直接钉 `deriveSessionPhase` 的优先级与两个谓词（此前差分把相位当输入轴，推导本身零覆盖）；`daemon-rename-route.test.ts` 补 thread 无会话 `/term` 不建会话的用例。§9 里仍缺的只剩 `/vc-auth` daemon 级用例（需要 VC 配置夹具）与裸 `/repo` 含空格路径的实例（command-handler 的 /repo 用例没有可克隆的路径形态夹具），留给 dogfood 之后。
+
+### 2026-09-16 rebase 到主干 dc7b4e63 与语义化合并
+
+40 个主干提交、18 个两边都动过的文件；逐提交 rebase（保留三期分界），备份 tag
+`backup/command_op-pre-rebase-20260916`。决策过程全部在 §16.2；rebase 之后的两个收口提交：
+「生命周期变体收进指令头解析器」「删 schema 里无消费者的 argShape/subcommands」。验证：`bun run build`
++ 全量 vitest（与 master 基线相比只多 0 条失败；`daemon-rename-route` 的 `/tw` targetSubdir 用例在本机
+master 上同样红，见 §16.2）。
+
+## 16. 理想终态与到达路径（2026-09-16）
+
+### 16.1 我认为的理想终态（六条，逐条标今天到哪了）
+
+1. **解析只有一处。** 任何"从原文判断这是什么"的逻辑——`/t` 头部、生命周期变体、斜杠命令、级联切分——都在 `core/` 的纯函数里；daemon 入口不含正则，只做"取上下文 → 调分类 → 按决策执行"。今天：✅（rebase 后把主干 #956 的 `/th` `/tw` 正则预判也收进了 `parseTopicHeader`）。dispatcher 侧的 pre-routing 命令（`/reply-mode` `/grant` `/tabs` …）仍各自判定——它们在切面 1 之前，属另一层，不在本设计范围。
+2. **一张表只说它守得住的话。** schema 登记的每个字段都有消费者与守卫；没有消费者的字段不进表。今天：✅（删了 `argShape` / `subcommands`）。`/help` 与用法串仍手写，但 help 键由守卫钉住，写错会红。
+3. **执行只有一份。** 两条入口对同一决策的执行只有一份代码（形如 `executeSlashDecision(decision, ctx)`）；入口差异——chat/thread 的 anchor、canTalk/canOperate 的参数、`/sessions` 的顶层回贴、级联仅 thread——成为显式的 ctx 字段，而不是两份平行代码。今天：❌ 各一份约 240 行，见 16.3。
+4. **相位只声称路由用到的粒度。** 路由只区分"有没有会话 / 有没有活 worker"两档；九相位枚举保留给日志/看板，`deriveSessionPhase` 有直接测试；§5 矩阵是行为文档不是数据。今天：✅（文档收敛，代码不变）。
+5. **oracle 有退役条件。** oracle = "上一个发布基线的判定"。rebase 到主干时同步主干**新增的命令集合**（不改 oracle 的判定逻辑，本次 `/cleanup-wt` 即是）；发布一个版本并稳定后重新冻结为该版本，INTENTIONAL 清零。今天：✅ 规则写下并执行了一次。
+6. **真实 CLI 验证过。** 级联的 3s 忙态宽限与 120s 上限在真 CLI 上 dogfood 过，`/model` 这类回显慢的命令不会被误判空闲。今天：❌（本 worktree 不能重启 daemon，见 §15 末尾）。
+
+### 16.2 2026-09-16 的决策过程
+
+- **rebase 策略**：逐提交 rebase、不 squash（用户要求每期有明确分界 commit 即可）。四处冲突，其余自动合并后逐 hunk 与主干 diff 复核（thread 入口的 diff 恰好只含本分支的改动，主干的跨 principal 代码无一丢失）。
+- **冲突 1（PR-1 × #956 话题工作区生命周期）**：主干把 `/tw` 做成了 `force` + 确定性 `worktreePath/branch` + `reuseExisting` + `PendingRepoSetup` 落盘可恢复的通用机制；本分支自己写的 `createExplicitWorktree` 与之同构但更弱（不落盘、失败提示自造）。**决策：删自己的**，头部 `/repo wt` 改走 `startAutoWorktreePending({ force: true, branch })`，落盘从 `picker` 改成 `auto_worktree + force + branch`（§9 有意变化）。主干 force 失败的硬编码提示「可发送 /tw 重试」改为 i18n 的 `cmd.repo.worktree_failed` + `choose_repo_no_card`：thread 入口并不识别 `/tw`，那条提示会把用户引去发一条被当普通输入暂存的消息。`isValidBranchName` / `resolveWorktreePathForBranch` 两个 helper 保留——它们服务的是"开话题前"的 fail closed 校验，主干的建库腿自己算目录时与之逐字一致。
+- **冲突 2（PR-2 × #956 新增 `/cleanup-wt`）**：同步进 schema（sessionless）与 oracle 的两张集合，oracle 头注把基线从 7de08289 改成 dc7b4e63。这是基线前移，不是路由器改动，差分测试不需要 INTENTIONAL。
+- **冲突 3（PR-2 × #1424/#1406 跨身份分流）**：daemon.ts 出现一个 1900 行 × 190 行的巨块冲突（git 把主干新增的 xpi 代码与本分支的入口改写判成同一块）。**决策：取主干版本，再把本分支 PR-2 的 17 个 hunk 重放**，1 个 reject 手工合并——主干给新话题入口的冷启动透传加了 `forceTopicMode !== 'worktree'` 闸（`/tw /<透传>` 要先建 worktree 再起 CLI），保留。
+- **冲突 4（wiring 守卫）**：`inThread: !!parsed.threadId` 计数 5 → 7（主干 +2 跨 principal envelope）→ 8（本分支 +1 级联）。
+- **合并后发现的 wart → 生命周期收口**：主干把 `/th` `/tw` `/t here|worktree` 做成入口里的两条正则 + 一次改写，command-handler 里还留一份只给测试用的同构 `parseForceTopicInvocation`；与头部 `/repo` 相遇只能静默优先。这与 R1/R4 直接冲突。**决策：收进 `parseTopicHeader`**（`header.lifecycle`），相斥交 `resolveTopicSpec` 拒；`/th` `/tw` 进 `FORCE_TOPIC_COMMANDS`；三条有意变化登记 §9；docs-site 补一行（此前 `/th` `/tw` 在文档里完全没有）。
+- **删 `argShape` / `subcommands`**：无消费者、无守卫的字段是 §15"承诺 vs 代码"差距的来源；留着就是一张会悄悄过期的表。删掉比留着诚实（16.1 第 2 条）。
+- **本机预存失败**：`daemon-rename-route.test.ts` 里 `/tw` 的 `targetSubdir: packages/app` 用例在 canonical 的 master 上同样红——macOS 下 `tmpdir()` 是 `/var/...` 而 `git worktree` 回报 `/private/var/...`，`relative()` 算出 `../..` 被安全闸丢掉。不是本分支引入，不在本分支修。
+
+### 16.3 没做的与建议的做法
+
+- **执行段合一（16.1 第 3 条）**——建议作为 PR-4，分三步、每步可独立合入：① 把两条入口的执行段各自抽成 `executeNewTopicSlash(ctx)` / `executeThreadSlash(ctx)` 两个函数（纯搬家，daemon 级测试不动）；② 对齐两个 ctx 的字段名与顺序；③ 合成一个函数，差异点用 `ctx.entry: 'newTopic' | 'thread'` 分支，每个分支点一条用例。风险在 daemon.ts 的 24k 行与现有测试对入口分支的覆盖不全，所以先做 ①——它已经把"两份"变成"两个能并排看的函数"，而不引入任何行为变化。
+- **`/help` 从 schema 生成**：要为每条命令定义分节与顺序，本质是文案重排；今天守卫已保证键不漏，收益低于成本，不做。
+- **dispatcher 层的 pre-routing 命令进表**：`/reply-mode` `/grant` `/tabs` 等在切面 1 之前判定，与 daemon 命令不是一个层；若要统一，是另一份设计。
+- **dogfood**：§15 末尾的清单不变，第一件仍是级联的 3s 忙态宽限对 `/model` 是否合适。
+
