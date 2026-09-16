@@ -8449,7 +8449,14 @@ function observeStartupBannerOnScreen(): boolean {
   let screen = '';
   try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
   if (!screen) return false;
-  return idleDetector?.observeStartupScreen(screen) === true;
+  if (idleDetector?.observeStartupScreen(screen) !== true) return false;
+  log(`${cliName()} initialized banner observed on screen; releasing the startup hold`);
+  // Initialization is not an idle/turn boundary. It only lifts the startup veto
+  // on adapters that already permit input while busy. Re-kick their held queue
+  // through the normal writer (which retains restart, principal, hook-review,
+  // and submission-recovery gates), without publishing a false prompt_ready.
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+  return true;
 }
 
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
@@ -10791,12 +10798,17 @@ async function onBackendScreenResync(snapshot: string): Promise<void> {
   const visibleSnapshot = nextRenderer?.rawSnapshot() ?? '';
   lastAnalyzerSnapshot = visibleSnapshot;
   refreshHookReviewInputHold(visibleSnapshot);
+  if (awaitingFirstPrompt && idleDetector?.isStartupPending()) {
+    observeStartupBannerOnScreen();
+  }
 
   // ZMX history does not carry the authoritative current PTY dimensions. A
   // local `zmx attach` can resize the session below our default 120x24 and that
   // size persists after detach, so even the rendered tail may include rows just
-  // above the real viewport. Never synthesize Enter/Down from a full-history
-  // resync. For the same reason, do not feed history into IdleDetector: an old
+  // above the real viewport. Never synthesize dialog-acceptance Enter/Down from
+  // a full-history resync. The startup observation above only releases the
+  // monotonic loading veto for already-permitted type-ahead input, not idle.
+  // Do not feed history into IdleDetector: an old
   // ready/completion marker just above the real viewport could otherwise flush
   // queued input into a CLI that is still busy. Later append-only history deltas
   // still flow through onPtyData; structured transcript completion remains
@@ -17263,9 +17275,7 @@ async function spawnCli(
     // branch terminal, and a hold that nothing can ever release silently
     // swallows the queued messages for the lifetime of the session.
     if (idleDetector?.isStartupPending()) {
-      if (observeStartupBannerOnScreen()) {
-        log(`${cliName()} initialized banner observed on screen; releasing the startup hold`);
-      }
+      observeStartupBannerOnScreen();
     }
     if (idleDetector?.isStartupPending()) {
       log(`First prompt timeout — ${cliName()} still initializing; keeping input queued`);
