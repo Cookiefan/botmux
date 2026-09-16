@@ -345,7 +345,7 @@ describe('restoreActiveSessions — narrow XPI recovery containment', () => {
     }];
     sessionStore.updateSession(stale);
     const healthy = makeActivePersistentSession('om_healthy_peer');
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -374,7 +374,7 @@ describe('restoreActiveSessions — narrow XPI recovery containment', () => {
       session.xpiSharedCwdAdmissionCoordinatorSessionId = coordinator.sessionId;
       sessionStore.updateSession(session);
     }
-    sessionStore.init();
+    sessionStore.init('app_test');
     const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
     const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
       if (ids.includes(coordinator.sessionId)) throw new Error('synthetic group persistence failure');

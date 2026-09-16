@@ -161,7 +161,7 @@ describe('mutateOwnedSessionsAtomically()', () => {
     expect(outcome.result).toBe('committed');
     expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
     expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
-    init();
+    init('test-app');
     expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
     expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
   });
@@ -181,14 +181,14 @@ describe('mutateOwnedSessionsAtomically()', () => {
     expect(first.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
     expect(second.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
     __testOnly_setBeforeRowPersist(undefined);
-    init();
+    init('test-app');
     expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
     expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
   });
 
   it('fails fast without publishing cache or disk when nonblocking lock acquisition is busy', () => {
     const first = createSession('chat-a', 'root-a', 'A');
-    const writer = new DatabaseSync(join(tempDir, 'sessions.db'));
+    const writer = new DatabaseSync(sessionStorePath(tempDir, 'test-app'));
     writer.exec('PRAGMA busy_timeout = 0;');
     writer.exec('BEGIN IMMEDIATE;');
     const startedAt = performance.now();
@@ -207,7 +207,7 @@ describe('mutateOwnedSessionsAtomically()', () => {
       rows.get(first.sessionId)!.xpiSharedCwdAdmissionGroupId = 'after-lock-release';
     }, { nonblocking: true });
     expect(first.xpiSharedCwdAdmissionGroupId).toBe('after-lock-release');
-    init();
+    init('test-app');
     expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('after-lock-release');
   });
 });
@@ -230,7 +230,7 @@ describe('createSessionWithOwnedMutation()', () => {
     expect(created.result).toBe(created.session.sessionId);
     expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
     expect(getOwnedSession(created.session.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
-    init();
+    init('test-app');
     expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
     expect(getOwnedSession(created.session.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
   });
@@ -279,7 +279,7 @@ describe('createSessionWithOwnedMutation()', () => {
     expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBeUndefined();
     expect(childId && getOwnedSession(childId)).toBeUndefined();
     __testOnly_setBeforeRowPersist(undefined);
-    init();
+    init('test-app');
     expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBeUndefined();
     expect(childId && getOwnedSession(childId)).toBeUndefined();
   });
@@ -287,7 +287,7 @@ describe('createSessionWithOwnedMutation()', () => {
   it('does not publish a child or parent mutation when nonblocking BEGIN is busy', () => {
     const parent = createSession('chat-a', 'root-a', 'parent');
     const beforeIds = listSessionsStrict().map(session => session.sessionId);
-    const writer = new DatabaseSync(join(tempDir, 'sessions.db'));
+    const writer = new DatabaseSync(sessionStorePath(tempDir, 'test-app'));
     writer.exec('PRAGMA busy_timeout = 0;');
     writer.exec('BEGIN IMMEDIATE;');
     const startedAt = performance.now();
