@@ -157,6 +157,26 @@ describe('XPI switch — agent-facing `--as` guidance', () => {
 });
 
 describe('XPI switch — worker.ts authority gates (source-pinned)', () => {
+  // worker.ts reads the switch through its own symbol, not the daemon's
+  // `config.crossPrincipalInterruption`. Every gate below is pinned by its CALL
+  // SITE, and those call sites stay textually intact even if this body stopped
+  // consulting the shared accessor — so without this case a worker hardwired to
+  // a constant passes the whole file. That failure mode is worse than the
+  // config-cache skew the two sides can already have: a skew self-heals inside
+  // the 2s TTL, a hardwired worker disagrees with the daemon forever.
+  it('the worker gate delegates to the shared accessor rather than a constant', () => {
+    const start = workerSource.indexOf('function crossPrincipalIsolationOn(): boolean {');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
+    expect(body).toContain('return isCrossPrincipalInterruptionEnabled();');
+    expect(body).not.toMatch(/return\s+(?:true|false)\s*;/);
+    // The import must be the real one, so the delegation cannot be satisfied by
+    // a local stub that shadows the accessor's name.
+    expect(workerSource).toMatch(
+      /import \{[^}]*\bisCrossPrincipalInterruptionEnabled\b[^}]*\} from '\.\/global-config\.js';/s,
+    );
+  });
+
   it('activeTurnBlocks short-circuits to false before consulting the authority', () => {
     const start = workerSource.indexOf('function activeTurnBlocks(input: {');
     expect(start).toBeGreaterThanOrEqual(0);
