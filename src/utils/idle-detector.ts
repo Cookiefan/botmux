@@ -298,6 +298,51 @@ export class IdleDetector {
     return this.startupPending && !this.startupComplete;
   }
 
+  /**
+   * Startup-banner evidence read from an authoritative screen snapshot.
+   *
+   * feed() is the only other source of that evidence, and on a snapshot-based
+   * backend it cannot carry it: ZMX's screen source is `zmx history`, which
+   * returns the current screen instead of an append-only byte stream. Only a
+   * snapshot that extends the previous one is published as PTY data; an
+   * in-place repaint — exactly what `model: loading` → `model: <real>` is — is
+   * published as a screen resync, which deliberately never reaches feed(). The
+   * startup hold could therefore never be released on that backend and queued
+   * input was held for the lifetime of the session.
+   *
+   * Deliberately narrower than feed(): it touches ONLY the startup latch, never
+   * outputTail / readySeen / spinner / quiescence state, and it neither arms
+   * nor fires a timer. Releasing the hold is not a claim that the CLI can
+   * accept a submit — readyPattern plus quiescence (or the worker's hard cap)
+   * still gate that independently. It does lift a veto: a quiescence check that
+   * fed data had already armed, and that isStartupPending() was rejecting, can
+   * complete afterwards. That is the point of the hold, not a bypass of it —
+   * the evidence behind that check still came from feed().
+   *
+   * Unlike feed(), ready does NOT win unconditionally here. A snapshot carries
+   * spatial order, and history includes scrollback: an initialized banner left
+   * above the viewport by an earlier CLI generation must not release a hold
+   * that the live banner still reports as loading. The lower banner wins.
+   *
+   * Returns true only on the transition that completes startup (for logging).
+   */
+  observeStartupScreen(screen: string): boolean {
+    if (this.startupComplete || !this.startupPendingPattern) return false;
+    const text = this.stripAnsi(screen);
+    const pendingAt = lastMatchIndex(this.startupPendingPattern, text);
+    const readyAt = this.startupReadyPattern
+      ? lastMatchIndex(this.startupReadyPattern, text)
+      : -1;
+    if (readyAt >= 0 && readyAt > pendingAt) {
+      this.startupComplete = true;
+      this.startupPending = false;
+      this.startupTail = '';
+      return true;
+    }
+    if (pendingAt >= 0) this.startupPending = true;
+    return false;
+  }
+
   dispose(): void {
     this.clearTimer();
     this.idleCallback = null;
