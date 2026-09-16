@@ -33,9 +33,9 @@ it('requires host authentication even with core-only public routes enabled', asy
   }
   expect(runCodexInvocation).not.toHaveBeenCalled();
 });
-it.each(['codex', 'claude-code'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
+it.each(['codex', 'codex-app', 'claude-code'])('accepts, retrieves and deduplicates with the same contract for %s', async cli => {
   const s = await start(cli); const path = '/api/headless/invocations';
-  const run = cli === 'codex' ? runCodexInvocation : runClaudeInvocation;
+  const run = cli.startsWith('codex') ? runCodexInvocation : runClaudeInvocation;
   const invocation = { ...request, requestId: `round-${cli}` };
   const call = (method: string, target: string, body?: unknown) => fetchDaemonIpc(s.port, target, { method, ...(body ? { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } } : {}) }, secret);
   expect((await call('POST', path, invocation)).status).toBe(202);
@@ -46,7 +46,7 @@ it.each(['codex', 'claude-code'])('accepts, retrieves and deduplicates with the 
   expect(result.result.configuredModel).toBe(request.model);
   expect(run).toHaveBeenCalledTimes(1);
   expect(vi.mocked(run).mock.calls[0][1]).toMatchObject({ ownerOpenId: undefined });
-  expect(vi.mocked(run).mock.calls[0][1].authHome).toMatch(cli === 'codex' ? /\/codex$/ : /\/claude$/);
+  expect(vi.mocked(run).mock.calls[0][1].authHome).toMatch(cli.startsWith('codex') ? /\/codex$/ : /\/claude$/);
   expect((await call('POST', path, { ...request, requestId: 'forged-owner', ownerOpenId: 'ou_forged' })).status).toBe(400);
 });
 it('rejects an unsupported CLI without launching a worker', async () => {

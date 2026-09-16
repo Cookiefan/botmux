@@ -18,12 +18,19 @@ export interface ModelOnlyAdapter {
   run(request: InvocationRequest, runtime: ModelOnlyRuntime, signal: AbortSignal): Promise<NativeInvocationOutput>;
 }
 
-const adapters: ReadonlyMap<string, ModelOnlyAdapter> = new Map<string, ModelOnlyAdapter>([
-  ['codex', {
-    cli: 'codex', authSubdir: 'codex', nativeProtocol: 'app-server', modelPolicy: 'caller_selected_native_catalog',
+function codexAdapter(cli: 'codex' | 'codex-app'): ModelOnlyAdapter {
+  return {
+    cli, authSubdir: 'codex', nativeProtocol: 'app-server', modelPolicy: 'caller_selected_native_catalog',
     acceptsIdentity: bot => bot.codexAuthSync === 'isolated',
     run: (request, runtime, signal) => runCodexInvocation(request, { ...runtime, catalogPath: join(runtime.authHome, 'models_cache.json') }, signal),
-  }],
+  };
+}
+
+const adapters: ReadonlyMap<string, ModelOnlyAdapter> = new Map<string, ModelOnlyAdapter>([
+  ['codex', codexAdapter('codex')],
+  // Both identities resolve to the same native executable. Model-only calls
+  // start a private app-server; the daemon gate rejects attached/shared servers.
+  ['codex-app', codexAdapter('codex-app')],
   ['claude-code', {
     cli: 'claude-code', authSubdir: 'claude', nativeProtocol: 'print-stream-json', modelPolicy: 'caller_selected',
     acceptsIdentity: () => true,
