@@ -8,6 +8,9 @@ import { runCodexInvocation } from './codex-runtime.js';
 import { runClaudeInvocation } from './claude-runtime.js';
 import { runMinimaxInvocation } from './minimax-runtime.js';
 import { runPiInvocation } from './pi-runtime.js';
+import { runGeminiInvocation } from './gemini-runtime.js';
+import { runOpenCodeInvocation } from './opencode-runtime.js';
+import { modelOnlyAssessments } from './support-status.js';
 
 /** Each CLI implements its own native inference/auth contract. Interactive CLI
  * arguments and agent loops must never be reused as a model-only fallback. */
@@ -46,6 +49,14 @@ const adapters: ReadonlyMap<string, ModelOnlyAdapter> = new Map<string, ModelOnl
     cli: 'pi', authSubdir: 'pi', nativeProtocol: 'print-json', modelPolicy: 'caller_selected_native_catalog',
     acceptsIdentity: () => true, run: runPiInvocation,
   }],
+  ['gemini', {
+    cli: 'gemini', authSubdir: 'gemini', nativeProtocol: 'headless-stream-json-policy', modelPolicy: 'caller_selected_native_catalog',
+    acceptsIdentity: () => true, run: runGeminiInvocation,
+  }],
+  ['opencode', {
+    cli: 'opencode', authSubdir: 'opencode', nativeProtocol: 'run-json-policy', modelPolicy: 'caller_selected_native_catalog',
+    acceptsIdentity: () => true, run: runOpenCodeInvocation,
+  }],
 ]);
 
 export function modelOnlyAdapter(cliId: string): ModelOnlyAdapter | undefined { return adapters.get(cliId); }
@@ -58,7 +69,8 @@ export function modelOnlyAdapterCapabilities() {
     return {
       cli, supported: !!adapter, runtimeVerified: false,
       nativeProtocol: adapter?.nativeProtocol ?? null,
-      reason: adapter ? null : 'native_model_only_adapter_not_implemented',
+      reason: adapter ? null : modelOnlyAssessments[cli].reason,
+      assessment: modelOnlyAssessments[cli],
     };
   });
 }

@@ -12,3 +12,16 @@ it('normalizes only complete native usage without fabricating missing cache coun
   expect(piUsage({ input: 10, output: 5 })).toBeNull();
   expect(piUsage({ input: -1, output: 5, cacheRead: 0, cacheWrite: 0 })).toBeNull();
 });
+
+import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
+import { modelOnlyAdapter, modelOnlyAdapterCapabilities } from '../src/services/constrained-invocation/adapters.js';
+import { modelOnlyAssessments } from '../src/services/constrained-invocation/support-status.js';
+it('assesses every CLI and keeps implementation claims aligned with executable adapters', () => {
+  expect(Object.keys(modelOnlyAssessments).sort()).toEqual([...ALL_CLI_IDS].sort());
+  for (const row of modelOnlyAdapterCapabilities()) {
+    expect(row.assessment.status === 'implemented').toBe(!!modelOnlyAdapter(row.cli));
+    expect(row.runtimeVerified).toBe(false);
+    expect(row.assessment.detail.length).toBeGreaterThan(20);
+    if (!row.supported) expect(row.reason).toBeTruthy();
+  }
+});

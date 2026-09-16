@@ -5,6 +5,7 @@ import { botHomePath } from '../../adapters/cli/read-isolation.js';
 import { InvocationService } from './service.js';
 import { rawCliExecutable } from '../../adapters/cli/registry.js';
 import { modelOnlyAdapter, modelOnlyAdapterCapabilities, modelOnlyCapabilities } from './adapters.js';
+import { modelOnlyAssessments } from './support-status.js';
 
 const services = new Map<string, InvocationService>();
 
@@ -20,7 +21,7 @@ export function invocationCapabilityForBot(botId: string): Record<string, unknow
     && Object.keys(bot.env ?? {}).length === 0;
   return { ...modelOnlyCapabilities, cli: bot.cliId, modelPolicy: adapter?.modelPolicy ?? null,
     supported, runtimeVerified: false,
-    reason: supported ? null : adapter ? 'requires_dedicated_core_only_isolated_auth' : 'native_model_only_adapter_not_implemented',
+    reason: supported ? null : adapter ? 'requires_dedicated_core_only_isolated_auth' : modelOnlyAssessments[bot.cliId].reason,
     adapters: modelOnlyAdapterCapabilities(),
   };
 }
