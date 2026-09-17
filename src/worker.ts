@@ -8459,6 +8459,16 @@ function observeStartupBannerOnScreen(): boolean {
   return true;
 }
 
+/** ZMX's complete cached history can carry a restoration header that no
+ * synthetic renderer viewport retains. Both resync and append-only captures
+ * update this cache before notifying us; neither path may strand startup. */
+function observeRestoredStartupHistory(): void {
+  if (!awaitingFirstPrompt || !(backend instanceof ZmxBackend)) return;
+  if (!idleDetector?.observeStartupHistory(backend.captureCurrentScreen())) return;
+  log(`${cliName()} restored history observed; releasing the startup hold`);
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+}
+
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
 function screenShowsReadyPattern(): boolean {
   const pattern = cliAdapter?.readyPattern;
@@ -10746,6 +10756,7 @@ function onPtyData(data: string): void {
   lastPtyOutputAtMs = Date.now();
   ptyOutputGeneration.observe();
   idleDetector?.feed(data);
+  observeRestoredStartupHistory();
 }
 
 /**
@@ -10798,8 +10809,10 @@ async function onBackendScreenResync(snapshot: string): Promise<void> {
   const visibleSnapshot = nextRenderer?.rawSnapshot() ?? '';
   lastAnalyzerSnapshot = visibleSnapshot;
   refreshHookReviewInputHold(visibleSnapshot);
-  if (awaitingFirstPrompt && idleDetector?.isStartupPending()) {
+  if (awaitingFirstPrompt && !idleDetector?.isStartupComplete()) {
     observeStartupBannerOnScreen();
+    // The async-write/generation fence also protects history startup evidence.
+    observeRestoredStartupHistory();
   }
 
   // ZMX history does not carry the authoritative current PTY dimensions. A

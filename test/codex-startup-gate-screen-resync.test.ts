@@ -23,6 +23,10 @@ const INITIALIZED_SCREEN = readFileSync(
   'utf8',
 );
 
+const RESUMED_HISTORY = readFileSync(
+  join(process.cwd(), 'test/fixtures/codex-startup/zmx-history-resumed.txt'), 'utf8',
+);
+
 /** idle-detector.ts 内部常量，此处复述用于断言边界。 */
 const QUIESCENCE_MS = 2_000;
 
@@ -232,5 +236,44 @@ describe('codex 启动闸：worker 侧接线', () => {
 
   it('复查节奏受首轮硬上限约束', () => {
     expect(source).toMatch(/const FIRST_PROMPT_STARTUP_RECHECK_MS = [\d_]+;/);
+  });
+});
+
+describe('Codex restored ZMX history startup evidence', () => {
+  it.each([false, true])('releases resumed history without a banner, loading observed=%s', (loadingSeen) => {
+    const { detector, idle } = newDetector();
+    try {
+      if (loadingSeen) detector.feed(LOADING_SCREEN);
+      // The restoration marker can be far outside the synthetic 24-row viewport.
+      const history = RESUMED_HISTORY.replace('• Previous conversation restored.', 'old output\n'.repeat(60));
+      expect(detector.observeStartupHistory(history)).toBe(true);
+      expect(detector.isStartupPending()).toBe(false);
+      expect(detector.isStartupComplete()).toBe(true);
+      expect(idle).not.toHaveBeenCalled();
+      detector.reset();
+      expect(detector.observeStartupHistory(history)).toBe(false);
+      expect(detector.isStartupComplete()).toBe(true);
+    } finally { detector.dispose(); }
+  });
+
+  it.each([
+    ['no restoration marker', RESUMED_HISTORY.split('\n').slice(2).join('\n')],
+    ['footer before initialization', RESUMED_HISTORY.replace('› Ask', '│ model: loading │\n│ directory: loading │\n› Ask')],
+    ['resuming', RESUMED_HISTORY.replace('› Ask', 'Resuming session...\n› Ask')],
+    ['busy', RESUMED_HISTORY.replace('› Ask', 'Working (esc to interrupt)\n› Ask')],
+    ['capacity queue', RESUMED_HISTORY.replace('› Ask', 'Queued for capacity\n› Ask')],
+    ['draft', RESUMED_HISTORY.replace('› Ask Codex to do anything', '› unsent draft')],
+    ['picker', RESUMED_HISTORY.replace('› Ask Codex to do anything', '› 1. Continue')],
+    ['dialog after footer', RESUMED_HISTORY + '\nPress enter to continue'],
+    ['stale ready before loading', RESUMED_HISTORY + '\n' + LOADING_SCREEN],
+    ['uninitialized footer', RESUMED_HISTORY.replace(' · Ready', '')],
+  ])('keeps input held for %s', (_name, history) => {
+    const { detector, idle } = newDetector();
+    try {
+      detector.feed(LOADING_SCREEN);
+      expect(detector.observeStartupHistory(history)).toBe(false);
+      expect(detector.isStartupPending()).toBe(true);
+      expect(idle).not.toHaveBeenCalled();
+    } finally { detector.dispose(); }
   });
 });

@@ -58,6 +58,7 @@ export class IdleDetector {
   private readySeen = false;
   private startupPendingPattern: RegExp | undefined;
   private startupReadyPattern: RegExp | undefined;
+  private startupReadyFromHistory: CliAdapter['startupReadyFromHistory'];
   private startupTail = '';
   private startupPending = false;
   private startupComplete = false;
@@ -80,6 +81,7 @@ export class IdleDetector {
     this.readyPattern = cli.readyPattern;
     this.startupPendingPattern = cli.startupPendingPattern;
     this.startupReadyPattern = cli.startupReadyPattern;
+    this.startupReadyFromHistory = cli.startupReadyFromHistory;
   }
 
   onIdle(cb: (source: IdleEvidenceSource) => void): void {
@@ -346,6 +348,17 @@ export class IdleDetector {
     }
     if (pendingAt >= 0) this.startupPending = true;
     return false;
+  }
+
+  /** Full snapshot evidence, separate from feed(): history must never seed
+   * readySeen, quiescence, or a synthetic turn completion. Also handles warm
+   * reattach, where this detector has never observed the loading banner. */
+  observeStartupHistory(history: string): boolean {
+    if (this.startupComplete || !this.startupReadyFromHistory?.(this.stripAnsi(history))) return false;
+    this.startupComplete = true;
+    this.startupPending = false;
+    this.startupTail = '';
+    return true;
   }
 
   dispose(): void {

@@ -9,9 +9,12 @@ import { resolveNodeExecutable, spawnTsEvalWithRepoImports } from './helpers/ts-
 
 // Real worker IPC, real ZMX history/resync, and a deterministic CLI stdin sink.
 // No model/API/Feishu traffic; no HOME override or live ZMX socket access.
-it.skipIf(process.platform === 'win32' || !ZmxBackend.isAvailable()).each(['before', 'after'] as const)(
-  'delivers input arriving %s a ZMX initialized repaint without waiting for the first-prompt timeout',
-  async (arrival) => {
+it.skipIf(process.platform === 'win32' || !ZmxBackend.isAvailable()).each([
+  ['banner', 'before'], ['banner', 'after'],
+  ['resume', 'before'], ['resume', 'after'], ['warm-resume', 'after'], ['reattach', 'after'], ['resume-append', 'before'],
+] as const)(
+  'delivers ZMX %s input arriving %s initialization without waiting for the first-prompt timeout',
+  async (mode, arrival) => {
     const root = mkdtempSync('/tmp/bmx-startup-');
     const home = join(root, 'home');
     const dataDir = join(root, 'data');
@@ -27,20 +30,29 @@ it.skipIf(process.platform === 'win32' || !ZmxBackend.isAvailable()).each(['befo
     const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
     writeFileSync(fakeCli, `#!/bin/sh\nexec ${quote(node)} ${quote(fakeScript)} "$@"\n`);
     chmodSync(fakeCli, 0o755);
+    const resumedHistory = readFileSync(join(process.cwd(), 'test/fixtures/codex-startup/zmx-history-resumed.txt'), 'utf8')
+      .replace('• Previous conversation restored.', 'old output\n'.repeat(60));
     writeFileSync(fakeScript, `
 const fs = require('node:fs');
 process.stdin.setRawMode(true);
 process.stdin.on('data', b => fs.appendFileSync(${JSON.stringify(inputFile)}, b));
 const screen = value => '\\x1b[2J\\x1b[H│ model: ' + value + ' │\\r\\n│ directory: ' + value + ' │\\r\\n› Ask Codex to do anything\\r\\n  100% left';
-process.stdout.write(screen('loading'));
+const resumed = '\\x1b[2J\\x1b[H' + ${JSON.stringify(resumedHistory)}.replace(/\\n/g, '\\r\\n');
+process.stdout.write(${JSON.stringify(mode)} === 'warm-resume' ? resumed : screen('loading'));
 fs.writeFileSync(${JSON.stringify(loadingFile)}, 'ready');
 const poll = setInterval(() => {
   if (!fs.existsSync(${JSON.stringify(releaseFile)})) return;
   clearInterval(poll);
   // Replace cells in place: the backend must emit resync, not an appended feed.
-  process.stdout.write(screen('initialized'));
+  if (${JSON.stringify(mode)} === 'resume-append') {
+    const split = resumed.lastIndexOf('›');
+    process.stdout.write(resumed.slice(0, split));
+    setTimeout(() => process.stdout.write(resumed.slice(split)), 700);
+  } else {
+    process.stdout.write(${JSON.stringify(mode)} === 'banner' ? screen('initialized') : resumed);
+  }
   // Repeated redraws must not duplicate the queued message or declare idle.
-  setInterval(() => process.stdout.write('\\x1b[4;1H  100% left'), 300);
+  setInterval(() => process.stdout.write('\\x1b[?25h'), 300);
 }, 25);
 `);
     const sessionId = randomUUID();
@@ -65,7 +77,7 @@ const poll = setInterval(() => {
       BOTMUX_SESSION_ID: sessionId, BOTMUX_NO_CLAIM: '1',
       LARK_APP_ID: 'app_startup_test', LARK_APP_SECRET: 'test-secret',
     };
-    try {
+    const startWorker = () => {
       // Mock only the worker's filesystem home APIs before module evaluation.
       // Shells/tool managers continue to inherit the real HOME and PATH.
       child = spawnTsEvalWithRepoImports(`
@@ -99,6 +111,9 @@ const poll = setInterval(() => {
         launchShell: '/bin/sh', prompt: '', apiOnly: true,
         larkAppId: 'app_startup_test', larkAppSecret: 'test-secret',
       } satisfies DaemonToWorker);
+    };
+    try {
+      startWorker();
       await waitFor(() => existsSync(loadingFile) && messages.some(m => m.type === 'ready'));
       // Let the initial loading capture arrive before the ordinary IM input.
       await new Promise(r => setTimeout(r, 500));
@@ -117,7 +132,20 @@ const poll = setInterval(() => {
 
       let releasedAt = Date.now();
       writeFileSync(releaseFile, 'loaded');
-      await waitFor(() => logs.join('').includes('initialized banner observed'));
+      await waitFor(() => logs.join('').includes(mode === 'banner' ? 'initialized banner observed' : 'restored history observed'));
+      if (mode === 'reattach') {
+        const previous = child!;
+        const exited = new Promise<void>(r => previous.once('exit', () => r()));
+        previous.kill('SIGTERM');
+        await exited;
+        expect(execFileSync('zmx', ['get', zmxSession, 'botmux.session'], { env, encoding: 'utf8', timeout: 3_000 }).trim()).toBe(sessionId);
+        logs.length = 0;
+        messages.length = 0;
+        startWorker();
+        await waitFor(() => messages.some(m => m.type === 'ready')
+          && logs.join('').includes('restored history observed'));
+        expect(logs.join('')).toContain('Re-attached to existing zmx session');
+      }
       // An empty queue at initialization must not consume the only wake-up.
       // A subsequent resync also resets idle evidence, but not startup evidence.
       if (arrival === 'after') {
