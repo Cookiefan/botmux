@@ -97,7 +97,8 @@ describe('registration loser command handoff', () => {
     // replacing master's rollbackRejectedSessionAndGetWinner here.
     const claimCalls = src.split('claimNewDaemonSession(activeSessions, cmdDs)').length - 1;
     expect(claimCalls).toBeGreaterThanOrEqual(2);
-    expect(src).toContain("if (registration.reason !== 'existing_owner') return;");
+    // 执行段搬进 executeNewTopicSlash / executeThreadSlash 之后用 true 表示「已处理」，入口据此 return。
+    expect(src).toContain("if (registration.reason !== 'existing_owner') return true;");
     expect(src).toContain(
       'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId)',
     );
