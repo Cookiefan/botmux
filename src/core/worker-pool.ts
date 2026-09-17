@@ -14957,8 +14957,17 @@ function setupWorkerHandlers(
           // pending turn. preview.ledger is the post-settle remainder.
           if (msg.disposition === 'steer_superseded') {
             const entry = preview.settledEntry;
+            // HTTP steer members (options.steer) carry an http_async / http_wait
+            // sink: unlike a Lark member (which simply skips delivery) they are
+            // PARKED here and resolved with the group's real final after the
+            // commit below — see parkSteerFanoutMember / fanOutSteerGroupFinal.
+            // doc_comment / suppressed / VC / legacy-undefined sinks remain
+            // rejected exactly as before.
+            const supersededSink = entry.deliverySink;
             const supersededHeadOk = entry.codexAppSteerable === true
-              && entry.deliverySink === 'lark'
+              && (supersededSink === 'lark'
+                || supersededSink === 'http_async'
+                || supersededSink === 'http_wait')
               && entry.vcMeetingImTurnOrigin === undefined
               && ds.session.vcMeetingReceiver === undefined
               && preview.ledger.length > 0;
@@ -15074,6 +15083,25 @@ function setupWorkerHandlers(
           }
           const persisted = await inFlight;
           acknowledge(persisted, persisted ? undefined : 'final_settlement_failed');
+          if (persisted) {
+            // HTTP steer group settlement (options.steer). An earlier member's
+            // empty superseded final is parked behind its successor; the real
+            // final fans the merged answer back to every parked member. Runs
+            // AFTER the durable FIFO commit so a parked/resolved member can
+            // never disagree with the ledger.
+            const settledSink = preview.settledEntry.deliverySink;
+            if (msg.disposition === 'steer_superseded'
+              && (settledSink === 'http_async' || settledSink === 'http_wait')) {
+              parkSteerFanoutMember(
+                ds,
+                settlement.generation,
+                { turnId: msg.turnId, sink: settledSink },
+                preview.ledger[0]?.turnId,
+              );
+            } else if (msg.disposition !== 'steer_superseded') {
+              fanOutSteerGroupFinal(ds, settlement.generation, msg.content, Date.now());
+            }
+          }
           if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
             try { await cb.onCodexAppLedgerDrained?.(ds); }
             catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
@@ -15320,6 +15348,102 @@ function setupWorkerHandlers(
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
+
+// ─── HTTP steer-group fan-out (options.steer → codex-app native turn/steer) ──
+//
+// A steered group settles as N finals: each earlier member gets an EMPTY
+// `steer_superseded` final and the LAST member owns the real merged final. A
+// Lark member only skips delivery, but an HTTP caller polls ITS OWN triggerId
+// (wait-mode promise or async result): the earlier member must not hang at
+// `running` and must not complete with empty content. We park it until the
+// group's real final lands, then fan the real content out to every parked
+// member of the same runner generation.
+type SteerFanoutSink = 'http_async' | 'http_wait';
+interface SteerFanoutParked {
+  turnId: string;
+  sink: SteerFanoutSink;
+}
+const steerFanoutBySession = new Map<string, { generation: string; members: SteerFanoutParked[] }>();
+
+/** Park one superseded HTTP steer member. `successorTurnId` is the next FIFO
+ *  head AFTER this member's pop (the chain target for durable restart
+ *  resolution); omit when unavailable (http_wait is in-memory only). */
+function parkSteerFanoutMember(
+  ds: DaemonSession,
+  generation: string,
+  member: SteerFanoutParked,
+  successorTurnId: string | undefined,
+): void {
+  const sessionId = ds.session.sessionId;
+  const existing = steerFanoutBySession.get(sessionId);
+  if (!existing || existing.generation !== generation) {
+    // A new runner generation invalidates an older fenced/dead group's parks;
+    // those turns converge through the ordinary worker-exit/boot paths.
+    steerFanoutBySession.set(sessionId, { generation, members: [member] });
+  } else if (!existing.members.some(candidate => candidate.turnId === member.turnId)) {
+    existing.members.push(member);
+  }
+  if (member.sink !== 'http_async' || !successorTurnId) return;
+  try {
+    asyncTriggerStore.recordSteerParked(
+      sessionId, member.turnId, successorTurnId, Date.now(), ds.larkAppId,
+    );
+  } catch (err) {
+    // Best-effort restart insurance (same tier as recordPending): the live
+    // in-memory fan-out still resolves this member; only a daemon restart in the
+    // superseded→real window falls back to dispatch_unknown convergence.
+    logger.error(
+      `[${tag(ds)}] Failed to persist steer park for ${member.turnId.substring(0, 8)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/** Resolve every parked earlier member of a steer group with the group's real
+ *  final. Called exactly once, after the REAL final's durable commit. No usage
+ *  is forwarded: the merged turn's token usage belongs solely to the group's
+ *  real (last) trigger. Idempotent — a replayed real final re-resolves safely
+ *  (the per-session park list is consumed on the first call). */
+function fanOutSteerGroupFinal(
+  ds: DaemonSession,
+  generation: string,
+  content: string,
+  completedAt: number,
+): void {
+  const sessionId = ds.session.sessionId;
+  const parked = steerFanoutBySession.get(sessionId);
+  if (!parked || parked.generation !== generation) return;
+  steerFanoutBySession.delete(sessionId);
+  for (const member of parked.members) {
+    if (member.sink === 'http_wait') {
+      const waitPromise = ds.pendingWaitPromises?.get(member.turnId);
+      if (waitPromise) {
+        waitPromise.resolve(content);
+        ds.pendingWaitPromises?.delete(member.turnId);
+      }
+      continue;
+    }
+    const asyncResult = ds.asyncTriggerResults?.get(member.turnId);
+    if (asyncResult && asyncResult.status === 'pending') {
+      asyncResult.status = 'completed';
+      asyncResult.content = content;
+      asyncResult.completedAt = completedAt;
+      // Drop the convergence entry, mirroring the real-final path: a later
+      // graceful worker exit must not retro-fail this now-merged turn.
+      ds.idempotentAsyncTurns?.delete(member.turnId);
+    }
+    try {
+      asyncTriggerStore.recordCompleted(
+        sessionId, member.turnId, content, completedAt, ds.larkAppId,
+      );
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Steer fan-out failed for ${member.turnId.substring(0, 8)}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
 
 /**
  * Shutdown-only view of the in-flight Codex App final-settlement promises. Each

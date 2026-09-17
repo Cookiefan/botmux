@@ -156,3 +156,29 @@ rebase master → 开 PR（中文 + 影响面）→ 发 canary → 配一个 `ap
    - **carve-out 最小**：own BOT_HOME RW（除 send-cred deny）+ own bots-info/sessions-self/bot-openids-self RO + own turn-sends RW + CLI 运行必需（.data-dir/.dashboard-port/bin/claude-plugin/lark-scopes/install root）。**模型 CLI 的 authPaths（如 codex-app 的 `~/.codex`）始终保留 RW**——那是模型自己的登录态，不是飞书凭证；混淆会击穿核心功能（本轮复审抓到的回归）。redirect 到 BOT_HOME 的 CODEX_HOME 走 `resolveRedirectedAdapterAuthPaths` 单一真源：redirected 丢宿主 `~/.codex`（防泄漏，BOT_HOME 副本已 provision），cold-start 未 redirect 时保留宿主登录源。
 
    **测试**：fs-policy.test 60 测含 no-transport 矩阵（双根冻结 / `~/.lark-cli` 敌意 nested RW/RO 拦截 / 外置 config `/tmp` `/etc` `project` 三形态 `external-bots-config` fail-closed + kind 断言 / **config 落 carve-out（BOT_HOME/bin/attachments/outbox/install 5 形态）`bots-config-in-carveout` fail-closed，denied 子目录（`conf/`、`data/`）config + dirname + sidecar 全 deny 正向** / workingDir=权威根 抛错、workingDir=~ 保留 / `computeNoTransportAuthorityRoots` 去重 / **真 codex-app adapter redirect→own CODEX_HOME 可用 + 宿主 ~/.codex 按 redirect 语义 drop/keep**）；api-only-mode-wiring 补 worker 真实装配 source-lock（worker 传双根 + frozen loaded config + FsPolicyConfigError→spawn-abort + 日志抑制项；daemon 冻结 getLoadedConfigPath）——负向验证删 worker freeze / 禁用 carve-out 自检 即红（关闭「删 freeze 仍全绿」缺口）。
+
+---
+
+## 2026-09-17 增补：HTTP API 支持 Steer（`options.steer`）
+
+### 背景
+
+core-only 公开面只有 `POST /api/trigger` + 两条 poll 路由。原生「忙时把消息注入当前活跃 turn」（codex app-server `turn/steer`）此前只对**飞书 plain-human 入口**授权（`computeCodexAppSteerable`），HTTP 触发路径从不计算/透传 `codexAppSteerable`，所以 riff 等 headless 调用方在任务运行中发追问只能**串行排队**（等当前 turn 结束才起下一轮），无法调整正在跑的 turn。
+
+### 契约
+
+`POST /api/trigger` 请求体 `options` 新增 **`steer?: boolean`**（默认 false；与 `dryRun` 互斥；不要求 sessionId——首轮也要带，见下）。响应在实际受理（非幂等复用）时回显 **`steer: true`**。
+
+- **首轮（fresh）**：把 opening root 标记为 steerable。codex `canSteer` 要求 root 与 follow-up head **都**被显式授权，只标 follow-up 无法注入。
+- **运行中追问（existing session，worker live）**：live runner 用 `turn/steer` 把消息注入活跃 turn；不满足条件（无活跃 turn / 正在 closing / review/compact turn / 非 codex-app CLI / worker 休眠冷启）时**静默降级为普通排队 follow-up**——受理时不报错，因为「此刻能否注入」只有 runner 知道且毫秒级变化。
+- **非 codex-app CLI（claude-code 等）**：flag 为 no-op，保持既有 type-ahead 队列语义（TUI 忙时 park，下一轮执行）。
+
+### 结果归因（steer 组）
+
+codex 对合并的 steer 组只产出**一条合并 final**：runner 给前 N−1 个成员发空的 `steer_superseded` final，最后一个成员（=最新 triggerId）拿真 final + usage。daemon 侧：
+
+- Lark sink：旧行为（superseded 成员只推进 FIFO，不投递）。
+- **HTTP sink（`http_async` / `http_wait`，本次新增）**：superseded 成员先 **park**（内存 fanout 表 + `async-triggers` 文件里的 `steerParkedBy` 后继指针链，仅 http_async 写 durable）；真 final 落盘后把**同一份合并正文** fan-out 给组内每个已 park 成员（wait promise resolve / async result `completed` + `recordCompleted`，**不带 usage**——用量只记在最新 trigger 上），并清掉其 `idempotentAsyncTurns` 收敛项，避免随后 worker 优雅退出把已合并轮误判失败。
+- daemon 在「superseded pop → 真 final」之间重启：poll 时 `buildAsyncTriggerLookupResponse` 沿 `steerParkedBy` 链走到第一个终态后继，completed 镜像正文、failed 镜像终态证据；链仍 pending 则继续 `running`。
+
+安全面不变：`POST /api/trigger` 本就是 core-only loopback 的「驱动我自己的 turn」面，steer 只授权注入**同一租户自己的**活跃 turn，无新增路由、无跨会话能力；R4/R5 的 superseded 守卫扩展为 `lark | http_async | http_wait` 三种 sink，VC / doc_comment / suppressed / sink 缺失 / 唯一 head 仍一律 ACK=false 拒绝。

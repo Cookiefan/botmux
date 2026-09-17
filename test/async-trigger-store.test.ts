@@ -9,7 +9,7 @@
  * Run:  pnpm vitest run test/async-trigger-store.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -33,7 +33,9 @@ import {
   recordFailedStrict,
   recordTerminalFailureStrict,
   lookup,
+  lookupStrict,
   deleteResults,
+  recordSteerParked,
 } from '../src/services/async-trigger-store.js';
 
 beforeEach(() => {
@@ -247,5 +249,74 @@ describe('recordTerminalFailureStrict (explicit worker terminal)', () => {
       'sessTC', 'trg_tc', 7000, 'cli_test', 'provider_server_error',
     )).toBe('already_completed');
     expect(lookup('sessTC', 'trg_tc')?.result.status).toBe('completed');
+  });
+});
+
+describe('recordSteerParked (HTTP steer group restart insurance)', () => {
+  it('parks a pending member behind its successor and survives a fresh lookup', () => {
+    recordPending('sessS', 'trg_root', 1000, 'cli_test');
+    recordPending('sessS', 'trg_head', 2000, 'cli_test');
+    recordSteerParked('sessS', 'trg_root', 'trg_head', 1500, 'cli_test');
+    const parked = lookup('sessS', 'trg_root');
+    expect(parked?.result.status).toBe('pending');
+    expect(parked?.result.steerParkedBy).toBe('trg_head');
+    // createdAt is preserved, not reset to the park time.
+    expect(parked?.result.createdAt).toBe(1000);
+  });
+
+  it('never overwrites a terminal member with a park marker (terminal wins)', () => {
+    recordPending('sessS2', 'trg_done', 1000, 'cli_test');
+    recordCompleted('sessS2', 'trg_done', 'answer', 2000, 'cli_test');
+    recordSteerParked('sessS2', 'trg_done', 'trg_next', 2500, 'cli_test');
+    const got = lookup('sessS2', 'trg_done');
+    expect(got?.result.status).toBe('completed');
+    expect(got?.result.content).toBe('answer');
+    expect(got?.result.steerParkedBy).toBeUndefined();
+  });
+
+  it('chains N parked members: resolving the real final completes every member by recordCompleted', () => {
+    recordPending('sessS3', 'trg_1', 1000, 'cli_test');
+    recordPending('sessS3', 'trg_2', 2000, 'cli_test');
+    recordPending('sessS3', 'trg_3', 3000, 'cli_test');
+    recordSteerParked('sessS3', 'trg_1', 'trg_2', 1100, 'cli_test');
+    recordSteerParked('sessS3', 'trg_2', 'trg_3', 2100, 'cli_test');
+    // Real merged final lands on the last member.
+    recordCompleted('sessS3', 'trg_3', 'merged answer', 4000, 'cli_test');
+    // Poll-time resolution mirrors buildAsyncTriggerLookupResponse: walk the
+    // whole steerParkedBy chain to its first TERMINAL successor, then mirror
+    // that outcome back onto the requested parked member. Poll order is
+    // independent — each member resolves itself on demand.
+    const resolveParked = (first: string): void => {
+      let next: string | undefined = first;
+      let terminal: ReturnType<typeof lookup> | undefined;
+      for (let hops = 0; next && hops < 8; hops++) {
+        const hit = lookup('sessS3', next);
+        if (!hit) return;
+        if (hit.result.status !== 'pending') { terminal = hit; break; }
+        next = hit.result.steerParkedBy;
+      }
+      const start = lookup('sessS3', first);
+      if (terminal?.result.status === 'completed' && start?.result.status === 'pending') {
+        recordCompleted('sessS3', first, terminal.result.content ?? '', terminal.result.completedAt ?? 0, 'cli_test');
+      }
+    };
+    resolveParked('trg_1');
+    resolveParked('trg_2');
+    expect(lookup('sessS3', 'trg_1')?.result.content).toBe('merged answer');
+    expect(lookup('sessS3', 'trg_2')?.result.content).toBe('merged answer');
+    expect(lookup('sessS3', 'trg_3')?.result.content).toBe('merged answer');
+  });
+
+  it('strict loader accepts the parked shape and rejects a marker on a non-pending record', () => {
+    recordPending('sessS4', 'trg_p', 1000, 'cli_test');
+    recordSteerParked('sessS4', 'trg_p', 'trg_q', 1200, 'cli_test');
+    expect(lookupStrict('sessS4', 'trg_p')?.result.steerParkedBy).toBe('trg_q');
+    // Hand-write a corrupt marker: steerParkedBy on a completed record is invalid.
+    const dir = join(tempDir, 'async-triggers');
+    const fp = join(dir, 'sessS4.json');
+    const file = JSON.parse(readFileSync(fp, 'utf-8'));
+    file.results.trg_bad = { status: 'completed', createdAt: 1, completedAt: 2, steerParkedBy: 'trg_q' };
+    writeFileSync(fp, JSON.stringify(file));
+    expect(() => lookupStrict('sessS4', 'trg_bad')).toThrow();
   });
 });

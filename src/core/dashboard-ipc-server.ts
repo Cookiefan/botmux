@@ -770,6 +770,9 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  * model turn could read/perturb sessions, scheduler, mutations). This is a tight
  * allowlist of drive-my-own-turn + poll-my-own-output surfaces:
  *   POST /api/trigger                              (start a turn)
+ *       · options.steer=true authorizes a best-effort native turn/steer into
+ *         a live codex-app turn; same drive-my-own-turn trust surface, no extra
+ *         route or capability.
  *   GET  /api/sessions/:id/trigger-result          (poll final)
  *   GET  /api/sessions/:id/insight                 (poll conversation/progress)
  * `/api/asks/answer` is deliberately EXCLUDED — it is askId-keyed with no
@@ -2523,6 +2526,24 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
  *
  *  Legacy `action`/`async` fields are still populated so existing webhook
  *  consumers keep working; new callers branch on `state`. */
+/** Walk a durable steer-park chain (T1→T2→…→Tn) to the first TERMINAL
+ *  successor. Returns undefined when the chain is absent, ends pending, or a
+ *  hop is missing. Bounded against cycles/long chains (FIFO successors are
+ *  always distinct, later turns, but never trust on-disk shape blindly). */
+function followSteerParkedChain(
+  sessionId: string,
+  firstSuccessorTurnId: string,
+): ReturnType<typeof asyncTriggerStore.lookup> {
+  let next: string | undefined = firstSuccessorTurnId;
+  for (let hops = 0; next !== undefined && hops < 8; hops++) {
+    const hit = asyncTriggerStore.lookup(sessionId, next);
+    if (!hit) return undefined;
+    if (hit.result.status === 'completed' || hit.result.status === 'failed') return hit;
+    next = hit.result.steerParkedBy;
+  }
+  return undefined;
+}
+
 function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
   const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
@@ -2541,7 +2562,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     persistedExists: !!persistedRaw,
   });
   const stored = decision.keepStored ? storedRaw : undefined;
-  const persisted = decision.keepPersisted ? persistedRaw : undefined;
+  let persisted = decision.keepPersisted ? persistedRaw : undefined;
 
   if (decision.foreignLeak) {
     return {
@@ -2552,6 +2573,30 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       error: `no session record for: ${sessionId}`,
       message: 'no session found',
     };
+  }
+
+  // HTTP steer-group restart insurance (options.steer; codex-app turn/steer): a
+  // superseded member parked behind its successor carries a durable
+  // `steerParkedBy` chain. Normally the live daemon fans the group's real final
+  // out in-memory; if it restarted in the superseded→real-final window, walk
+  // the chain to the first terminal successor and mirror that outcome back onto
+  // this turn (completed carries the merged ANSWER, no usage; failed mirrors the
+  // terminal evidence). A chain that still ends pending keeps the turn `running`.
+  if (persisted?.result.status === 'pending' && persisted.result.steerParkedBy) {
+    const owner = persisted.ownerLarkAppId ?? cachedLarkAppId ?? '';
+    const terminal = followSteerParkedChain(sessionId, persisted.result.steerParkedBy);
+    if (terminal && owner) {
+      const r = terminal.result;
+      const at = (r.status === 'completed' ? r.completedAt : r.failedAt) ?? Date.now();
+      if (r.status === 'completed') {
+        asyncTriggerStore.recordCompleted(sessionId, persisted.triggerId, r.content ?? '', at, owner);
+      } else if (r.reason === 'turn_terminal' && r.terminalErrorCode) {
+        asyncTriggerStore.recordTerminalFailureStrict(sessionId, persisted.triggerId, at, owner, r.terminalErrorCode);
+      } else {
+        asyncTriggerStore.recordFailedStrict(sessionId, persisted.triggerId, at, owner, 'dispatch_unknown');
+      }
+      persisted = asyncTriggerStore.lookup(sessionId, persisted.triggerId);
+    }
   }
 
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
