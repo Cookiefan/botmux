@@ -170,7 +170,7 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 
 ## 接入自带 loop 的工具
 
-自带 Agent loop 的工具可使用实验版 [仅模型模式](docs/constrained-invocations.md)：调用方管理上下文和工具执行，Botmux 通过 CLI 提供模型推理、任务查询、取消及去重。接口面向所有 CLI，当前接通 Codex、Codex App、Claude Code、Pi、MiniMax、Gemini 和 OpenCode；文档及能力查询逐项列出全部 31 个 CLI 的支持状态和未适配原因。
+外部应用可使用实验版[模型代理模式](docs/model-proxy.md)：通过有鉴权的本机 Chat Completions 入口复用 CLI 模型能力，调用方继续管理上下文、工具执行和任务流程。普通 SDK 和 OCR 无需自写推理 wrapper；当前兼容字段、原生 CLI 验证范围及专用身份要求见文档。底层[受约束执行接口](docs/constrained-invocations.md)提供任务查询、取消、幂等和进程回收。
 
 ## 文档 · 社区 · 贡献
 

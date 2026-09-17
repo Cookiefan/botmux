@@ -1,19 +1,17 @@
-# 仅模型模式：接入自带 loop 的工具（实验版 v1）
+# 模型代理模式：受约束推理执行层（实验版 v1）
 
-一些工具已经有自己的 Agent loop：它们负责组织上下文、选择并执行工具、检查结果，再决定是否继续调用模型。接入 Botmux 时，这类工具需要的是 CLI 背后的模型能力；如果直接使用普通编程会话，CLI 还会加载自己的工具、项目规则和历史，形成两套同时控制任务的循环。
+Botmux 复用 CLI 的原生推理与工具控制能力，向外部应用提供模型调用。调用方负责上下文、业务工具执行和任务流程；执行层负责隔离原生调用、deadline、取消、幂等、结果校验和进程回收。
 
-仅模型模式把这两个职责分开：**调用方掌握 loop，Botmux 提供统一的模型调用和任务管理入口，各 CLI 适配器负责原生登录与推理协议。** 调用方提交输入和期望的 JSON 格式，获得模型回答或工具调用建议，自行执行后再发起下一轮。工具名称、参数和业务流程由调用方定义，Botmux 不替调用方运行工具或拼接历史。
+普通模型 SDK、OCR 等兼容客户端优先使用[公共 Chat Completions 入口](model-proxy.md)，由 Botmux 统一翻译协议，无需自行实现推理 wrapper。本页记录底层 `session invoke` / 签名 IPC 契约，适合直接控制执行资源的集成。
 
-例如：外部工具请求计算 19＋23 → 通过 Botmux 调用模型 → 模型返回加法建议 → 外部工具算出 42 → 再调用模型生成最终回答。换一个 CLI 应当只需要换 Bot 配置，外部 loop 使用的提交、查询、取消和去重契约保持一致。
-
-这是面向所有 CLI 的通用能力，不是 Codex 专用协议。当前接通 7 个 CLI 标识：Codex、Codex App、Claude Code、Pi、MiniMax、Gemini、OpenCode；全部 31 项的核查结果见下表。其余 24 项有明确的验证阻塞或接口缺口，不能把统一接口理解成所有 CLI 已经可用。该接口也不等于任意第三方 SDK 可以直接替换 endpoint：调用方仍需对接本页的 `session invoke` / 签名 IPC 契约。
+执行层已适配 7 个 CLI 标识，其余 24 项本机暂无完整测试环境，后续按需迭代。公共模型协议的字段兼容范围与各 CLI 不完全相同，具体以公共入口文档和实际测试为准。
 
 ## 支持范围与前置条件
 
 | 条件 | 本版支持 |
 |---|---|
 | CLI | 7 个标识，见逐项表格；不设版本号白名单，使用各自原生协议 |
-| 模型 | 调用方通过 `model` 指定，无名称白名单；由对应 CLI 解析模型标识 |
+| 模型 | 执行层调用方通过 `model` 指定；公共入口由管理员配置别名到原生模型的映射 |
 | 平台 | macOS、Linux；不支持 Windows |
 | Bot | 专用 `apiOnly: true`；Codex / Codex App 另需 `codexAuthSync: isolated` |
 | 原生身份 | Bot 专用目录下的原生凭证文件；不主动复制全局或其他 Bot 登录 |
@@ -62,47 +60,43 @@ Gemini 使用 headless stream-json、空 `tools.core` 和匹配全部工具的 d
 
 OpenCode 使用 `run --pure --format json`，专用 agent 和全局权限均拒绝所有工具。关闭自动标题、摘要及压缩，原生测试确认每次只发出一次模型请求。只复制专用 `auth.json` 中的原生 API/OAuth 记录；拒绝可能加载远端配置的 well-known 身份，不复制用户配置或外部插件。macOS/Linux 系统管理配置存在时拒绝，不覆盖。`actualModel` 保持 null，因为该原生输出没有独立报告实际执行模型。参见 [OpenCode 官方源码](https://github.com/anomalyco/opencode)。
 
-### 全部 CLI 核查表
+### 全部 CLI 适配表
 
-**7 项已适配，19 项待验证，5 项当前核查存在接口缺口。** “待验证”不表示上游无法实现；具体缺少的程序、认证隔离或协议证据如下。已适配也不代表所有账号和版本已经验收。普通 PTY/tmux 会话的支持范围不受影响。
+**7 项已适配，验证范围见下表和测试记录；其余 24 项本机暂无完整测试环境，本 PR 暂未适配，后续按需迭代。** 原生 CLI 配合合成服务的测试与真实订阅/OAuth 验收分别注明。
 
-| CLI | 分组 | 状态 | 验证结果或未适配原因 |
-|---|---|---|---|
-| `claude-code` | claude-print | 已适配 | 原生 print/stream-json、空 tools、安全模式；原生合成服务测试通过，真实订阅认证待验证。 |
-| `seed` | claude-print | 待验证 | 使用独立的 byted-cloud-auth.json；缺少可运行的 Seed，未验证空 tools、安全模式和隔离登录，不能直接继承 Claude 支持。 |
-| `relay` | claude-print | 待验证 | Relay 的登录目录和迁移行为不同于 Claude；缺少可运行的 Relay，未验证原生工具关闭及独立身份。 |
-| `aiden` | native-print | 待验证 | 原生帮助确认有 --no-tools、--stream-json；原生登录涉及多种 token 文件，尚未完成无配置、无插件的独立认证验证。 |
-| `coco` | trae-app-server | 待验证 | 检查到的旧原生接口只有 print/json 和自动批准 allowed-tool；新版与 TraeX 共用实现，但零工具目录和认证适配尚未验证。 |
-| `codex` | codex-app-server | 已适配 | 独立 app-server、空工具和临时线程；原生合成服务测试及 Linux 真实订阅外部 loop 通过。 |
-| `codex-app` | codex-app-server | 已适配 | 复用同一 Codex 可执行文件和隔离 app-server 通道；独立 IPC 路由测试通过，不连接既有服务或实例池。 |
-| `cursor` | native-print | 接口缺口 | 原生 help 的 ask/plan 仍是只读 Agent，print 明确保留工具；本次核查未发现可验证的空工具目录接口。 |
-| `gemini` | policy-headless | 已适配 | headless stream-json、空 core 工具和全部拒绝策略；原生合成服务测试通过，OAuth 登录待真实账号验证。 |
-| `genius` | claude-print | 待验证 | 使用 Genius 自己的凭证和状态目录；缺少原生程序，未验证 Claude 风格参数是否提供相同隔离保证。 |
-| `opencode` | policy-headless | 已适配 | run/json、pure 模式、全部工具拒绝，关闭标题与压缩子调用；原生合成服务测试通过。 |
-| `opencode2` | policy-headless | 待验证 | 仓库适配器明确使用 V2 插件、配置和服务接口；缺少 opencode2 原生程序，不能以 OpenCode 的测试替代。 |
-| `antigravity` | native-print | 待验证 | 仓库目标是 Agent CLI；本次找到的同名 agy 是编辑器启动器，无法验证目标 Agent 的 print 和工具隔离协议。 |
-| `mtr` | policy-headless | 待验证 | 仓库目标是 OpenCode 衍生 Agent；本次找到的同名 mtr 是网络诊断工具，缺少目标程序做原生验证。 |
-| `hermes` | native-print | 待验证 | 官方源码有单次调用和 toolsets 入口；未获得可运行的 Hermes 环境，空工具集、认证及 hooks 隔离未完成原生验证。 |
-| `mira` | remote-agent | 接口缺口 | 当前接入是云端 chat/completion；tool_list 只体现检索配置，尚无证据证明可禁用整个服务端工具与 Agent loop。 |
-| `mir` | native-print | 待验证 | 现有 print runner 依赖原生本地 MCP bridge；缺少 mircli，未验证关闭 bridge 和宿主工具后仍可推理。 |
-| `traex` | trae-app-server | 待验证 | 已确认原生 app-server 和工具禁用选项；TRAE_HOME、认证和工具目录与 Codex 不同，尚未证明完整空工具调用。 |
-| `pi` | native-print | 已适配 | 原生 --no-tools、禁用扩展与上下文、print/json；原生合成服务测试通过，拒绝可执行凭证 helper。 |
-| `copilot` | native-print | 待验证 | 原生帮助有 available-tools；OAuth 优先存入系统凭证库，文件回退混在配置中，尚未证明专用 Bot 认证不会回退宿主身份。 |
-| `oh-my-pi` | native-print | 待验证 | 原生 --no-tools 可用，但认证、设置等共存于 agent.db 并支持 auth broker；不能复制整个数据库或直接套用 Pi auth.json。 |
-| `ebsd` | service-agent | 待验证 | 仓库使用固定 HOME 下的 service 身份和 botmux 子命令，禁止 per-bot HOME 覆盖；未验证独立身份和零工具协议。 |
-| `kimi` | agent-profile | 待验证 | 官方源码提供自定义 agent 文件及 tools 列表；缺少可运行的 Kimi，空列表、OAuth 目录和非交互输出未原生验证。 |
-| `grok` | native-print | 接口缺口 | 官方 headless 文档说明工具筛选后仍保留常驻 MCP meta-tools；尚未找到并验证完全关闭这些能力的方法。 |
-| `kiro-cli` | agent-profile | 待验证 | 官方 agent 配置区分 tools 与 allowedTools；缺少原生程序，tools 空列表及自动内置能力、认证隔离尚未验证。 |
-| `riff` | remote-agent | 接口缺口 | 现有后端提交远端 Agent 任务并使用远端工具；当前接口没有已核实的纯模型、无服务端 loop 契约。 |
-| `reasonix` | native-print | 待验证 | 仓库目前接入 TUI 和本地 transcript；缺少原生程序及已验证的非交互零工具入口。 |
-| `dsh` | agent-profile | 待验证 | 现有 runner 使用 profile 认证和 ACP session/prompt；缺少 dsh 程序，profile 的空工具和无定制加载未验证。 |
-| `dsh-tui` | agent-profile | 待验证 | 这是独立 TUI 入口，配置和登录关联 dsh；未验证可复用的原生 model-only 协议，不能退回 PTY 提示词限制。 |
-| `mojo` | remote-agent | 接口缺口 | 现有 CLI 管理后台远端 Agent session；session cancel 能控制任务生命周期，但没有已核实的禁用远端工具和 loop 参数。 |
-| `minimax` | native-print | 已适配 | 原生 text chat/json，不传任何 tool；原生合成服务测试通过，使用原生 config.json 维护区域和认证。 |
-
-此表对应 `src/services/constrained-invocation/support-status.ts`；闭合的 `Record<CliId, …>` 和回归测试要求每个新 CLI 都有评估。能力接口返回相同的 `assessment`、机器可读 `reason` 和说明，未通过验证的项目保持 `supported:false`。各 CLI 的亲缘关系仅用于分组，不自动继承兼容性。
-
-Grok 的常驻 meta-tools 依据[官方 headless 文档](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md)；Kiro 的候选适配入口见[官方 agent 配置](https://kiro.dev/docs/custom-agents/configuration-reference/)。其余核查结合仓库现有适配器、已安装 CLI 原生帮助和公开源代码，不能用“允许自动批准”替代“模型不可见工具”。
+| CLI | 状态 | 已验证结果 / 后续安排 |
+|---|---|---|
+| `claude-code` | 已适配 | 原生 print/stream-json、空 tools、安全模式；原生合成服务测试通过，真实订阅认证待验证。 |
+| `seed` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `relay` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `aiden` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `coco` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `codex` | 已适配 | 独立 app-server、空工具和临时线程；原生合成服务测试及 Linux 真实订阅下的外部工具调用闭环通过。 |
+| `codex-app` | 已适配 | 复用同一 Codex 可执行文件和隔离 app-server 通道；独立 IPC 路由测试通过，不连接既有服务或实例池。 |
+| `cursor` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `gemini` | 已适配 | headless stream-json、空 core 工具和全部拒绝策略；原生合成服务测试通过，OAuth 登录待真实账号验证。 |
+| `genius` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `opencode` | 已适配 | run/json、pure 模式、全部工具拒绝，关闭标题与压缩子调用；原生合成服务测试通过。 |
+| `opencode2` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `antigravity` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `mtr` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `hermes` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `mira` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `mir` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `traex` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `pi` | 已适配 | 原生 --no-tools、禁用扩展与上下文、print/json；原生合成服务测试通过，拒绝可执行凭证 helper。 |
+| `copilot` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `oh-my-pi` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `ebsd` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `kimi` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `grok` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `kiro-cli` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `riff` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `reasonix` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `dsh` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `dsh-tui` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `mojo` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
+| `minimax` | 已适配 | 原生 text chat/json，不传任何 tool；原生合成服务测试通过，使用原生 config.json 维护区域和认证。 |
 
 ## 接入
 
@@ -144,7 +138,7 @@ Claude Code 使用同一启动方式，将 `BOTMUX_CORE_CLI` 改为 `claude-code
 
 原生刷新只影响本次临时副本，不回写来源登录目录；来源登录需保持有效。Pi / Gemini / OpenCode 不复制自定义模型目录与 provider 插件。模型能力、原生认证以及操作系统管理策略不满足时明确报错。
 
-`capabilities` 的 `mode` 为 `model_only`、`loopOwner` 为 `caller`，`adapters` 列出全部已注册 CLI 的接通状态。`supported:true` 仍不代表已经在线验证当前账号。
+`capabilities` 的 `mode` 为 `model_only`、`loopOwner` 为 `caller`，`adapters` 列出全部已注册 CLI 的接通状态。`supported:true` 仍不代表已经在线验证当前账号。`maxOutputTokens` capability 声明本 CLI 是否接收可选的原生生成上限；当前仅 Claude 支持，请求中可传 `maxOutputTokens`（1–128000）。其他 CLI 明确报错，具体语义和公共字段映射见[公共入口说明](model-proxy.md#协议子集与语义边界)。
 
 `request.json` 示例（更换 CLI 时替换 `model`）：
 

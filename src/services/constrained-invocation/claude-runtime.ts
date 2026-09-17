@@ -54,7 +54,11 @@ export async function runIsolatedClaude(request: InvocationRequest, runtime: {
     `--model=${request.model}`, '--json-schema', JSON.stringify(request.outputSchema),
     '--system-prompt', 'Reason only over the supplied input. Return the requested structured answer. Tool proposals are data for the caller, not executable actions.'];
   if (request.reasoningEffort) args.push('--effort', request.reasoningEffort);
-  const child = spawnOwnedModelProcess(runtime.executable, args, runtime);
+  // Native generation budget, not post-hoc truncation. This applies to each
+  // native model request (including serialization); aggregate usage stays native.
+  const env = { ...runtime.env };
+  if (request.maxOutputTokens !== undefined) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(request.maxOutputTokens);
+  const child = spawnOwnedModelProcess(runtime.executable, args, { ...runtime, env });
   let closed = false;
   let bytes = 0;
   let initialized = false;

@@ -20,7 +20,7 @@ export function invocationCapabilityForBot(botId: string): Record<string, unknow
     && !bot.backendType && !bot.maxLiveWorkers && !(bot.startupCommands?.length)
     && Object.keys(bot.env ?? {}).length === 0;
   return { ...modelOnlyCapabilities, cli: bot.cliId, modelPolicy: adapter?.modelPolicy ?? null,
-    supported, runtimeVerified: false,
+    supported, maxOutputTokens: bot.cliId === 'claude-code', runtimeVerified: false,
     reason: supported ? null : adapter ? 'requires_dedicated_core_only_isolated_auth' : modelOnlyAssessments[bot.cliId].reason,
     adapters: modelOnlyAdapterCapabilities(),
   };
@@ -35,6 +35,7 @@ export function invocationServiceForBot(botId: string, forStart = false): Invoca
         if (invocationCapabilityForBot(botId).supported !== true) throw new Error('constrained_capability_unsupported');
         const bot = getBot(botId).config;
         const adapter = modelOnlyAdapter(bot.cliId)!;
+        if (request.maxOutputTokens !== undefined && bot.cliId !== 'claude-code') throw new Error('max_output_tokens_unsupported');
         const executable = rawCliExecutable(bot.cliId, bot.cliPathOverride);
         if (!executable) throw new Error('constrained_capability_unsupported');
         return adapter.run(request, {

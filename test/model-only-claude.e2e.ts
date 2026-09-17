@@ -93,3 +93,10 @@ it.skipIf(!executable)('reaps the whole Claude process group after its owner die
     if (nativePid) { try { process.kill(-nativePid, 'SIGKILL'); } catch { /* gone */ } }
   }
 });
+
+it.skipIf(!executable).each([1, 4096, 16384])('passes completion budget %s to native generation', async maxOutputTokens => {
+  const h = await fixture();
+  await runIsolatedClaude({ ...h.request, maxOutputTokens }, h.runtime, AbortSignal.timeout(15000));
+  expect(h.requests.length).toBeGreaterThan(0);
+  for (const request of h.requests) expect(request.max_tokens).toBe(maxOutputTokens);
+});

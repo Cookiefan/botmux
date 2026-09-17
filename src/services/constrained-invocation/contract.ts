@@ -7,6 +7,7 @@ export const invocationRequest = z.object({
   reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional(),
   deadlineMs: z.number().int().min(100).max(300_000),
   outputSchema: z.record(z.unknown()),
+  maxOutputTokens: z.number().int().min(1).max(128_000).optional(),
 }).strict();
 export type InvocationRequest = z.infer<typeof invocationRequest>;
 export type JsonSchema = Record<string, unknown>;

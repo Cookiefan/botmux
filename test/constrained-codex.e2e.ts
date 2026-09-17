@@ -146,3 +146,37 @@ async function viWait(predicate: () => boolean) {
   for (let i = 0; i < 100; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 50)); }
   throw new Error('process_lifecycle_timeout');
 }
+
+it.skipIf(!executable || !process.env.BOTMUX_MODEL_PROXY_OPENAI_SDK)('ordinary SDK uses the public proxy for a Codex text/tool roundtrip', async () => {
+  const { InvocationService } = await import('../src/services/constrained-invocation/service.js');
+  const { proxyConfigSchema, proxyClients } = await import('../src/services/model-proxy/config.js');
+  const { startModelProxy } = await import('../src/services/model-proxy/server.js');
+  const { pathToFileURL } = await import('node:url');
+  const { default: OpenAI } = await import(pathToFileURL(process.env.BOTMUX_MODEL_PROXY_OPENAI_SDK!).href);
+  const chats: any[] = [];
+  const h = await harness(body => {
+    const text = body.input.flatMap((m: any) => m.content ?? []).find((c: any) => c.text?.includes('CHAT_REQUEST_JSON:\n'))?.text;
+    const chat = JSON.parse(text.split('CHAT_REQUEST_JSON:\n')[1]); chats.push(chat);
+    return assistant(!chat.tools?.length ? { content: 'hello', tool_calls: [] }
+      : chat.messages.at(-1).role === 'tool' ? { content: '42', tool_calls: [] }
+        : { content: '', tool_calls: [{ name: 'add', arguments: '{"left":19,"right":23}' }] });
+  });
+  const service = new InvocationService({ directory: join(h.root, 'records'), run: (request, signal) => h.run(request.prompt, signal) });
+  const config = proxyConfigSchema.parse({ port: 0, models: { reasoner: { bot: 'fixture', model: 'gpt-5.5', deadlineMs: 15000 } }, clients: [{ id: 'fixture', tokenEnv: 'FIXTURE_TOKEN', models: ['reasoner'] }] });
+  const token = 'synthetic-codex-proxy-token-at-least-32';
+  const proxy = await startModelProxy({ config, clients: proxyClients(config, { FIXTURE_TOKEN: token }), backend: () => ({ capabilities: async () => ({ supported: true }), start: async request => service.start(request), get: async id => service.get(id)!, cancel: id => service.cancel(id) }) });
+  try {
+    const sdk = new OpenAI({ baseURL: `http://127.0.0.1:${proxy.port}/v1`, apiKey: token, maxRetries: 0 });
+    const text = await sdk.chat.completions.create({ model: 'reasoner', messages: [{ role: 'user', content: 'hello' }] });
+    expect(text.choices[0].message.content).toBe('hello');
+    const messages: any[] = [{ role: 'system', content: 'Use the external calculator.' }, { role: 'user', content: '19 + 23' }];
+    const tools = [{ type: 'function', function: { name: 'add', parameters: { type: 'object', properties: { left: { type: 'integer' }, right: { type: 'integer' } }, required: ['left', 'right'] } } }];
+    const first = await sdk.chat.completions.create({ model: 'reasoner', messages, tools, tool_choice: 'required' });
+    const call = first.choices[0].message.tool_calls[0]; const args = JSON.parse(call.function.arguments);
+    messages.push(first.choices[0].message, { role: 'tool', tool_call_id: call.id, content: String(args.left + args.right) });
+    const last = await sdk.chat.completions.create({ model: 'reasoner', messages, tools, tool_choice: 'none' });
+    expect(last.choices[0].message.content).toBe('42'); expect(chats[2].messages).toEqual(messages);
+    expect(h.requests.every(r => r.tools.length === 0)).toBe(true); expect(h.requests).toHaveLength(3);
+    expect(last.usage).toBeNull(); expect(last.botmux.native_invocation_usage).toMatchObject({ inputTokens: 10, outputTokens: 5 });
+  } finally { await proxy.close(); await service.close(); }
+});
