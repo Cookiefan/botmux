@@ -134,6 +134,10 @@ The table below compares only **verifiable integration boundaries** — it does 
 | Multi-bot | Multi-bot @mention routing in one group | Depends on the implementation |
 | Direct terminal | Local CLIs can `tmux attach` into the real process | Depends on the implementation |
 
+## Integrating Applications with Their Own Task Workflows
+
+External applications can use experimental [model proxy mode](docs/model-proxy.md) through an authenticated local Chat Completions endpoint. Applications such as [OpenCodeReview (OCR)](https://github.com/alibaba/open-code-review) can connect through a model SDK while retaining control of context, tools, and task workflows. The execution layer implements seven CLI identities; the documentation distinguishes protocol support, native CLI tests, and pending account validation. The underlying [constrained invocation interface](docs/constrained-invocations.md) provides task status, cancellation, deduplication, and process cleanup.
+
 ## Docs · Community · Contributing
 
 - 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>**
@@ -144,5 +148,3 @@ The table below compares only **verifiable integration boundaries** — it does 
 - 📄 **License**: [MIT](LICENSE)
 
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
-
-Tools with their own agent loop can use experimental [model-only mode](docs/constrained-invocations.md). The caller owns context and tool execution; Botmux provides CLI-backed inference, task status, cancellation, and deduplication. The interface covers all CLI identities; Codex and Claude Code currently have native implementations. Capability discovery reports which adapters are available.

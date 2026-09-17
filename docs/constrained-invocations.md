@@ -1,8 +1,8 @@
-# 模型代理模式：受约束推理执行层（实验版 v1）
+# 模型透明代理模式：受约束推理执行层（实验版 v1）
 
 Botmux 复用 CLI 的原生推理与工具控制能力，向外部应用提供模型调用。调用方负责上下文、业务工具执行和任务流程；执行层负责隔离原生调用、deadline、取消、幂等、结果校验和进程回收。
 
-普通模型 SDK、OCR 等兼容客户端优先使用[公共 Chat Completions 入口](model-proxy.md)，由 Botmux 统一翻译协议，无需自行实现推理 wrapper。本页记录底层 `session invoke` / 签名 IPC 契约，适合直接控制执行资源的集成。
+[OpenCodeReview（OCR）](https://github.com/alibaba/open-code-review) 等外部应用可通过模型 SDK 使用[公共 Chat Completions 入口](model-proxy.md)，由 Botmux 统一翻译协议，无需自行实现推理 wrapper。本页记录底层 `session invoke` / 签名 IPC 契约，适合直接控制执行资源的集成。
 
 执行层已适配 7 个 CLI 标识，其余 24 项本机暂无完整测试环境，后续按需迭代。公共模型协议的字段兼容范围与各 CLI 不完全相同，具体以公共入口文档和实际测试为准。
 
@@ -195,6 +195,8 @@ Claude Code 使用同一启动方式，将 `BOTMUX_CORE_CLI` 改为 `claude-code
 - 未观测用量为 `usage:null`，缓存指标未知为 null，绝不补 0。`usageSource` 区分 Codex 的 `native_thread_total` 与其他适配器的 `native_result`。schema 校验等后期失败保留已观测的用量。
 
 ## 可复现验证
+
+本轮原生合成服务复核使用 Codex 0.153.4、Claude Code 2.1.268、Pi 0.85.1、MiniMax CLI 1.0.25、Gemini CLI 0.60.0、OpenCode 1.18.31，合计 34 项通过（含公共 SDK 与 OCR 接入测试）。这些版本是验证样本，不是兼容白名单。全局 Gemini CLI 0.1.18 不具备所需的 `--policy` / `--output-format` 接口，本轮调用失败；测试环境中的 OpenCode npm 启动入口未完成 postinstall，改用同一安装包提供的原生平台二进制后 4 项通过。下面的可执行路径应指向具备所需能力且安装完整的 CLI。
 
 ```bash
 bun run test -- --configLoader runner test/constrained-invocation.test.ts test/ipc-constrained-invocation.test.ts test/model-only-print.test.ts
