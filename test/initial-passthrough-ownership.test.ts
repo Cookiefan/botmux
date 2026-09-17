@@ -70,8 +70,9 @@ describe('startInitialPassthroughSession ownership', () => {
 
 describe('startInitialPassthroughSession call sites', () => {
   it('thread-reply injection keeps the foreign-bot guard on owner fields', () => {
-    expect(src).toContain('ownerOpenId: isForeignBot ? undefined : threadSenderOpenId');
-    expect(src).toMatch(/ownerUnionId: isForeignBot \? undefined :/);
+    // thread 执行段（executeThreadSlash）里的字段名已与新话题入口对齐：isForeignBotSender / senderOpenId。
+    expect(src).toContain('ownerOpenId: isForeignBotSender ? undefined : senderOpenId');
+    expect(src).toMatch(/ownerUnionId: isForeignBotSender \? undefined :/);
   });
 
   it('every call site passes ownership explicitly', () => {

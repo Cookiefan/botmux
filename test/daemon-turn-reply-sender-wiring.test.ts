@@ -111,7 +111,7 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     expect(daemonSource).toMatch(/const resolvedSenderIsBot = senderIsBot \?\? \(parsed\.senderType === 'app' \|\| parsed\.senderType === 'bot'\);/);
     // Both callers pass a cross-ref-resolved is-bot, kept separate from quota's botSender.
     expect(daemonSource).toMatch(/botSender: isBotSenderType,\n[\s\S]{0,400}senderIsBot: isForeignBotSender,/);
-    expect(daemonSource).toMatch(/botSender: isBotSenderType \|\| isForeignBot,\n[\s\S]{0,400}senderIsBot: isBotSenderType \|\| isForeignBot,/);
+    expect(daemonSource).toMatch(/botSender: isBotSenderType \|\| isForeignBotSender,\n[\s\S]{0,400}senderIsBot: isBotSenderType \|\| isForeignBotSender,/);
   });
 
   it('keeps the source DM id separate from the generated session-group turn id', () => {

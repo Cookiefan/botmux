@@ -20680,7 +20680,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
 
   // 斜杠命令执行段已搬到 executeNewTopicSlash（输入全部显式）；true = 已处理。
-  if (await executeNewTopicSlash({ ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg })) return;
+  if (await executeNewTopicSlash({
+    ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent,
+    senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger,
+    forceTopic, forceTopicMode, botCfg,
+  })) return;
 
   // A setup-only `/t` must still pass the same talk-permission recheck as any
   // CLI input, but it creates no AI turn and therefore must not consume a
@@ -21881,20 +21885,22 @@ interface ThreadSlashContext {
   parsed: LarkMessage;
   resources: MessageResource[];
   cmdContent: string;
-  ctxChatId: RoutingContext['chatId'];
-  ctxChatType: RoutingContext['chatType'];
-  threadChatId: string | undefined;
-  threadSenderOpenId: string | undefined;
-  threadSenderUnionId: string | undefined;
-  threadTeamTrustUnionId: string | undefined;
+  /** dispatcher 给的路由 chatId（可能缺席）：只用于 commandDepsForInvocation，与新话题入口的 chatId 同源。 */
+  routingChatId: RoutingContext['chatId'];
+  chatType: RoutingContext['chatType'];
+  /** 话题所在群：`routingChatId ?? data.message.chat_id`；无会话时的建会话/透传冷启动都以它为准。 */
+  chatId: string | undefined;
+  senderOpenId: string | undefined;
+  senderUnionId: string | undefined;
+  teamTrustUnionId: string | undefined;
   isBotSenderType: boolean;
-  isForeignBot: boolean;
+  isForeignBotSender: boolean;
   substituteTrigger: RoutingContext['substituteTrigger'];
   getThreadSender: () => Promise<Parameters<typeof setDirectChatDisplayNameFromSender>[2]>;
 }
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
-  const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, ctxChatId, ctxChatType, threadChatId, threadSenderOpenId, threadSenderUnionId, threadTeamTrustUnionId, isBotSenderType, isForeignBot, substituteTrigger, getThreadSender } = slash;
+  const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
   // Intercept daemon commands
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
@@ -21916,7 +21922,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
     phase: deriveSessionPhase(existingDs),
     passthrough: resolvePassthroughCommands(larkAppId, passthroughCliId),
     coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
-    senderIsBot: isBotSenderType || isForeignBot,
+    senderIsBot: isBotSenderType || isForeignBotSender,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
     // runtime 级联（§6）只在 PTY 家族后端、非 adopt 会话上跑：riff / mojo 一条透传是两次
     // write、turn 边界与命令不是 1:1；adopt 会话人机输入交错。带附件的消息整条按今天转发。
@@ -21942,16 +21948,16 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
     const cascadeDs = existingDs!; // 路由器只在活 worker 的相位上给出级联决策
     const cascadeDeps = commandDepsForInvocation({
       scope,
-      chatId: ctxChatId,
+      chatId: routingChatId,
       anchor,
       messageId: parsed.messageId,
       replyRootId,
     });
-    const cascadeChatId = cascadeDs.chatId ?? threadChatId;
+    const cascadeChatId = cascadeDs.chatId ?? chatId;
     // 与单条透传同一组闸，逐条命令过一遍：grant 限制、排队激活提交闸、/fast 后端门。
     for (const item of slashDecision.items) {
       if (item.kind !== 'passthrough') continue;
-      const restrictedText = grantRestrictedSlashCommandText(larkAppId, cascadeChatId, threadSenderOpenId, item.cmd);
+      const restrictedText = grantRestrictedSlashCommandText(larkAppId, cascadeChatId, senderOpenId, item.cmd);
       if (restrictedText) {
         await cascadeDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
         return true;
@@ -21981,8 +21987,8 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       ctx,
       parsed,
       replyRootId,
-      senderOpenId: threadSenderOpenId,
-      senderIsBot: isForeignBot,
+      senderOpenId: senderOpenId,
+      senderIsBot: isForeignBotSender,
       substitute: !!substituteTrigger,
     }).catch(err => {
       logger.error(`[${anchor.substring(0, 12)}] cascade failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -21991,9 +21997,9 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   }
   // grant 限制闸对认不出的 `/xxx` 同样要查（与新话题入口、改造前一致）。
   if (slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
-    const restrictedText = grantRestrictedSlashCommandText(larkAppId, existingDs?.chatId ?? threadChatId, threadSenderOpenId, slashDecision.cmd);
+    const restrictedText = grantRestrictedSlashCommandText(larkAppId, existingDs?.chatId ?? chatId, senderOpenId, slashDecision.cmd);
     if (restrictedText) {
-      await commandDepsForInvocation({ scope, chatId: ctxChatId, anchor, messageId: parsed.messageId, replyRootId })
+      await commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId })
         .sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
     }
@@ -22002,26 +22008,26 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
     const { cmd, content: commandContent } = slashDecision;
     const invocationDeps = commandDepsForInvocation({
       scope,
-      chatId: ctxChatId,
+      chatId: routingChatId,
       anchor,
       messageId: parsed.messageId,
       replyRootId,
     });
-    const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
-    const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
+    const effectiveThreadChatId = existingDs?.chatId ?? chatId;
+    const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, senderOpenId, cmd);
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'sessions') {
-      const botSender = isBotSenderType || isForeignBot;
+      const botSender = isBotSenderType || isForeignBotSender;
       if (!canTalkForGroupSessions(
         larkAppId,
         effectiveThreadChatId,
-        threadSenderOpenId,
-        threadTeamTrustUnionId,
-        threadSenderUnionId,
-        ctxChatType,
+        senderOpenId,
+        teamTrustUnionId,
+        senderUnionId,
+        chatType,
         botSender,
       )) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
@@ -22037,7 +22043,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       return true;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'vc-auth') {
-      if (!canOperate(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId)) {
+      if (!canOperate(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -22047,8 +22053,8 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         anchor,
         commandContent,
         mentions: parsed.mentions,
-        senderOpenId: threadSenderOpenId,
-        senderUnionId: threadSenderUnionId,
+        senderOpenId: senderOpenId,
+        senderUnionId: senderUnionId,
         // 同 new-topic 路径：仅在真正开始改状态后打接纳标。
         onMutating: () => markIngressAdmitted(ctx),
       });
@@ -22058,26 +22064,26 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
     // schema 表（special.thread），不再落进下面的 DAEMON_COMMANDS 块预建 worker:null 幽灵会话。
     // 有会话时两个 handler 内部按 anchor 自己取 ds，效果与原先经 handleCommand 的 switch 一致。
     if (slashDecision.kind === 'special' && slashDecision.handler === 'card') {
-      await handleCardCommand(anchor, larkAppId, effectiveThreadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      await handleCardCommand(anchor, larkAppId, effectiveThreadChatId ?? '', senderOpenId, commandContent, invocationDeps);
       return true;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'cot') {
-      await handleCotCommand(anchor, larkAppId, effectiveThreadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      await handleCotCommand(anchor, larkAppId, effectiveThreadChatId ?? '', senderOpenId, commandContent, invocationDeps);
       return true;
     }
     // /term only hands out a writable link for an ALREADY-live session — it must never
     // pre-create one; its own canOperate gate (inside the handler) is the sole authority.
     if (slashDecision.kind === 'special' && slashDecision.handler === 'term') {
-      await handleTermLinkCommand(anchor, larkAppId, threadChatId ?? '', threadSenderOpenId, commandContent, invocationDeps);
+      await handleTermLinkCommand(anchor, larkAppId, chatId ?? '', senderOpenId, commandContent, invocationDeps);
       return true;
     }
     if (slashDecision.kind === 'passthrough') {
-      if (slashDecision.delivery === 'cold_start' && threadChatId) {
+      if (slashDecision.delivery === 'cold_start' && chatId) {
         await startInitialPassthroughSession({
           promptResources: resources,
           larkAppId,
-          chatId: threadChatId,
-          chatType: ctxChatType,
+          chatId: chatId,
+          chatType: chatType,
           scope,
           anchor,
           messageId: parsed.messageId,
@@ -22085,21 +22091,21 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
           parsed,
           cmd,
           commandContent,
-          senderOpenId: threadSenderOpenId,
+          senderOpenId: senderOpenId,
           substitute: !!substituteTrigger,
-          senderUnionId: threadTeamTrustUnionId,
-          memberUnionId: threadSenderUnionId, // 原始 union（人腿），不锁 bot
-          botSender: isBotSenderType || isForeignBot,
+          senderUnionId: teamTrustUnionId,
+          memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
+          botSender: isBotSenderType || isForeignBotSender,
           // Reply attribution: platform-stamped OR cross-ref-resolved bot →
           // treat as bot for --mention-back (never mis-attribute a peer bot as
           // human when飞书 sender_type 缺失/变值但已识别 peer).
-          senderIsBot: isBotSenderType || isForeignBot,
+          senderIsBot: isBotSenderType || isForeignBotSender,
           cardlessForceTopicSeed: false,
           // Bot-started cold starts get no human owner (mirrors the auto-create
           // path) — see the ownership note on startInitialPassthroughSession.
-          ownerOpenId: isForeignBot ? undefined : threadSenderOpenId,
-          ownerUnionId: isForeignBot ? undefined : data?.sender?.sender_id?.union_id,
-          creatorOpenId: threadSenderOpenId,
+          ownerOpenId: isForeignBotSender ? undefined : senderOpenId,
+          ownerUnionId: isForeignBotSender ? undefined : data?.sender?.sender_id?.union_id,
+          creatorOpenId: senderOpenId,
           onDurablyAdmitted: () => markIngressAdmitted(ctx),
           routeToCanonicalOwner: () => handleThreadReplyAdmitted(data, {
             ...ctx,
@@ -22142,8 +22148,8 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
           messageId: parsed.messageId,
           replyRootId,
-          senderOpenId: threadSenderOpenId,
-          senderIsBot: isForeignBot,
+          senderOpenId: senderOpenId,
+          senderIsBot: isForeignBotSender,
           substitute: !!substituteTrigger,
           inThread: !!parsed.threadId,
           onDelivered: () => markIngressAdmitted(ctx),
@@ -22157,7 +22163,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // (see spawn-path gate above). Denies chat-granted users management commands.
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
-      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, threadSenderOpenId, threadTeamTrustUnionId, cmd, threadSenderUnionId, ctxChatType, isBotSenderType || isForeignBot, isBotSenderType)) {
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType)) {
         invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -22170,27 +22176,27 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // commands (/rename) must NOT get one — a pre-created worker:null session
       // would be a phantom conversation that only exists to be renamed. Let
       // handleCommand's `!ds` branch reply no_active_session instead.
-      if (threadChatId && slashDecision.sessionPolicy === 'precreate') {
-        const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
+      if (chatId && slashDecision.sessionPolicy === 'precreate') {
+        const session = sessionStore.createSession(chatId, anchor, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
         const now = Date.now();
-        if (ctxChatType === 'p2p') {
+        if (chatType === 'p2p') {
           setDirectChatDisplayNameFromSender(
             session,
-            ctxChatType,
+            chatType,
             await getThreadSender(),
           );
         }
         session.larkAppId = larkAppId;
-        session.ownerOpenId = threadSenderOpenId;
-        session.creatorOpenId = threadSenderOpenId;  // stable creator (= dispatch orchestrator for /repo prime) — see Session.creatorOpenId
+        session.ownerOpenId = senderOpenId;
+        session.creatorOpenId = senderOpenId;  // stable creator (= dispatch orchestrator for /repo prime) — see Session.creatorOpenId
         session.ownerUnionId = data?.sender?.sender_id?.union_id;
-        session.lastCallerOpenId = threadSenderOpenId;
+        session.lastCallerOpenId = senderOpenId;
         session.lastMessageAt = new Date(now).toISOString();
         session.scope = scope;
         fillNativeTopicId(session, scope, parsed.threadId);
         let cmdPending: Partial<DaemonSession> | undefined;
         if (cmd === '/repo') {
-          const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
+          const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId: chatId, chatType: chatType, larkAppId });
           if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
           cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
         }
@@ -22201,14 +22207,14 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
           workerPort: null,
           workerToken: null,
           larkAppId,
-          chatId: threadChatId,
-          chatType: ctxChatType,
+          chatId: chatId,
+          chatType: chatType,
           scope,
           spawnedAt: Date.parse(session.createdAt) || now,
           cliVersion: cliVersionCache.get(cliRuntimeVersionKey(getBot(larkAppId).config))?.version ?? 'unknown',
           lastMessageAt: now,
           hasHistory: false,
-          ownerOpenId: threadSenderOpenId,
+          ownerOpenId: senderOpenId,
           ...cmdPending,
         };
         const registration = await claimNewDaemonSession(activeSessions, cmdDs);
@@ -22223,7 +22229,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       }
       // Pass mention-stripped content so /command argument parsing works.
       // chatId lets session-less handlers (e.g. /group) reach the chat roster.
-      const cmdMessage = { ...parsed, content: commandContent, chatId: threadChatId };
+      const cmdMessage = { ...parsed, content: commandContent, chatId: chatId };
       if (slashDecision.sessionPolicy === 'sessionless') {
         // Fast-ACK for /group invoked mid-thread. See fireSessionlessCommandDetached.
         fireSessionlessCommandDetached(cmd, anchor, cmdMessage, larkAppId, invocationDeps);
@@ -22548,7 +22554,12 @@ async function handleThreadReplyAdmitted(
   }
 
   // 斜杠命令执行段已搬到 executeThreadSlash（输入全部显式）；true = 已处理。
-  if (await executeThreadSlash({ ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, ctxChatId, ctxChatType, threadChatId, threadSenderOpenId, threadSenderUnionId, threadTeamTrustUnionId, isBotSenderType, isForeignBot, substituteTrigger, getThreadSender })) return;
+  if (await executeThreadSlash({
+    ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent,
+    routingChatId: ctxChatId, chatType: ctxChatType, chatId: threadChatId,
+    senderOpenId: threadSenderOpenId, senderUnionId: threadSenderUnionId, teamTrustUnionId: threadTeamTrustUnionId,
+    isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender,
+  })) return;
 
   // 自定义回复拦截：该话题有未结的 ask 时，把这条文字当答案，走 submitCustomReply
   // settle 掉 ask（替代选项语义），不再当作新一轮指令喂给 CLI。此时发起 ask 的 CLI

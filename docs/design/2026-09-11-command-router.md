@@ -407,7 +407,7 @@ master 上同样红，见 §16.2）。
 
 1. **解析只有一处。** 任何"从原文判断这是什么"的逻辑——`/t` 头部、生命周期变体、斜杠命令、级联切分——都在 `core/` 的纯函数里；daemon 入口不含正则，只做"取上下文 → 调分类 → 按决策执行"。今天：✅（rebase 后把主干 #956 的 `/th` `/tw` 正则预判也收进了 `parseTopicHeader`）。dispatcher 侧的 pre-routing 命令（`/reply-mode` `/grant` `/tabs` …）仍各自判定——它们在切面 1 之前，属另一层，不在本设计范围。
 2. **一张表只说它守得住的话。** schema 登记的每个字段都有消费者与守卫；没有消费者的字段不进表。今天：✅（删了 `argShape` / `subcommands`）。`/help` 与用法串仍手写，但 help 键由守卫钉住，写错会红。
-3. **执行只有一份。** 两条入口对同一决策的执行只有一份代码（形如 `executeSlashDecision(decision, ctx)`）；入口差异——chat/thread 的 anchor、canTalk/canOperate 的参数、`/sessions` 的顶层回贴、级联仅 thread——成为显式的 ctx 字段，而不是两份平行代码。今天：❌ 各一份约 240 行，见 16.3。
+3. **执行段是两个输入显式、能并排对照的函数，差异有清单。** 原先的提法是"只有一份代码"；2026-09-17 做完 ①② 之后按 diff 裁定（16.3）：两条入口有 8 组差异、其中 3 组是入口本性，合成一个函数不比两个并排的函数更可读。今天：✅ `executeNewTopicSlash` / `executeThreadSlash`（输入 22 / 19 个显式字段、字段名已对齐、差异表在 16.3）；剩余的参数漂移逐条裁定属后续。
 4. **相位只声称路由用到的粒度。** 路由只区分"有没有会话 / 有没有活 worker"两档；九相位枚举保留给日志/看板，`deriveSessionPhase` 有直接测试；§5 矩阵是行为文档不是数据。今天：✅（文档收敛，代码不变）。
 5. **oracle 有退役条件。** oracle = "上一个发布基线的判定"。rebase 到主干时同步主干**新增的命令集合**（不改 oracle 的判定逻辑，本次 `/cleanup-wt` 即是）；发布一个版本并稳定后重新冻结为该版本，INTENTIONAL 清零。今天：✅ 规则写下并执行了一次。
 6. **真实 CLI 验证过。** 级联的 3s 忙态宽限与 120s 上限在真 CLI 上 dogfood 过，`/model` 这类回显慢的命令不会被误判空闲。今天：❌（本 worktree 不能重启 daemon，见 §15 末尾）。
@@ -425,7 +425,21 @@ master 上同样红，见 §16.2）。
 
 ### 16.3 没做的与建议的做法
 
-- **执行段合一（16.1 第 3 条）**——建议作为 PR-4，分三步、每步可独立合入：① 把两条入口的执行段各自抽成 `executeNewTopicSlash(ctx)` / `executeThreadSlash(ctx)` 两个函数（纯搬家，daemon 级测试不动）；② 对齐两个 ctx 的字段名与顺序；③ 合成一个函数，差异点用 `ctx.entry: 'newTopic' | 'thread'` 分支，每个分支点一条用例。风险在 daemon.ts 的 24k 行与现有测试对入口分支的覆盖不全，所以先做 ①——它已经把"两份"变成"两个能并排看的函数"，而不引入任何行为变化。
+- **执行段合一（16.1 第 3 条）**——作为 PR-4 分三步。**① 已做（2026-09-17）**：两段各自抽成 `executeNewTopicSlash` / `executeThreadSlash`，输入是显式字段的 ctx（22 / 19 个），返回 true 表示已处理；两段都不给外层变量赋值、只有提前 return，所以是纯搬家。**② 已做**：thread 侧字段名对齐到新话题侧（`threadSenderOpenId → senderOpenId` 等；两个 chatId 分别叫 `routingChatId`（dispatcher 给的，可能缺席，只喂 commandDepsForInvocation）和 `chatId`（话题所在群））。对齐之后把两个函数去掉注释做 `diff -U0`，35 个 hunk 归成下面 8 组差异——这就是 ③ 要面对的全部：
+
+  | # | 差异 | 新话题入口 | thread 入口 | 判断 |
+  |---|---|---|---|---|
+  | A | 分类输入 | `phase: 'none'`、透传集按 live bot 配置 | `phase = deriveSessionPhase(existingDs)`、透传集按会话冻结的 CLI、`cascadeCapable` / `hasAttachments` | 入口本性，保留 |
+  | B | 级联在飞推迟 + 级联派发 | 无 | 有（≈60 行） | 入口本性，保留 |
+  | C | 闸与特判用的群 id | `chatId` | `existingDs?.chatId ?? chatId`（`/term` 例外：用裸 `chatId`） | `/term` 那处像漂移；其余是"以会话记录的群为准"的刻意做法 |
+  | D | `commandDepsForInvocation` 的 chatId | `chatId` | `routingChatId`（可能 undefined） | 疑似漂移，未证实有观测差异 |
+  | E | `/sessions` 顶层回贴 | 按 `ctx.regularGroupTopLevel` 改写 anchor/deps | 无 | thread 路上该旗标恒假，可共用同一段代码而不改行为 |
+  | G | 冷启动透传 | 受 `forceTopicMode !== 'worktree'` 闸；`botSender: isBotSenderType`、`senderIsBot: isForeignBotSender`、`cardlessForceTopicSeed: forceTopic !== null`、owner 恒为发送者 | 要求 `chatId` 存在；`botSender` / `senderIsBot` 都是 `isBot \|\| isForeign`、`cardlessForceTopicSeed: false`、外部 bot 发起则 owner 为空；非冷启动时还有排队激活闸、`/fast` 后端门、送进已有会话、`cmd_needs_active_cli` | 前半是有意的身份策略差异（源码守卫 `initial-passthrough-ownership` 钉着），后半是入口本性 |
+  | H | `canRunDaemonCommand` 第 8 个参数 | `isBotSenderType` | `isBotSenderType \|\| isForeignBotSender` | 语义差异：thread 把外部 bot 也按 bot 过 talk 级名单；是否刻意待查 |
+  | I | 预建会话 | rootId `scope==='thread' ? anchor : messageId`；不设 `creatorOpenId`；stage `turnId: replyAnchorId`；p2p 显示名走 `resolveSender` | rootId 恒 `anchor`；设 `creatorOpenId`；`turnId: parsed.messageId`；走缓存的 `getThreadSender`；整块受 `chatId &&` 保护 | 三处是语义差异（会话组开场的 turnId、chat-scope 的 rootId、creator），其余等价 |
+  | J | daemon 命令的派发顺序与消息形状 | 闸 → sessionless → existingOnly → 预建+handleCommand；handleCommand 的消息不带 chatId | 闸 → 预建（仅 precreate）→ sessionless → handleCommand；消息带 `chatId` | 按政策逐条对照结果等价；消息多一个 chatId 字段是漂移 |
+
+  **③ 的裁定：不合成一个函数。** 8 组里 A、B、G 后半是入口本性，C/D/H/I/J 是多年各自演化出的参数漂移——合成一个函数意味着 300 行里塞十来个 `ctx.entry` 分支，可读性反而不如两个并排的函数。有切实收益的下一步是两件小事：(a) 把两边逐字相同的块抽成带显式参数的 helper（五个前置特判的派发、预建会话那 45 行），让 C/I 的漂移显形在参数上；(b) 对 C 的 `/term`、D、H、I、J 逐条决定"统一还是保留"，每条统一都是 §9 级别的有意变化、各配一条用例。这两件没有在本轮做。
 - **`/help` 从 schema 生成**：要为每条命令定义分节与顺序，本质是文案重排；今天守卫已保证键不漏，收益低于成本，不做。
 - **dispatcher 层的 pre-routing 命令进表**：`/reply-mode` `/grant` `/tabs` 等在切面 1 之前判定，与 daemon 命令不是一个层；若要统一，是另一份设计。
 - **dogfood**：§15 末尾的清单不变，第一件仍是级联的 3s 忙态宽限对 `/model` 是否合适。
