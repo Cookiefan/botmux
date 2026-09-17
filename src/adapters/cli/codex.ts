@@ -13,13 +13,18 @@ import { discoverRolloutSessions } from '../../services/resumable-session-discov
 import { delay, scaleMs } from '../../utils/timing.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
+const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
 
-/** ZMX resume can replace the entire banner with restored history. The native
- * restoration header and the bottom empty composer + explicit Ready footer
- * prove initialization without guessing the PTY's current viewport geometry.
+/** ZMX resume can replace the entire banner with restored history; warm worker
+ * reattach can leave the original loaded banner far above the viewport. Either
+ * native header plus a bottom empty composer + explicit Ready footer proves
+ * initialization without guessing the PTY's current viewport geometry.
  * Do not use a prompt/footer found in the middle of scrollback as evidence. */
 function restoredCodexHistoryReady(history: string): boolean {
-  if (!/^\s*Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript[ \t]*(?:\r?\n|$)/.test(history)) return false;
+  const restored = /^\s*Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript[ \t]*(?:\r?\n|$)/.test(history);
+  const banner = history.match(/^\s*╭[^\r\n]*╮\r?\n[\s\S]*?╰[^\r\n]*╯/)?.[0];
+  const initialized = !!banner && banner.includes('>_ OpenAI Codex') && CODEX_STARTUP_READY_PATTERN.test(banner);
+  if (!restored && !initialized) return false;
   const lines = history.trimEnd().split(/\r?\n/);
   const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
   if (fromBottom < 0) return false;
@@ -467,7 +472,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // models/paths. The footer can already show a model during loading. Match
     // cell boundaries, not literal newlines: PTY redraws also move the cursor.
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
-    startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
+    startupReadyPattern: CODEX_STARTUP_READY_PATTERN,
     startupReadyFromHistory: restoredCodexHistoryReady,
     // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
     // Wait for the real composer marker so the bare-shell guard does not treat

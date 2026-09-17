@@ -240,6 +240,17 @@ describe('codex 启动闸：worker 侧接线', () => {
 });
 
 describe('Codex restored ZMX history startup evidence', () => {
+  it('accepts the native initialized banner above a long conversation when its bottom composer is Ready', () => {
+    const { detector, idle } = newDetector();
+    try {
+      const banner = INITIALIZED_SCREEN.split('\n\n  Tip:')[0];
+      const history = banner + '\n' + 'old output\n'.repeat(60)
+        + RESUMED_HISTORY.slice(RESUMED_HISTORY.lastIndexOf('›'));
+      expect(detector.observeStartupHistory(history)).toBe(true);
+      expect(detector.isStartupComplete()).toBe(true);
+      expect(idle).not.toHaveBeenCalled();
+    } finally { detector.dispose(); }
+  });
   it.each([false, true])('releases resumed history without a banner, loading observed=%s', (loadingSeen) => {
     const { detector, idle } = newDetector();
     try {
