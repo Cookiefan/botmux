@@ -2526,24 +2526,6 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
  *
  *  Legacy `action`/`async` fields are still populated so existing webhook
  *  consumers keep working; new callers branch on `state`. */
-/** Walk a durable steer-park chain (T1→T2→…→Tn) to the first TERMINAL
- *  successor. Returns undefined when the chain is absent, ends pending, or a
- *  hop is missing. Bounded against cycles/long chains (FIFO successors are
- *  always distinct, later turns, but never trust on-disk shape blindly). */
-function followSteerParkedChain(
-  sessionId: string,
-  firstSuccessorTurnId: string,
-): ReturnType<typeof asyncTriggerStore.lookup> {
-  let next: string | undefined = firstSuccessorTurnId;
-  for (let hops = 0; next !== undefined && hops < 8; hops++) {
-    const hit = asyncTriggerStore.lookup(sessionId, next);
-    if (!hit) return undefined;
-    if (hit.result.status === 'completed' || hit.result.status === 'failed') return hit;
-    next = hit.result.steerParkedBy;
-  }
-  return undefined;
-}
-
 function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
   const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
@@ -2584,7 +2566,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   // terminal evidence). A chain that still ends pending keeps the turn `running`.
   if (persisted?.result.status === 'pending' && persisted.result.steerParkedBy) {
     const owner = persisted.ownerLarkAppId ?? cachedLarkAppId ?? '';
-    const terminal = followSteerParkedChain(sessionId, persisted.result.steerParkedBy);
+    const terminal = asyncTriggerStore.followSteerParkedChain(sessionId, persisted.result.steerParkedBy);
     if (terminal && owner) {
       const r = terminal.result;
       const at = (r.status === 'completed' ? r.completedAt : r.failedAt) ?? Date.now();

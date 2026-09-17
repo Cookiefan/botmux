@@ -179,6 +179,7 @@ codex 对合并的 steer 组只产出**一条合并 final**：runner 给前 N−
 
 - Lark sink：旧行为（superseded 成员只推进 FIFO，不投递）。
 - **HTTP sink（`http_async` / `http_wait`，本次新增）**：superseded 成员先 **park**（内存 fanout 表 + `async-triggers` 文件里的 `steerParkedBy` 后继指针链，仅 http_async 写 durable）；真 final 落盘后把**同一份合并正文** fan-out 给组内每个已 park 成员（wait promise resolve / async result `completed` + `recordCompleted`，**不带 usage**——用量只记在最新 trigger 上），并清掉其 `idempotentAsyncTurns` 收敛项，避免随后 worker 优雅退出把已合并轮误判失败。
-- daemon 在「superseded pop → 真 final」之间重启：poll 时 `buildAsyncTriggerLookupResponse` 沿 `steerParkedBy` 链走到第一个终态后继，completed 镜像正文、failed 镜像终态证据；链仍 pending 则继续 `running`。
+- daemon 在「superseded pop → 真 final」之间重启：poll 时 `buildAsyncTriggerLookupResponse` 用 `asyncTriggerStore.followSteerParkedChain` 沿 `steerParkedBy` 链走到第一个终态后继，completed 镜像正文、failed 镜像终态证据；链仍 pending 则继续 `running`。链遍历**无跳数上限**（组成员数无界，限制跳数会在 daemon 恰好重启于大组中段时把早期成员永久挂 running），终止性靠 visited 集合——FIFO 后继天然互异且更晚，revisit 只可能是盘上损坏的环，遇环 fail-closed 返回 undefined（继续 running）。
+- 两个已知边界（review 确认接受）：① `http_wait` 是纯内存 promise，不写 durable 记录（wait 模式既有契约），daemon 重启即断连，park 链只救 `http_async`；② 后继指针指向的是 FIFO 上紧邻的下一 head，若该后继是交错派发的非 steer 普通 turn（riff 顺序派发，实际罕见），parked 成员镜像该普通 turn 的 final——归因仍合理（用户视角就是这之后的第一条模型产出）。
 
 安全面不变：`POST /api/trigger` 本就是 core-only loopback 的「驱动我自己的 turn」面，steer 只授权注入**同一租户自己的**活跃 turn，无新增路由、无跨会话能力；R4/R5 的 superseded 守卫扩展为 `lark | http_async | http_wait` 三种 sink，VC / doc_comment / suppressed / sink 缺失 / 唯一 head 仍一律 ACK=false 拒绝。

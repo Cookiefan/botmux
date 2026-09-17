@@ -413,6 +413,39 @@ export function lookupStrict(sessionId: string, triggerId?: string): {
   return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
 }
 
+/** Walk a durable steer-park chain (T1→T2→…→Tn) from `firstSuccessorTurnId`
+ *  to the first TERMINAL successor. Returns undefined when the chain is absent,
+ *  ends in a pending record without a pointer, or a hop is missing — the caller
+ *  then keeps reporting `running` (the group's real final may simply not be on
+ *  disk yet).
+ *
+ *  No hop COUNT limit: a legitimate steer group can have arbitrarily many
+ *  members, and capping the restart-insurance walk would strand early members
+ *  (running until session close) only when the daemon restarted mid-group.
+ *  Termination is guaranteed instead by a VISITED set: FIFO successors are
+ *  always distinct later turns, so a revisit can only come from a corrupt
+ *  on-disk cycle, which fails closed (undefined → stay running, never loop). */
+export function followSteerParkedChain(
+  sessionId: string,
+  firstSuccessorTurnId: string,
+): {
+  triggerId: string;
+  result: PersistedAsyncTriggerResult;
+  ownerLarkAppId?: string;
+} | undefined {
+  const visited = new Set<string>();
+  let next: string | undefined = firstSuccessorTurnId;
+  while (next !== undefined) {
+    if (visited.has(next)) return undefined;
+    visited.add(next);
+    const hit = lookup(sessionId, next);
+    if (!hit) return undefined;
+    if (hit.result.status === 'completed' || hit.result.status === 'failed') return hit;
+    next = hit.result.steerParkedBy;
+  }
+  return undefined;
+}
+
 /** Delete a session's persisted async results (called on session close). */
 export function deleteResults(sessionId: string): void {
   const fp = getFilePath(sessionId);

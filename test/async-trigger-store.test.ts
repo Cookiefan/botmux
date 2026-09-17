@@ -36,6 +36,7 @@ import {
   lookupStrict,
   deleteResults,
   recordSteerParked,
+  followSteerParkedChain,
 } from '../src/services/async-trigger-store.js';
 
 beforeEach(() => {
@@ -282,29 +283,61 @@ describe('recordSteerParked (HTTP steer group restart insurance)', () => {
     recordSteerParked('sessS3', 'trg_2', 'trg_3', 2100, 'cli_test');
     // Real merged final lands on the last member.
     recordCompleted('sessS3', 'trg_3', 'merged answer', 4000, 'cli_test');
-    // Poll-time resolution mirrors buildAsyncTriggerLookupResponse: walk the
-    // whole steerParkedBy chain to its first TERMINAL successor, then mirror
-    // that outcome back onto the requested parked member. Poll order is
-    // independent — each member resolves itself on demand.
-    const resolveParked = (first: string): void => {
-      let next: string | undefined = first;
-      let terminal: ReturnType<typeof lookup> | undefined;
-      for (let hops = 0; next && hops < 8; hops++) {
-        const hit = lookup('sessS3', next);
-        if (!hit) return;
-        if (hit.result.status !== 'pending') { terminal = hit; break; }
-        next = hit.result.steerParkedBy;
+    // The exported chain walk finds the first TERMINAL successor; poll-time
+    // resolution then mirrors that outcome onto each parked member.
+    for (const member of ['trg_1', 'trg_2']) {
+      const terminal = followSteerParkedChain('sessS3', member);
+      if (terminal?.result.status === 'completed') {
+        recordCompleted('sessS3', member, terminal.result.content ?? '', terminal.result.completedAt ?? 0, 'cli_test');
       }
-      const start = lookup('sessS3', first);
-      if (terminal?.result.status === 'completed' && start?.result.status === 'pending') {
-        recordCompleted('sessS3', first, terminal.result.content ?? '', terminal.result.completedAt ?? 0, 'cli_test');
-      }
-    };
-    resolveParked('trg_1');
-    resolveParked('trg_2');
+    }
     expect(lookup('sessS3', 'trg_1')?.result.content).toBe('merged answer');
     expect(lookup('sessS3', 'trg_2')?.result.content).toBe('merged answer');
     expect(lookup('sessS3', 'trg_3')?.result.content).toBe('merged answer');
+  });
+
+  it('followSteerParkedChain has no hop-count cap: a long (>8) chain still reaches the terminal', () => {
+    const COUNT = 12;
+    recordPending('sessLong', 'trg0', 1000, 'cli_test');
+    for (let i = 0; i < COUNT; i++) {
+      recordPending('sessLong', `trg${i + 1}`, 1000 + i, 'cli_test');
+      recordSteerParked('sessLong', `trg${i}`, `trg${i + 1}`, 1000 + i, 'cli_test');
+    }
+    recordCompleted('sessLong', `trg${COUNT}`, 'far merged answer', 9000, 'cli_test');
+    const hit = followSteerParkedChain('sessLong', 'trg0');
+    expect(hit?.triggerId).toBe(`trg${COUNT}`);
+    expect(hit?.result.status).toBe('completed');
+    expect(hit?.result.content).toBe('far merged answer');
+  });
+
+  it('followSteerParkedChain returns undefined on a corrupt on-disk cycle (never loops)', () => {
+    recordPending('sessCyc', 'a', 1000, 'cli_test');
+    recordPending('sessCyc', 'b', 1000, 'cli_test');
+    recordSteerParked('sessCyc', 'a', 'b', 1100, 'cli_test');
+    recordSteerParked('sessCyc', 'b', 'a', 1200, 'cli_test');
+    expect(followSteerParkedChain('sessCyc', 'a')).toBeUndefined();
+  });
+
+  it('followSteerParkedChain returns undefined when a hop is missing or the chain ends pending', () => {
+    recordPending('sessMiss', 'p1', 1000, 'cli_test');
+    recordSteerParked('sessMiss', 'p1', 'gone', 1100, 'cli_test');
+    expect(followSteerParkedChain('sessMiss', 'p1')).toBeUndefined();
+
+    recordPending('sessEnd', 'e1', 1000, 'cli_test');
+    recordPending('sessEnd', 'e2', 1000, 'cli_test');
+    recordSteerParked('sessEnd', 'e1', 'e2', 1100, 'cli_test'); // e2 has no pointer, no terminal
+    expect(followSteerParkedChain('sessEnd', 'e1')).toBeUndefined();
+  });
+
+  it('followSteerParkedChain returns a failed terminal successor (not just completed)', () => {
+    recordPending('sessF', 'f1', 1000, 'cli_test');
+    recordPending('sessF', 'f2', 1000, 'cli_test');
+    recordSteerParked('sessF', 'f1', 'f2', 1100, 'cli_test');
+    recordTerminalFailureStrict('sessF', 'f2', 2000, 'cli_test', 'provider_500');
+    const hit = followSteerParkedChain('sessF', 'f1');
+    expect(hit?.triggerId).toBe('f2');
+    expect(hit?.result.status).toBe('failed');
+    expect(hit?.result.terminalErrorCode).toBe('provider_500');
   });
 
   it('strict loader accepts the parked shape and rejects a marker on a non-pending record', () => {
