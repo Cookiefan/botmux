@@ -190,11 +190,12 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
     // codex + codex-app collapse into one「Codex」二级菜单 at codex's position.
     if (o.id === 'codex') return [{ key: 'codex', label: 'Codex', children: CODEX_VARIANTS }];
     if (o.id === 'codex-app') return [];
-    // coco + traex collapse into one「TRAE CLI」submenu at coco's position.
+    // coco + traex collapse into one「TRAE CLI」submenu at coco's position;
+    // Forge x TraeX stays a first-class top-level launch shape.
     // Keep the underlying CLI_OPTIONS / numeric cliId mapping untouched.
     if (o.id === 'coco') return [
       { key: 'trae', label: 'TRAE CLI', children: TRAE_VARIANTS },
-      { key: 'forge', label: 'Forge', children: FORGE_VARIANTS },
+      { key: 'forge-x-traex', label: 'Forge x TraeX', option: FORGE_X_TRAEX },
     ];
     if (o.id === 'traex') return [];
     // Pi and Oh My Pi are kept as adjacent leaves (emitted together at pi's spot).

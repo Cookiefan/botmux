@@ -82,12 +82,16 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(flatKeys.indexOf('forge-x-traex')).toBe(flatKeys.indexOf('coco') + 1);
   });
 
-  it('cascades Forge into its own submenu with Forge x TraeX', () => {
-    const forge = CLI_SELECT_TREE.find((g) => g.key === 'forge');
-    expect(forge?.label).toBe('Forge');
-    expect(forge?.children?.map((c) => c.key)).toEqual(['forge-x-traex']);
-    expect(forge?.option).toBeUndefined();
-    expect(CLI_SELECT_TREE.find((g) => g.key === 'forge-x-traex')).toBeUndefined();
+  it('exposes Forge x TraeX as a first-class top-level launch shape', () => {
+    const forge = CLI_SELECT_TREE.find((g) => g.key === 'forge-x-traex');
+    expect(forge?.label).toBe('Forge x TraeX');
+    expect(forge?.option).toEqual({
+      key: 'forge-x-traex',
+      label: 'Forge x TraeX',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    });
+    expect(forge?.children).toBeUndefined();
     expect(resolveCliSelection('forge-x-traex')).toEqual({ cliId: 'traex', cliLaunchMode: 'forge-traex' });
   });
 

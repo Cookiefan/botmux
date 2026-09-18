@@ -77,8 +77,8 @@ describe('truncateToWidth', () => {
 
 describe('matchesSelectItem', () => {
   it('matches hidden search text used by cascaded CLI groups', () => {
-    const item = { label: 'Forge', submenu: true, searchText: 'forge-x-traex Forge x TraeX' };
-    expect(matchesSelectItem(item, 'Forge')).toBe(true);
+    const item = { label: 'TRAE CLI', submenu: true, searchText: 'traex TRAE CLI 2.0 coco TRAE CLI 1.0' };
+    expect(matchesSelectItem(item, 'TRAE')).toBe(true);
     expect(matchesSelectItem(item, 'traex')).toBe(true);
     expect(matchesSelectItem(item, 'codex')).toBe(false);
   });

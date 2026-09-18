@@ -2,6 +2,8 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNod
 import { createPortal } from 'react-dom';
 import { cloneSourceDefaultsFrom, openBotOnboarding } from './bot-onboarding.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
+import { BlockedUsersEditor } from './blocked-users-editor.js';
+import { QuietPresetSection } from './quiet-preset-section.js';
 import {
   agentSelectionKey,
   cliIdOf,
@@ -62,7 +64,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
@@ -774,6 +776,8 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: body.autoStartOnGroupJoinSeed,
+    groupJoinCommandEnabled: body.groupJoinCommandEnabled,
+    groupJoinCommand: body.groupJoinCommand,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
@@ -1146,6 +1150,7 @@ function BotDefaultsCard(props: {
             ) : null}
             <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><BlockedUsersEditor larkAppId={bot.larkAppId} tr={tr} /></section>
             <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -2367,7 +2372,7 @@ export function BotAgentSection(props: {
     } else {
       setModel(current => current.trim() === cliState.ttadkModelDefault ? '' : current);
     }
-    if (selectedAgentCliId(nextKey) !== 'traex') {
+    if (!isBackendVariantCliId(selectedAgentCliId(nextKey))) {
       setModelBackendVariant('');
       setModelBackendVariantTouched(true);
     }
@@ -2463,7 +2468,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        ...(saveCliId === 'traex' && modelBackendVariantTouched ? { modelBackendVariant } : {}),
+        ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
@@ -2673,7 +2678,7 @@ export function BotAgentSection(props: {
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const selectedCliId = selectedAgentCliId(cliKey);
   const isRiff = selectedCliId === 'riff';
-  const isTraex = selectedCliId === 'traex';
+  const isTraex = isBackendVariantCliId(selectedCliId);
   const isCodexSelection = selectedCliId === 'codex' || selectedCliId === 'codex-app';
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   // The dsh adapter is the only one that forwards a runner turn timeout.
@@ -3380,7 +3385,11 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
   // 编辑态软预填：未自定义时显示内置默认文案，只有点保存才落盘（空 = 跟随动态默认）。
   const [seed, setSeed] = useState(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
+  const [joinCmdOn, setJoinCmdOn] = useState(bot.groupJoinCommandEnabled === true);
+  const [joinCmd, setJoinCmd] = useState(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   const [status, setStatus] = useState<StatusMessage>(null);
+  // 同一块里有两排按钮，状态提示跟着最后操作的那一排显示。
+  const [statusKey, setStatusKey] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
@@ -3388,6 +3397,8 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
     setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
+    setJoinCmdOn(bot.groupJoinCommandEnabled === true);
+    setJoinCmd(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   }, [
     bot.larkAppId,
     bot.autoStartOnGroupJoin,
@@ -3395,11 +3406,14 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     bot.autoStartOnGroupJoinSeed,
     bot.autoStartOnGroupJoinSeedDefault,
     bot.autoStartOnNewTopic,
+    bot.groupJoinCommandEnabled,
+    bot.groupJoinCommand,
   ]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
     setBusy(key);
     setStatus(null);
+    setStatusKey(key);
     try {
       const res = await putCardPref(patch);
       setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
@@ -3472,7 +3486,36 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
             {tr('botDefaults.autoStartJoinSeedReset')}
           </button>
         ) : null}
-        <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />
+        {statusKey?.startsWith('joincmd') ? null : <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />}
+      </div>
+      <ToggleRow
+        checked={joinCmdOn}
+        disabled={busy === 'joincmd-toggle' || (!joinCmdOn && !(bot.groupJoinCommand ?? '').trim())}
+        dataAction="toggle-group-join-command"
+        title={tr('botDefaults.groupJoinCommand')}
+        help={tr('botDefaults.groupJoinCommandHelp')}
+        onChange={checked => {
+          setJoinCmdOn(checked);
+          void savePatch({ groupJoinCommandEnabled: checked }, 'joincmd-toggle');
+        }}
+      />
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.groupJoinCommandFieldHelp')}>{tr('botDefaults.groupJoinCommandField')}</FieldTitle>
+          <textarea
+            data-input="groupJoinCommand"
+            rows={2}
+            placeholder={tr('botDefaults.groupJoinCommandPlaceholder')}
+            value={joinCmd}
+            onChange={event => setJoinCmd(event.currentTarget.value)}
+          />
+        </label>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-group-join-command" disabled={busy === 'joincmd'} onClick={() => void savePatch({ groupJoinCommand: joinCmd }, 'joincmd')}>
+          {tr('botDefaults.groupJoinCommandSave')}
+        </button>
+        {statusKey?.startsWith('joincmd') ? <StatusSpan status={status} attr={{ 'data-group-join-command-status': '' }} /> : null}
       </div>
     </div>
   );
@@ -4433,6 +4476,18 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             />
           </div>
           {replyMode === 'legacy' && pinToggle}
+          <QuietPresetSection
+            tr={tr}
+            thinkingCard={thinkingCard}
+            silentReactions={silentReactions}
+            disableStreaming={disableStreaming}
+            putCardPref={putCardPref}
+            onApplied={() => {
+              setThinkingCard(false);
+              setSilentReactions(true);
+              setDisableStreaming(true);
+            }}
+          />
         </section>
 
         <section className="bd-card-setting-group" data-card-buttons-group>

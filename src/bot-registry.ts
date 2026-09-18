@@ -51,7 +51,7 @@ import {
   normalizeReplyStyleConfig,
   type ReplyStyleConfig,
 } from './im/lark/reply-card-style.js';
-import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
   type NativeSubagentRuntimePolicy,
@@ -1665,6 +1665,20 @@ export interface BotConfig {
   workingDirs?: string[];
   allowedUsers?: string[];
   /**
+   * 黑名单（纯增量「否决腿」，与 allowedUsers 白名单独立）：原始条目形态与
+   * allowedUsers 完全一致（邮箱 / 手机号 / on_ / ou_ 混写），daemon 启动期复用
+   * 同一套 resolveAllowedUsersWithMap + sidecar 缓存解析成**本 app 视角**的
+   * open_id（resolvedBlockedUsers）。注意 `ou_` 与 allowedUsers 一样是
+   * app-scoped：只对本飞书应用有效，不能从别的 Bot 配置复制。
+   *
+   * 语义：命中黑名单的 sender 在 evaluateTalk 里于 allowedUser 命中腿**之后**、
+   * 其它所有放行腿（oncall / peer / team / grants / open …）**之前**被否决，
+   * canOperate 同腿；黑名单不进 dashboard owner 描述符。owner / 管理员
+   * （resolvedAllowedUsers）不可被拉黑——写入口 setBotBlockedUsers 有守卫，
+   * 判定顺序是双保险。空/缺省 = 不否决任何人。
+   */
+  blockedUsers?: string[];
+  /**
    * Owner's native app-scoped `open_id` (`ou_…`), captured at setup from the
    * device-flow scanner identity. UNLIKE `allowedUsers` (which may hold `on_`/
    * email entries needing a contact-API resolve every boot), this is stored raw
@@ -2025,6 +2039,20 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinSeed?: string;
   /**
+   * 主动开工 — 入群执行命令开关。true 且 {@link groupJoinCommand} 非空时，bot 被拉进
+   * 任意群就直接执行该命令（不起 CLI 会话、不经 LLM），与 {@link autoStartOnGroupJoin}
+   * 互相独立、可同时开。不做 allowedUser 在群闸：命令本身由 bot 管理员配置，
+   * 典型场景是告警平台拉的应急群里人还没进来就要先跑诊断脚本。
+   */
+  groupJoinCommandEnabled?: boolean;
+  /**
+   * 主动开工 — 入群执行的命令。执行契约同 hooks.json（无 shell、按空白/引号切分参数、
+   * 最小 env 白名单）；stdin 是 JSON `{event:'chat.bot_added', larkAppId, chatId,
+   * operatorOpenId, emittedAt}`，另有 BOTMUX_JOIN_CHAT_ID / BOTMUX_JOIN_LARK_APP_ID /
+   * BOTMUX_JOIN_OPERATOR_OPEN_ID 环境变量；超时 10 分钟杀进程组。
+   */
+  groupJoinCommand?: string;
+  /**
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
    *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
@@ -2179,6 +2207,9 @@ export interface BotState {
   resolvedAllowedUsers: string[];
   /** raw allowedUsers 条目 → 解析后的 open_id。供 /revoke 反查并删除 email 形式的 raw 条目。 */
   rawAllowedUserResolution: Map<string, string>;
+  /** blockedUsers 原始条目解析后的本 app open_id（纯否决腿，启动期 best-effort 解析，
+   *  缺省 [] = 不否决任何人）。与 resolvedAllowedUsers 共用同一 sidecar 缓存。 */
+  resolvedBlockedUsers: string[];
 }
 
 export type NativeSubagentRuntimeConfigState =
@@ -2405,6 +2436,7 @@ export function registerBot(cfg: BotConfig): BotState {
     uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
+    resolvedBlockedUsers: [],
   };
   // p2pOpen 是一次显式的权限边界声明（进入限制态），但它只授 talk。没有 allowedUsers 就
   // 没有任何人能 operate（/restart、/cd、卡片按钮全锁死），也没有 owner 可以处置授权卡 ——
@@ -3576,7 +3608,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.model.trim()
         : undefined,
       groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
-      modelBackendVariant: entryCliId === 'traex'
+      modelBackendVariant: isBackendVariantCliId(entryCliId)
         && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
         ? entry.modelBackendVariant
         : undefined,
@@ -3634,6 +3666,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
+      // 与 allowedUsers 同款原始条目（邮箱/手机/on_/ou_），daemon 启动期复用同一套
+      // 解析缓存换成本 app open_id；非数组 / 空归一为 undefined，保持 bots.json 干净。
+      blockedUsers: Array.isArray(entry.blockedUsers)
+        ? (normalizeStringList(entry.blockedUsers) || undefined)
+        : undefined,
       // Only a well-formed native open_id is trusted; anything else (stray on_/
       // email/garbage) is dropped so the fail-safe recipient can never be a
       // value that itself needs resolving.
@@ -3746,6 +3783,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
+      groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
+        ? entry.groupJoinCommand.trim()
+        : undefined,
       // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
       // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
       allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
