@@ -271,6 +271,7 @@ import {
   silentIdleCardFlag,
   dshRuntimeForSession,
   recordTurnExplicitMention,
+  pruneSteerFanoutState,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
@@ -25308,6 +25309,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       vcMeetingRuntimeLeaseRecovery.acknowledge(context);
     },
     async onCodexAppLedgerDrained(ds) {
+      // Reap any parked HTTP steer-group members for this session: with the
+      // FIFO empty no real-final settle can still fan them out. The success
+      // path already consumed the entry, so this only fires on failure/retire
+      // drain shapes.
+      pruneSteerFanoutState(ds.session.sessionId);
       await withBotTurnMutation(ds.larkAppId, async () => {
         await closeCliMismatchedSessionsForBot(ds.larkAppId);
       });

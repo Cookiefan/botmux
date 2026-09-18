@@ -114,6 +114,7 @@ import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
   postTurnStartingCard,
+  pruneSteerFanoutState,
   __testOnly_setupWorkerHandlers,
   sendWorkerInput,
   __testOnly_resetOrdinaryImDeliveries,
@@ -1208,6 +1209,76 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     await vi.waitFor(() => expect(resolveRootWait).toHaveBeenCalledWith('merged answer'));
     await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('HTTP steer: pruning fanout state on ledger drain stops a later real final resolving the parked failure-group member', async () => {
+    // Failure shape: the group's last head dies (turn_terminal / recovery fence)
+    // and the ledger drains WITHOUT a real final settle. The onCodexAppLedgerDrained
+    // chokepoint prunes the parked in-memory fanout state so the parked member
+    // converges through its own terminal/closed-session paths — and a final that
+    // settles afterwards must never retroactively fan content into it (the FIFO
+    // group is already over).
+    const sessionReply = vi.fn(async () => 'om_delivered');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-http-steer-prune';
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.asyncTriggerResults = new Map([
+      ['turn-prune-1', { status: 'pending' as const, createdAt: 1 }],
+      ['turn-prune-2', { status: 'pending' as const, createdAt: 2 }],
+    ]);
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-prune-1', turnId: 'turn-prune-1', state: 'prepared', content: '', deliverySink: 'http_async', codexAppSteerable: true },
+      { dispatchId: 'd-prune-2', turnId: 'turn-prune-2', state: 'accepted', content: 'merged answer', deliverySink: 'http_async', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // Member 1 settles superseded → parked for fan-out.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-prune-1', turnId: 'turn-prune-1',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-prune-1', generation: 'gen-prune', seq: 1, dispatchId: 'd-prune-1' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-prune-1', ok: true })));
+    expect(ds.asyncTriggerResults.get('turn-prune-1')?.status).toBe('pending');
+
+    // The failure path drains the ledger (terminal/recovery fence). The daemon's
+    // onCodexAppLedgerDrained chokepoint prunes the parked group state at that
+    // point. Simulate that prune while T2 is still queued.
+    pruneSteerFanoutState(ds.session.sessionId);
+
+    // T2 then settles through the normal FIFO path (submit → real final). With
+    // the park table pruned its real final must NOT fan out to member 1.
+    (ds.worker as any).emit('message', {
+      type: 'codex_app_dispatch_transition',
+      sessionId: ds.session.sessionId,
+      requestId: 'prepare-prune-2',
+      operation: 'submit',
+      entries: [{ dispatchId: 'd-prune-2', turnId: 'turn-prune-2' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'late merged answer', lastUuid: 'uuid-prune-2', turnId: 'turn-prune-2',
+      codexAppSettlement: { requestId: 'settle-prune-2', generation: 'gen-prune', seq: 2, dispatchId: 'd-prune-2' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    // T2 completes normally; wait for its SETTLEMENT ACK, not just the
+    // asyncResult completion — fan-out runs synchronously right after that ACK
+    // in the same handler continuation, so observing the ACK proves any
+    // (incorrect) fan-out onto member 1 has already happened or been skipped.
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-prune-2', ok: true })));
+    // Member 1 was pruned and stays pending for its own convergence path — the
+    // pruned park table must NOT have fanned T2's content into it.
+    expect(ds.asyncTriggerResults.get('turn-prune-1')?.status).toBe('pending');
+    expect(ds.asyncTriggerResults.get('turn-prune-1')?.content).toBeUndefined();
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
