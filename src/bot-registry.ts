@@ -45,6 +45,7 @@ import {
   type CodexBrowserConfig,
 } from './core/codex-browser-config.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
+import { normalizeOncallGroupPolicy, type OncallGroupPolicy } from './services/oncall-group-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import {
@@ -265,12 +266,17 @@ export interface MessageListenerConfig {
     matchMode?: 'any' | 'all';
   };
   replyPolicy?: {
-    /** V1 always replies under the triggering message. */
-    mode?: 'thread';
+    /** `thread` replies under the triggering message; `chat` posts at group top level. */
+    mode?: 'thread' | 'chat';
     /** V1 starts one session per matched message. */
     sessionMode?: 'per_message';
   };
 }
+
+/** A group may opt out of its bot's default listener or replace it entirely. */
+export type GroupMessageListenerOverride =
+  | { mode: 'disabled' }
+  | { mode: 'custom'; listener: MessageListenerConfig };
 
 /**
  * 免@ 斜杠命令：普通群里旁人直接发一条配置内的命令（如 `/solve`，未 @ 任何 bot）
@@ -1167,7 +1173,12 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
     ...(contentPolicy ? { contentPolicy } : {}),
-    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    replyPolicy: {
+      mode: entry.replyPolicy && typeof entry.replyPolicy === 'object' && (entry.replyPolicy as Record<string, unknown>).mode === 'chat'
+        ? 'chat'
+        : 'thread',
+      sessionMode: 'per_message',
+    },
   };
 }
 
@@ -1178,6 +1189,23 @@ function normalizeMessageListeners(raw: unknown, botIndex: number): Record<strin
     if (typeof chatId !== 'string' || !chatId.trim()) continue;
     const listener = normalizeMessageListenerConfig(listenerRaw, botIndex, chatId.trim());
     if (listener) out[chatId.trim()] = listener;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeGroupMessageListenerOverrides(raw: unknown, botIndex: number): Record<string, GroupMessageListenerOverride> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, GroupMessageListenerOverride> = {};
+  for (const [chatId, overrideRaw] of Object.entries(raw as Record<string, unknown>)) {
+    if (!chatId.trim() || !overrideRaw || typeof overrideRaw !== 'object' || Array.isArray(overrideRaw)) continue;
+    const entry = overrideRaw as Record<string, unknown>;
+    if (entry.mode === 'disabled') {
+      out[chatId.trim()] = { mode: 'disabled' };
+      continue;
+    }
+    if (entry.mode !== 'custom') continue;
+    const listener = normalizeMessageListenerConfig(entry.listener, botIndex, chatId.trim());
+    if (listener) out[chatId.trim()] = { mode: 'custom', listener };
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -1379,6 +1407,7 @@ export interface BotConfig {
   apiOnly?: boolean;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  oncallGroup?: OncallGroupPolicy;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
@@ -1511,6 +1540,17 @@ export interface BotConfig {
    * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
    */
   envelopeInjection?: 'auto' | 'off';
+  /**
+   * 最终回复投递方式。`send`：模型必须自己执行 `botmux send` 把回复发到飞书，
+   * 系统提示与每轮 reminder 都这么要求。`transcript`：daemon 从 CLI 转写自动取
+   * 本轮最后的 assistant 文本发最终回复卡（即原来的 bridge fallback 升为主通道），
+   * 系统提示不再提及 `botmux send`、不再注入每轮 reminder；solo 会话（私聊 / 仅
+   * owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。只对有转写采集
+   * 的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。
+   * 缺省为 `send`（`defaultReplyDeliveryFor`）；显式 `'send'` / `'transcript'`
+   * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
+   */
+  replyDelivery?: 'send' | 'transcript';
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -2066,13 +2106,11 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
-  /**
-   * Per-chat group message listener. Keyed by chat_id and bot-scoped so the
-   * dashboard can configure it from the Roles page's natural group × bot
-   * matrix. When enabled, the bot may react to non-@ top-level group messages
-   * after deterministic sender/msgType filtering. V1 always replies in a
-   * fresh thread under the triggering message.
-   */
+  /** Bot-wide default listener. It applies to every joined group without an override. */
+  globalMessageListener?: MessageListenerConfig;
+  /** Per-chat exceptions to {@link globalMessageListener}; an absent entry inherits. */
+  groupMessageListenerOverrides?: Record<string, GroupMessageListenerOverride>;
+  /** @deprecated Read-only compatibility shape; normalized as custom overrides. */
   messageListeners?: Record<string, MessageListenerConfig>;
   /**
    * 免@ 斜杠命令。per-bot 一份命令表 + 生效群范围（chats 空 = 所有群，
@@ -2549,6 +2587,14 @@ export function getOwnerOpenId(larkAppId: string): string | undefined {
     return configuredOwner;
   }
   return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+/** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
+ *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 补缺省 send。只读内存
+ *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
+export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
+  const v = bots.get(larkAppId)?.config.replyDelivery;
+  return v === 'transcript' || v === 'send' ? v : undefined;
 }
 
 /** Admins = only resolved allowedUsers, matching `/botconfig`'s fail-closed permission model. */
@@ -3514,7 +3560,17 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const summaryMemory = entry.summaryMemory === true ? true : undefined;
     const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
-    const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
+    const globalMessageListener = normalizeMessageListenerConfig(entry.globalMessageListener, i, 'global');
+    const groupMessageListenerOverrides = normalizeGroupMessageListenerOverrides(entry.groupMessageListenerOverrides, i);
+    // Existing configurations are semantically group-specific custom rules.
+    // Read them as a compatibility fallback without widening their scope.
+    const legacyMessageListeners = normalizeMessageListeners(entry.messageListeners, i);
+    const mergedGroupMessageListenerOverrides = {
+      ...(legacyMessageListeners
+        ? Object.fromEntries(Object.entries(legacyMessageListeners).map(([chatId, listener]) => [chatId, { mode: 'custom' as const, listener }]))
+        : {}),
+      ...(groupMessageListenerOverrides ?? {}),
+    };
     const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
     const normalizedQuotaFallback = cyclicQuotaFallbackIds.has(entry.larkAppId)
@@ -3579,6 +3635,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),
@@ -3630,6 +3687,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
+      // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
+      replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
@@ -3790,7 +3849,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
       // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
       allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
-      messageListeners,
+      globalMessageListener,
+      groupMessageListenerOverrides: Object.keys(mergedGroupMessageListenerOverrides).length > 0
+        ? mergedGroupMessageListenerOverrides
+        : undefined,
+      // Compatibility read view for existing callers during the transition.
+      // New runtime resolution prefers groupMessageListenerOverrides, while
+      // legacy consumers continue seeing the original per-chat rules.
+      messageListeners: legacyMessageListeners,
       commandTriggers,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺

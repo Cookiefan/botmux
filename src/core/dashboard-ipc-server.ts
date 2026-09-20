@@ -116,6 +116,7 @@ import type {
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
 import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult } from '../services/bot-config-store.js';
+import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -210,7 +211,7 @@ import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
-import { getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import { getGlobalMessageListenerConfig, getGroupMessageListenerMode, getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateGlobalMessageListenerConfig, updateGroupMessageListenerMode, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
 import { getCommandTriggerConfig, setCommandTriggerChatEnabled, updateCommandTriggerConfig } from '../services/command-trigger-store.js';
 import { reservedCommandKind } from '../services/command-trigger.js';
 import { resolvePassthroughCommands } from './command-handler.js';
@@ -222,6 +223,7 @@ import {
   buildListenerBotAppIdToOpenId,
   collectListenerBotAppIds,
   renderMessageListenerInstruction,
+  resolveEffectiveMessageListener,
   type MessageListenerPreviewMatch,
 } from '../services/message-listener.js';
 import {
@@ -773,6 +775,9 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  * model turn could read/perturb sessions, scheduler, mutations). This is a tight
  * allowlist of drive-my-own-turn + poll-my-own-output surfaces:
  *   POST /api/trigger                              (start a turn)
+ *       · options.steer=true authorizes a best-effort native turn/steer into
+ *         a live codex-app turn; same drive-my-own-turn trust surface, no extra
+ *         route or capability.
  *   GET  /api/sessions/:id/trigger-result          (poll final)
  *   GET  /api/sessions/:id/insight                 (poll conversation/progress)
  * `/api/asks/answer` is deliberately EXCLUDED — it is askId-keyed with no
@@ -2544,7 +2549,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     persistedExists: !!persistedRaw,
   });
   const stored = decision.keepStored ? storedRaw : undefined;
-  const persisted = decision.keepPersisted ? persistedRaw : undefined;
+  let persisted = decision.keepPersisted ? persistedRaw : undefined;
 
   if (decision.foreignLeak) {
     return {
@@ -2555,6 +2560,42 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       error: `no session record for: ${sessionId}`,
       message: 'no session found',
     };
+  }
+
+  // HTTP steer-group restart insurance (options.steer; codex-app turn/steer): a
+  // superseded member parked behind its successor carries a durable
+  // `steerParkedBy` chain. Normally the live daemon fans the group's real final
+  // out in-memory; if it restarted in the superseded→real-final window, walk
+  // the chain to the first terminal successor and mirror that outcome back onto
+  // this turn (completed carries the merged ANSWER, no usage; failed mirrors the
+  // terminal evidence). A chain that still ends pending keeps the turn `running`.
+  if (persisted?.result.status === 'pending' && persisted.result.steerParkedBy) {
+    const owner = persisted.ownerLarkAppId ?? cachedLarkAppId ?? '';
+    const terminal = asyncTriggerStore.followSteerParkedChain(sessionId, persisted.result.steerParkedBy);
+    if (terminal && owner) {
+      const r = terminal.result;
+      const at = (r.status === 'completed' ? r.completedAt : r.failedAt) ?? Date.now();
+      try {
+        if (r.status === 'completed') {
+          asyncTriggerStore.recordCompleted(sessionId, persisted.triggerId, r.content ?? '', at, owner);
+        } else if (r.reason === 'turn_terminal' && r.terminalErrorCode) {
+          asyncTriggerStore.recordTerminalFailureStrict(sessionId, persisted.triggerId, at, owner, r.terminalErrorCode);
+        } else {
+          asyncTriggerStore.recordFailedStrict(sessionId, persisted.triggerId, at, owner, 'dispatch_unknown');
+        }
+        persisted = asyncTriggerStore.lookup(sessionId, persisted.triggerId);
+      } catch (err) {
+        // Mirror writes use the strict/durable tier and can throw on EIO or an
+        // owner mismatch. Never 500 the poll: the parked record stays pending,
+        // this response falls through to `running`, and the next poll retries
+        // the mirror once storage recovers (same fail-soft shape as the
+        // postBarrierFault convergence below).
+        logger.warn(
+          `steer-park chain mirror failed for session=${sessionId} `
+          + `trigger=${(persisted?.triggerId ?? 'unknown').substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
@@ -4827,12 +4868,15 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     let groupDefaultModels: Record<string, import('./group-default-models.js').GroupDefaultModels> = {};
     let pinStreamingCardMasterEnabled = false;
     let noPinStreamingCardChats = new Set<string>();
+    let effectiveMessageListenerForChat: ((chatId: string) => boolean) | undefined;
     try {
-      const botConfig = getBot(cachedLarkAppId).config;
+      const botState = getBot(cachedLarkAppId);
+      const botConfig = botState.config;
       agentDefaults = { agentCliId: botConfig.cliId, agentModel: botConfig.model, agentReasoningEffort: botConfig.reasoningEffort };
       groupDefaultModels = botConfig.groupDefaultModels ?? {};
       pinStreamingCardMasterEnabled = botConfig.pinStreamingCard === true;
       noPinStreamingCardChats = new Set(botConfig.noPinStreamingCardChats ?? []);
+      effectiveMessageListenerForChat = (chatId) => resolveEffectiveMessageListener(botState, chatId)?.enabled === true;
     } catch {
       // Fail open for the groups board when config lookup is unavailable:
       // rows still render with safe defaults instead of dropping the whole list.
@@ -4846,7 +4890,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     const enriched = chats.map(c => {
       const oncall = oncallStore.getOncallStatus(cachedLarkAppId, c.chatId);
       const hasRole = resolveRoleFile(cachedLarkAppId, c.chatId) !== null;
-      const hasMessageListener = getMessageListenerConfig(cachedLarkAppId, c.chatId)?.enabled === true;
+      const hasMessageListener = effectiveMessageListenerForChat?.(c.chatId) ?? false;
       // /introduce 记录的外部 botmux 机器人（按名字）——dashboard 团队看板用
       // 它识别「介绍过同团队机器人的协作群」。
       const observedBotNames = observedBotsStore
@@ -5217,9 +5261,10 @@ async function collectMessageListenerPreviewMatches(
     ...bot,
     config: {
       ...bot.config,
-      messageListeners: {
-        ...(bot.config.messageListeners ?? {}),
-        [chatId]: previewListener,
+      globalMessageListener: previewListener,
+      groupMessageListenerOverrides: {
+        ...(bot.config.groupMessageListenerOverrides ?? {}),
+        [chatId]: { mode: 'custom' as const, listener: previewListener },
       },
     },
   };
@@ -5400,6 +5445,64 @@ ipcRoute('DELETE', '/api/message-listeners/:chatId', async (_req, res, p) => {
   const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, { enabled: false, prompt: '' });
   if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
   jsonRes(res, 200, { ok: true });
+});
+
+// Bot-scoped listener APIs for the dedicated Dashboard page. The supervisor
+// proxy selects a bot's IPC server; this process therefore uses cachedLarkAppId
+// as the authoritative bot identity rather than accepting an app id from body.
+ipcRoute('GET', '/api/global-message-listener', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  jsonRes(res, 200, { listener: getGlobalMessageListenerConfig(cachedLarkAppId), maxPromptBytes: MAX_MESSAGE_LISTENER_PROMPT_BYTES });
+});
+
+ipcRoute('PUT', '/api/global-message-listener', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const update = sanitizeMessageListenerUpdate(body);
+  if (!update) return jsonRes(res, 400, { ok: false, error: 'invalid_listener' });
+  const validation = validateMessageListenerUpdate(update);
+  if (!validation.ok) return jsonRes(res, 400, { ok: false, error: validation.reason });
+  if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
+  const result = await updateGlobalMessageListenerConfig(cachedLarkAppId, update);
+  if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, listener: result.listener });
+});
+
+ipcRoute('GET', '/api/group-message-listeners', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const chats = await groupsStore.listChats(cachedLarkAppId);
+    jsonRes(res, 200, { groups: chats.map(chat => ({ chatId: chat.chatId, name: chat.name, mode: getGroupMessageListenerMode(cachedLarkAppId!, chat.chatId), listener: getMessageListenerConfig(cachedLarkAppId!, chat.chatId) })) });
+  } catch (err) { jsonRes(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) }); }
+});
+
+ipcRoute('GET', '/api/group-message-listeners/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  jsonRes(res, 200, { chatId: p.chatId, mode: getGroupMessageListenerMode(cachedLarkAppId, p.chatId), listener: getMessageListenerConfig(cachedLarkAppId, p.chatId) });
+});
+
+ipcRoute('PUT', '/api/group-message-listeners/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body?.mode === 'inherit' || body?.mode === 'disabled') {
+    const result = await updateGroupMessageListenerMode(cachedLarkAppId, p.chatId, body.mode);
+    return jsonRes(res, result.ok ? 200 : 500, result.ok ? { ok: true, mode: result.mode } : { ok: false, error: result.reason });
+  }
+  if (body?.mode !== 'custom') return jsonRes(res, 400, { ok: false, error: 'invalid_listener_mode' });
+  const update = sanitizeMessageListenerUpdate(body.listener);
+  if (!update) return jsonRes(res, 400, { ok: false, error: 'invalid_listener' });
+  const validation = validateMessageListenerUpdate(update);
+  if (!validation.ok) return jsonRes(res, 400, { ok: false, error: validation.reason });
+  if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) {
+    return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
+  }
+  const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, update);
+  jsonRes(res, result.ok ? 200 : ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500,
+    result.ok ? { ok: true, mode: 'custom', listener: result.listener } : { ok: false, error: result.reason });
 });
 
 // ─── 免@ 斜杠命令（commandTriggers） ──────────────────────────────────────
@@ -5589,6 +5692,17 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   } catch { /* default chat */ }
   let envelopeInjection: 'auto' | 'off' = 'off';
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
+  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则缺省 send）
+  // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
+  let replyDelivery: 'send' | 'transcript' = 'send';
+  let replyDeliveryDefault: 'send' | 'transcript' = 'send';
+  let replyDeliverySupported = false;
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    replyDelivery = effectiveReplyDelivery(cachedLarkAppId, cfg.cliId);
+    replyDeliveryDefault = defaultReplyDeliveryFor(cfg.cliId);
+    replyDeliverySupported = supportsTranscriptReplyDelivery(cfg.cliId);
+  } catch { /* default send */ }
   let codexAuthSync: 'shared' | 'isolated' = 'shared';
   try { if (getBot(cachedLarkAppId).config.codexAuthSync === 'isolated') codexAuthSync = 'isolated'; } catch { /* default shared */ }
   // Trigger-user CLI auth policy. Absent → null ("feature off"), which is what
@@ -5795,6 +5909,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     })(),
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
+    oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     summaryMemory: cardPrefs.summaryMemory,
     summaryMemoryPath: cardPrefs.summaryMemoryPath,
@@ -5806,6 +5921,9 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     p2pMode,
     envelopeInjection,
     triggerUserAuth,
+    replyDelivery,
+    replyDeliveryDefault,
+    replyDeliverySupported,
     skillInjection,
     skillInjectionSupport,
     // Resolved machine-wide default → the dashboard shows it as the pre-selected
@@ -6890,6 +7008,34 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
   jsonRes(res, 200, { ok: true, envelopeInjection: value ?? 'off' });
 });
 
+// Per-bot 最终回复投递方式 replyDelivery。Body `{ replyDelivery: 'transcript'|'send'|'' }`:
+//   • 'transcript' → daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，
+//     模型不再被要求 botmux send；仅 claude-code 与结构化转写白名单 CLI 支持，其它
+//     CLI 由 store 拒绝（400 reply_delivery_unsupported）。落盘 'transcript'
+//   • 'send' → 模型必须自己 botmux send。落盘 'send'
+//   • ''/其它 → 删 key，回到缺省 send
+// 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
+// 系统提示部分要 /restart 才换新值。响应里的 replyDelivery 是写入后的**生效值**。
+ipcRoute('PUT', '/api/bot-reply-delivery', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { replyDelivery?: unknown };
+  try { body = await readJsonBody<{ replyDelivery?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('replyDelivery');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const value = body.replyDelivery === 'transcript' || body.replyDelivery === 'send' ? body.replyDelivery : null;
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  let cliId: string | undefined;
+  try { cliId = getBot(cachedLarkAppId).config.cliId; } catch { cliId = undefined; }
+  jsonRes(res, 200, {
+    ok: true,
+    replyDelivery: effectiveReplyDelivery(cachedLarkAppId, cliId),
+    replyDeliveryDefault: defaultReplyDeliveryFor(cliId),
+  });
+});
+
 // Per-bot 内置技能注入模式 skillInjection。Body `{ skillInjection: 'global'|'prompt'|'off'|'' }`:
 //   • 'global'|'prompt'|'off' → 显式覆盖本 bot
 //   • ''/其它                  → 清回机器级默认（config.json skills.builtinInjection）
@@ -7011,6 +7157,19 @@ ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
+});
+
+ipcRoute('PUT', '/api/bot-oncall-group', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { oncallGroup?: unknown };
+  try { body = await readJsonBody<{ oncallGroup?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const spec = findConfigField('oncallGroup')!;
+  const parsed = coerceConfigValue(spec, JSON.stringify(body.oncallGroup ?? {}));
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.reason });
+  const result = await applyConfigField(cachedLarkAppId, spec, parsed.value);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, oncallGroup: parsed.value });
 });
 
 ipcRoute('PUT', '/api/bot-feedback', async (req, res) => {

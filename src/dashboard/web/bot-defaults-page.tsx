@@ -57,6 +57,8 @@ import {
 } from './dashboard-components.js';
 import { botAvatarHtml, larkConsoleUrl, loadNameMaps, overrideBotAvatar, ui } from './ui.js';
 import { fetchGroupsSnapshot, type GroupChat } from './groups-api.js';
+import { SearchableGroupPicker } from './searchable-group-picker.js';
+import { controlCsrfHeaders } from './control-csrf.js';
 import {
   DEFAULT_GRANT_DURATION_MS,
   DEFAULT_GRANT_QUOTA,
@@ -1192,6 +1194,9 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile"><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
+            {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
+                避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
+            <section className="bd-tile"><ReplyDeliverySection bot={bot} patchBot={patchBot} /></section>
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile"><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
@@ -1203,6 +1208,80 @@ function BotDefaultsCard(props: {
       </div>
     </article>
   );
+}
+
+export function OncallServiceSecretSettings() {
+  const inputId = useId();
+  const [secret, setSecret] = useState('');
+  const [configured, setConfigured] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void sendJson('GET', '/api/oncall-service-secret').then(res => {
+      if (cancelled) return;
+      if (!res.ok) throw new Error(responseErrorText(res));
+      setConfigured(res.body.configured === true);
+    }).catch(() => { if (!cancelled) setStatus({ text: '无法读取凭据状态，请刷新后重试' }); });
+    return () => { cancelled = true; };
+  }, []);
+  async function saveSecret(): Promise<void> {
+    setBusy(true); setStatus(null);
+    try {
+      const response = await fetch('/api/oncall-service-secret', {
+        method: 'PUT', headers: { 'content-type': 'application/json', ...controlCsrfHeaders() },
+        body: JSON.stringify({ secret }),
+      });
+      const body = await response.json();
+      if (!response.ok || !body.ok) throw new Error(body.error || '保存失败');
+      setConfigured(true);
+      setStatus({ text: '已保存，重启 BotMux 后生效', ok: true });
+    } catch (error) { setStatus({ text: caughtErrorText(error) }); }
+    finally { setSecret(''); setBusy(false); }
+  }
+  return <form className="bd-oncall-secret" onSubmit={event => { event.preventDefault(); if (secret.trim() && !busy && configured !== null) void saveSecret(); }}>
+    <label htmlFor={inputId}>Service Secret <span className="muted">{configured === null ? '状态未确认' : configured ? '已配置' : '未配置'}</span></label>
+    <div className="bd-oncall-secret-input">
+      <input id={inputId} type="password" autoComplete="new-password" spellCheck={false} maxLength={8192}
+        value={secret} disabled={busy || configured === null} placeholder={configured ? '输入新凭据以替换' : '输入 Service Secret'}
+        onChange={event => setSecret(event.currentTarget.value)} />
+      <button type="submit" disabled={busy || configured === null || !secret.trim()}>{busy ? '保存中' : '保存'}</button>
+    </div>
+    <small className="muted">同一部署共用，保存后重启生效。</small>
+    <StatusSpan status={status} />
+  </form>;
+}
+
+function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: PatchBot; chats: GroupChat[]; active: boolean }) {
+  const [policy, setPolicy] = useState(props.bot.oncallGroup ?? { enabled: false, chatIds: [] });
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const groupLabel = useId();
+  useEffect(() => { setPolicy(props.bot.oncallGroup ?? { enabled: false, chatIds: [] }); }, [props.bot.oncallGroup]);
+  async function save(next: typeof policy): Promise<void> {
+    const previous = policy;
+    setPolicy(next);
+    setBusy(true); setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/oncall-group`, { oncallGroup: next });
+      if (!res.ok) throw new Error(responseErrorText(res));
+      setPolicy(res.body.oncallGroup);
+      props.patchBot(props.bot.larkAppId, { oncallGroup: res.body.oncallGroup });
+    } catch (error) { setPolicy(previous); setStatus({ text: caughtErrorText(error) }); }
+    finally { setBusy(false); }
+  }
+  const options = [...props.chats, ...policy.chatIds.filter(id => !props.chats.some(chat => chat.chatId === id)).map(chatId => ({ chatId }))];
+  return <fieldset className="bd-oncall-settings" disabled={busy} aria-busy={busy}>
+    <ToggleRow checked={policy.enabled} disabled={busy} title="支持拉起 Oncall 群" help={null} onChange={enabled => void save({ ...policy, enabled })} />
+    <div className="bd-oncall-scope">
+      <label htmlFor={groupLabel}>生效群</label>
+      <SearchableGroupPicker id={groupLabel} label="生效群" groups={options} value={policy.chatIds} multiple disabled={!policy.enabled}
+        placeholder="选择生效群" searchPlaceholder="搜索生效群" emptyLabel="暂无匹配群" selectedCountLabel={count => `已选 ${count} 个群`}
+        onChange={value => void save({ ...policy, chatIds: value as string[] })} />
+    </div>
+    <StatusSpan status={status ?? (policy.enabled && !policy.chatIds.length ? { text: '请选择生效群' } : null)} />
+    {props.active && ui.authed ? <OncallServiceSecretSettings key={props.bot.larkAppId} /> : null}
+  </fieldset>;
 }
 
 function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; active: boolean }) {
@@ -1284,7 +1363,10 @@ function FeedbackSettingsSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
       <h3 className="bd-section-title">
         <FieldTitle help="开启后，最终回答卡片会显示“结论可用 / 有效推进 / 结论有误”等反馈按钮，用于收集回答质量评价。默认关闭；只影响这个 bot 的最终回答，不影响过程消息。">最终回答反馈</FieldTitle>
       </h3>
-      <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+      <div className="bd-feedback-controls">
+        <ToggleRow checked={on} disabled={busy} title="最终回答反馈" help={null} description="在最终回答卡片中收集用户评价。" onChange={checked => { setOn(checked); void save(checked); }} />
+        <OncallGroupSettings bot={props.bot} patchBot={props.patchBot} chats={chats} active={props.active} />
+      </div>
       <StatusSpan status={status} />
       {on ? (
         <details className="bd-feedback-advanced">
@@ -4688,6 +4770,64 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
       <small className="bd-section-note">{tr('botDefaults.envelopeInjectionNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-envelope-injection-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+/** 最终回复投递方式：on = transcript（daemon 从 CLI 转写自动取最终回复，模型不再被
+ *  要求 botmux send），off = send（模型自己 botmux send）。开关显示的是生效值：缺省
+ *  为 send；两个方向都显式落盘。当前 CLI 没有转写采集通道时开关禁用并说明。 */
+export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [transcript, setTranscript] = useState(props.bot.replyDelivery === 'transcript');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const supported = props.bot.replyDeliverySupported === true;
+  const defaultMode = props.bot.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send';
+
+  useEffect(() => setTranscript(props.bot.replyDelivery === 'transcript'), [props.bot.replyDelivery]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = transcript;
+    setTranscript(next);
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/reply-delivery`, { replyDelivery: next ? 'transcript' : 'send' });
+      if (res.ok && res.body.ok) {
+        const saved = res.body.replyDelivery === 'transcript';
+        setTranscript(saved);
+        props.patchBot(props.bot.larkAppId, { replyDelivery: saved ? 'transcript' : 'send' });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setTranscript(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setTranscript(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" data-reply-delivery>
+      <h3 className="bd-section-title">{tr('botDefaults.replyDelivery')}</h3>
+      <ToggleRow
+        checked={transcript}
+        disabled={busy || !supported}
+        dataAction="toggle-reply-delivery"
+        title={tr('botDefaults.replyDeliveryTranscript')}
+        help={tr('botDefaults.replyDeliveryHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <small className="bd-section-note">
+        {supported ? tr('botDefaults.replyDeliveryNote', { defaultMode }) : tr('botDefaults.replyDeliveryUnsupported')}
+      </small>
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-reply-delivery-status': '' }} />
       </div>
     </section>
   );

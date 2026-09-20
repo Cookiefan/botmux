@@ -207,6 +207,7 @@ import {
   storedSessionAnchorId,
   larkTransportEnabled,
 } from './core/types.js';
+import { computeSoloSessionForBot, effectiveReplyDelivery } from './core/reply-delivery.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId } from './core/pending-repo-journal.js';
 import { hasPendingSessionTurns, runSessionTurn } from './core/session-turn-queue.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
@@ -268,9 +269,10 @@ import {
   type WorkerSessionReplyOptions,
   migrateMojoSessionIdentities,
   mojoLivePatchForSession,
-  silentIdleCardFlag,
+  idleCardLabel,
   dshRuntimeForSession,
   recordTurnExplicitMention,
+  pruneSteerFanoutState,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
@@ -309,7 +311,7 @@ import {
 } from './services/group-collaboration-mode-store.js';
 import { saveFrozenCards, deleteFrozenCards } from './services/frozen-card-store.js';
 import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation } from './core/command-handler.js';
-import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
+import { parseTopicHeader, parseTopicHeaderWithLifecycleAliases, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
 import { topicHeaderErrorText, topicHeaderReadyText, topicSpecErrorText } from './core/topic-header-messages.js';
 import { docWatchCommandNeedsSession } from './core/doc-watch-command.js';
@@ -556,7 +558,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -5133,7 +5135,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
     const prevTitle = ds.currentTurnTitle || ds.session.title || runtimeDisplayName || getCliDisplayName(effectiveCliId);
     const prevMode = ds.displayMode ?? 'hidden';
     const previousCodexTierBadge = codexServiceTierBadge(effectiveCliId, ds.codexServiceTier);
-    const previousSilentIdle = silentIdleCardFlag(ds);
+    const previousIdleLabel = idleCardLabel(ds);
     const frozenCard = buildStreamingCard(
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
       ds.lastScreenContent ?? '', previousStatus, effectiveCliId,
@@ -5145,8 +5147,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       runtimeDisplayName,
       previousCodexTierBadge,
       // A silently-closed previous turn freezes with its honest label
-      // (「已处理 · 判定无需回复」), not a misleading 「等待输入」.
-      silentIdleCardFlag(ds),
+      // (「已处理 · 判定无需回复」/ transcript 模式「已完成」), not a misleading 「等待输入」.
+      previousIdleLabel,
       dshRuntimeForSession(ds),
       resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
     );
@@ -5163,7 +5165,9 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
         displayMode: prevMode,
         imageKey: ds.currentImageKey,
         ...(previousCodexTierBadge ? { codexServiceTierBadge: previousCodexTierBadge } : {}),
-        ...(previousSilentIdle ? { silentIdle: true } : {}),
+        // 新字段 idleLabel 为准；'silent' 同时写旧字段 silentIdle，旧版 daemon 读盘不退化。
+        ...(previousIdleLabel ? { idleLabel: previousIdleLabel } : {}),
+        ...(previousIdleLabel === 'silent' ? { silentIdle: true } : {}),
       });
       saveFrozenCards(ds.session.sessionId, ds.frozenCards);
     }
@@ -5175,6 +5179,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // New turn — the previous turn's deliberate-silence marker (if any) has been
   // baked into the frozen card above; live cards return to normal labels.
   ds.silentIdleTurnId = undefined;
+  ds.completedIdleTurnId = undefined;
   // Lineage anchor for the deliberate-silence label: a turn_terminal that lands
   // AFTER this point belongs to an older turn (type-ahead admits the follow-up
   // while the previous turn is still running) and must not relabel this card.
@@ -17311,6 +17316,42 @@ function startAutoWorktreePending(ds: DaemonSession, args: {
 
 type AvailableBot = Awaited<ReturnType<typeof getAvailableBots>>[number];
 
+/** replyDelivery=transcript 下按本轮（chatType + 发言者）判定 solo 会话（只有 owner
+ *  与本 bot），结果写到 ds.soloSession（内存态；session-manager 据此给信封去壳，
+ *  worker-pool 据此在 init 上冻结 solo）。send 模式直接置 false、零额外 API；
+ *  p2p 恒 solo，group 才查 getChatMode / getGroupStats（都带缓存）；任何异常 →
+ *  false（fail-closed：回到带壳/带 sender 的现状）。 */
+async function resolveSoloSessionForTurn(
+  ds: DaemonSession,
+  chatType: 'group' | 'p2p' | undefined,
+  sender: ResolvedSender | undefined,
+): Promise<boolean> {
+  let solo = false;
+  try {
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+    if (effectiveReplyDelivery(ds.larkAppId, cliId) === 'transcript') {
+      let chatMode: 'group' | 'topic' | undefined;
+      let stats: { userCount: number; botCount: number } | undefined;
+      if (chatType === 'group') {
+        const mode = await getChatMode(ds.larkAppId, ds.chatId);
+        chatMode = mode === 'group' || mode === 'topic' ? mode : undefined;
+        stats = await getGroupStats(ds.larkAppId, ds.chatId);
+      }
+      solo = computeSoloSessionForBot(ds.larkAppId, {
+        chatType,
+        chatMode,
+        stats,
+        senderType: sender?.type,
+        senderOpenId: sender?.openId,
+      });
+    }
+  } catch {
+    solo = false;
+  }
+  ds.soloSession = solo;
+  return solo;
+}
+
 /** Materialize the opening input at the final synchronous boundary before
  * fork. All potentially-slow preparation must happen before this call; the
  * pendingFollowUps snapshot and fork then cannot be interleaved by a later
@@ -17355,6 +17396,9 @@ function buildReservedInitialInput(
         ? undefined
         : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
       sessionBackendType: ds.session.backendType,
+      // transcript + solo（resolveSoloSessionForTurn 在注册会话后算好）：首轮去壳。
+      solo: ds.soloSession,
+      selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
     },
   );
   // R5-B1-1: COPY the frozen new-topic steer authorization onto the opening
@@ -17499,6 +17543,8 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
         codexAppText: rawCodexText || buffered.join('\n\n'),
         sessionBackendType: ds.session.backendType,
         turnId,
+        solo: ds.soloSession,
+        selfMention: { name: bot.botName, openId: bot.botOpenId },
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: (ds.pendingCodexAppFollowUpContexts ?? [])
           .filter(Boolean)
@@ -20303,7 +20349,13 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Workflow 保留动词必须先于即兴 grill，避免 `run/save/cancel/list/show`
   // 被当成自由文本目标；v2 runtime 已没有回退路径。
   if (await handleV3SavedWorkflowCommandIfAny({
-    content: cmdContent,
+    // 与话题指令头同理（D8）：剥掉本 bot 在任意位置的 @。只剥前导 @ 时，
+    // 结尾的 `@机器人` 会作为文本进入 `/workflow save` 的名称或 `run` 的引用。
+    content: stripBotMentions(
+      cmdContent,
+      followupMentions,
+      { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+    ),
     anchor,
     replyRootId,
     messageId: parsed.messageId,
@@ -20553,20 +20605,48 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       session.scope = scope;
       fillNativeTopicId(session, scope, parsed.threadId);
 
-      // First-message `/repo`: seed the same pending-repo state the card flow
-      // uses, so the `/repo` handler launches the CLI straight away —
-      // `/repo <arg>` in that repo, bare `/repo` in the default workingDir —
-      // instead of taking the mid-session close+recreate path or re-showing the
-      // card. Use the SAME pinned-dir resolver as the normal spawn path (incl.
-      // defaultOncall auto-bind) so a bound/auto-bound chat still launches in the
-      // right place when no arg is given.
+      // Pin the working dir with the SAME resolver as the normal spawn path
+      // (oncall binding → defaultOncall auto-bind → inheritable same-anchor peer
+      // → defaultWorkingDir). This session is a REAL conversation — every later
+      // turn in this topic/chat routes into it and forks a CLI from it — so it
+      // must resolve its dir exactly like a session born from an ordinary
+      // message. Resolving only for `/repo` (the historical shape) left a
+      // session born from e.g. `/status` with NO workingDir at all: it silently
+      // ignored the chat's oncall binding and the bot's defaultWorkingDir and
+      // launched in whatever getSessionWorkingDir() fell back to. The layer-2
+      // defaultOncall auto-bind WRITES state and "must run identically on every
+      // spawn path" (see resolvePinnedWorkingDir) — skipping it here also left
+      // that write undone for the whole life of the chat, since later turns
+      // reuse this session and never re-enter a spawn path.
+      const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      // …EXCEPT when that dir would have triggered auto-worktree. There the bot
+      // default is a worktree BASE, not a launch dir: the ordinary spawn paths
+      // answer it with `pendingRepo` + a detached worktree build, which a daemon
+      // command (no CLI prompt of its own) must not start on the user's behalf.
+      // Pinning the base dir here instead would silently launch every later turn
+      // of this session INSIDE the shared repo — exactly the isolation the flag
+      // buys. Leave those unpinned (unchanged behaviour) so nothing lands in the
+      // base repo, and the row stays an evictable command scratch.
+      // `/repo` keeps its historical shape untouched: it owns the repo flow and
+      // its handler re-decides the dir straight away.
+      const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+      const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
+      if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
       let cmdPending: Partial<DaemonSession> | undefined;
       if (cmd === '/repo') {
-        const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
-        if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+        // First-message `/repo`: seed the same pending-repo state the card flow
+        // uses, so the `/repo` handler launches the CLI straight away —
+        // `/repo <arg>` in that repo, bare `/repo` in the default workingDir —
+        // instead of taking the mid-session close+recreate path or re-showing the
+        // card.
         // pendingPrompt is empty (the message *is* the command), so the CLI just
         // boots and waits for the user's next message; no sender tag needed.
         cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
+      } else if (cmdPinnedWorkingDir) {
+        // Every other command only inherits the dir: no pendingRepo — they must
+        // not raise a repo-select card, and they fork no CLI of their own (the
+        // first real turn of this session does, from this dir).
+        cmdPending = { workingDir: cmdPinnedWorkingDir };
       }
       sessionStore.updateSession(session);
       const cmdDs: DaemonSession = {
@@ -20982,6 +21062,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
     return;
   }
+  // transcript 模式的 solo 判定：在 fork 之前算好，让下面所有开场分支（立即 fork /
+  // repo 卡片 / auto-worktree 之后的 commit）经 buildReservedInitialInput 与
+  // worker-pool init 读到同一个值。send 模式零额外 API。
+  await resolveSoloSessionForTurn(ds, chatType, newTopicSender);
   const sharedWorktree = autoWt && pinnedWorkingDir && forceTopicMode === 'worktree'
     ? await forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
     : undefined;
@@ -21780,7 +21864,6 @@ async function handleThreadReplyAdmitted(
   const parsedResult = prepared ?? parseEventMessage(data);
   const parsed = parsedResult.parsed;
   const resources = parsedResult.resources;
-
   // Expand merge_forward: fetch sub-messages and collect their resources
   if (!prepared && parsed.msgType === 'merge_forward') {
     const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed);
@@ -21848,8 +21931,24 @@ async function handleThreadReplyAdmitted(
   const threadCommandPrompt = ctx.commandTrigger
     ? renderCommandTriggerPrompt(ctx.commandTrigger)
     : undefined;
-  const threadCommandLane = parsed.content.trim();
+  let threadCommandLane = parsed.content.trim();
   if (threadCommandPrompt) parsed.content = threadCommandPrompt;
+
+  // A listener may use chat scope and therefore arrive through an existing
+  // session's reply path after its first match. Apply its untrusted wrapper
+  // only after audio transcription and bot-steer / command-template parsing:
+  // both can rewrite parsed.content, and every later command lane must see the
+  // wrapper rather than the observed message. This deliberately mirrors the
+  // new-topic path's final listener override.
+  let listenerPrompt: string | undefined;
+  if (ctx.messageListener) {
+    refreshListenerCardTextFromResolved(ctx.messageListener, data.message);
+    listenerPrompt = renderMessageListenerPrompt(ctx.messageListener);
+  }
+  if (listenerPrompt) {
+    parsed.content = listenerPrompt;
+    threadCommandLane = listenerPrompt;
+  }
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
   const botSenderPrefix = isForeignBot
@@ -21911,11 +22010,20 @@ async function handleThreadReplyAdmitted(
     return threadSenderCached;
   };
 
-  const content = parsed.content.trim();
+  let content = parsed.content.trim();
   // Strip leading @<bot> mentions so "@bot /restart" is recognized as a command.
   // threadCommandLane 是免@ 命令模板改写**之前**的正文；没有模板时与 content
   // 逐字相同（见上方 threadCommandPrompt 处的说明）。
-  const cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
+  // Keep the three values consumed by the remainder of this function in lock
+  // step. In particular, workflow/slash parsing reads cmdContent while worker
+  // injection reads content/parsed.content; listener input is never trusted as
+  // a control command on either path.
+  if (listenerPrompt) {
+    content = listenerPrompt;
+    cmdContent = listenerPrompt;
+    parsed.content = listenerPrompt;
+  }
   const threadSenderOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
   // Tenant-stable union_id of the thread sender — lets canOperate recognise a
   // cross-deployment TEAM peer bot (isTeamBot) and grant it daemon-command
@@ -21958,7 +22066,7 @@ async function handleThreadReplyAdmitted(
     }
   }
 
-  const threadHeaderParse = parseTopicHeader(stripBotMentions(
+  const threadHeaderParse = parseTopicHeaderWithLifecycleAliases(stripBotMentions(
     cmdContent,
     parsed.mentions,
     { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
@@ -22030,7 +22138,12 @@ async function handleThreadReplyAdmitted(
 
   // v3 Workflow 命令在 thread 内同样由 host 直接处理，不转发给 CLI。
   if (await handleV3SavedWorkflowCommandIfAny({
-    content: cmdContent,
+    // 同上（D8）：结尾的 `@机器人` 不能进入 Saved Workflow 的名称或引用。
+    content: stripBotMentions(
+      cmdContent,
+      parsed.mentions,
+      { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+    ),
     anchor,
     replyRootId,
     messageId: parsed.messageId,
@@ -22081,7 +22194,9 @@ async function handleThreadReplyAdmitted(
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
   // off it falls through to ordinary message handling. Human senders unaffected.
-  const invocation = ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
+  const invocation = ctx.messageListener
+    ? null
+    : ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
     ? null
     : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
@@ -22276,11 +22391,19 @@ async function handleThreadReplyAdmitted(
         session.lastMessageAt = new Date(now).toISOString();
         session.scope = scope;
         fillNativeTopicId(session, scope, parsed.threadId);
+        // Twin of the new-topic pre-create block above: resolve the pinned dir
+        // for EVERY session-needing daemon command, not just `/repo`, and skip
+        // the pin when it would have meant auto-worktree. Same reasoning — this
+        // record becomes the thread's real session.
+        const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
+        const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+        const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
+        if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
         let cmdPending: Partial<DaemonSession> | undefined;
         if (cmd === '/repo') {
-          const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
-          if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
           cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
+        } else if (cmdPinnedWorkingDir) {
+          cmdPending = { workingDir: cmdPinnedWorkingDir };
         }
         sessionStore.updateSession(session);
         const cmdDs: DaemonSession = {
@@ -22590,14 +22713,21 @@ async function handleThreadReplyAdmitted(
       userPrompt: promptContent,
       turnId: parsed.messageId,
       build: async () => {
-        const botCfg = getBot(ds.larkAppId).config;
+        const tailBot = getBot(ds.larkAppId);
+        const botCfg = tailBot.config;
+        // solo 必须在构造信封之前解析：transcript 下 solo 决定是否去掉
+        // <user_message> 壳与 <sender/> 标签。
+        const tailSender = await getThreadSender();
+        await resolveSoloSessionForTurn(ds, ctxChatType, tailSender);
         const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
           cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
           cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
-          sender: await getThreadSender(),
+          sender: tailSender,
+          solo: ds.soloSession,
+          selfMention: { name: tailBot.botName, openId: tailBot.botOpenId },
           larkAppId,
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
@@ -22726,7 +22856,10 @@ async function handleThreadReplyAdmitted(
           turnId: parsed.messageId,
         });
       } else {
-        const botCfg = getBot(ds.larkAppId).config;
+        const pendingBot = getBot(ds.larkAppId);
+        const botCfg = pendingBot.config;
+        // 此分支是 pending 首个 worker 的同步屏障，不能 await 网络（见上方注释），
+        // 所以不重算 solo，沿用会话注册时算好的 ds.soloSession。
         const exactFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
@@ -22740,6 +22873,8 @@ async function handleThreadReplyAdmitted(
           substituteTrigger,
           codexAppText: parsed.content,
           codexAppApplicationContext,
+          solo: ds.soloSession,
+          selfMention: { name: pendingBot.botName, openId: pendingBot.botOpenId },
           codexAppMessageContext,
         sessionBackendType: ds.session.backendType,
         turnId: parsed.messageId,
@@ -22985,6 +23120,8 @@ async function handleThreadReplyAdmitted(
       }
       return;
     }
+    // transcript 模式的 solo 判定（同 handleNewTopicAdmitted）：fork 前算好。
+    await resolveSoloSessionForTurn(newDs, autoCreateChatType, autoCreateSender);
     if (newDs.pendingRepo) {
       stageClaimedPendingRepoSetup(activeSessions, newDs, {
         mode: autoWt ? 'auto_worktree' : 'picker',
@@ -23168,6 +23305,8 @@ async function handleThreadReplyAdmitted(
     const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
     const turnSender = await getThreadSender();
+    // transcript 模式按轮重算 solo（bridge 会话本就是裸文本，跳过）。
+    if (!isBridge) await resolveSoloSessionForTurn(ds, ctxChatType, turnSender);
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
       ? { content: buildBridgeInputContent(promptContent, {
@@ -23200,6 +23339,8 @@ async function handleThreadReplyAdmitted(
             // sendWorkerInput 的权威 turnId（parsed.messageId）一致，sidecar 可被 claim。
             turnId: parsed.messageId,
             sessionBackendType: ds.session.backendType,
+            solo: ds.soloSession,
+            selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
@@ -23216,6 +23357,8 @@ async function handleThreadReplyAdmitted(
           codexAppText: parsed.content,
           codexAppApplicationContext,
           codexAppMessageContext,
+          solo: ds.soloSession,
+          selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         sessionBackendType: ds.session.backendType,
         turnId: parsed.messageId,
         });
@@ -23324,6 +23467,7 @@ async function handleThreadReplyAdmitted(
     // without clearing, a previous turn's deliberate-silence marker survives the
     // re-fork and mislabels THIS turn's idle card 「已处理 · 判定无需回复」.
     ds.silentIdleTurnId = undefined;
+    ds.completedIdleTurnId = undefined;
     ds.currentTurnId = parsed.messageId;
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
@@ -23348,13 +23492,17 @@ async function handleThreadReplyAdmitted(
         userPrompt: promptContent,
         turnId: parsed.messageId,
         build: async () => {
+          const stagedSender = await getThreadSender();
+          await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
           const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
             attachments,
             mentions: parsed.mentions,
             isAdoptMode: false,
             cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
             cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
-            sender: await getThreadSender(),
+            sender: stagedSender,
+            solo: ds.soloSession,
+            selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
             larkAppId,
             chatId: ds.session.chatId,
             whiteboardId: ds.session.whiteboardId,
@@ -23470,6 +23618,9 @@ async function handleThreadReplyAdmitted(
     const wantsOpening = !ds.adoptedFrom && !queuedDashboardTurn && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
     const reforkSender = await getThreadSender();
+    // transcript 模式按轮重算 solo：refork 走 worker-pool init 冻结 solo，且
+    // buildReforkCliInput / buildNewTopicCliInput 都据 ds.soloSession 去壳。
+    if (!ds.adoptedFrom) await resolveSoloSessionForTurn(ds, ctxChatType, reforkSender);
     // An empty-started CLI has nothing to resume: `hasHistory` is set
     // unconditionally by restoreActiveSessions (and by claude_exit /
     // suspendWorker), so it cannot tell "booted idle" from "has real history".
@@ -23505,6 +23656,8 @@ async function handleThreadReplyAdmitted(
           substituteTrigger,
           codexAppText: reforkCodexApp.text,
           codexAppApplicationContext,
+          solo: ds.soloSession,
+          selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
           codexAppMessageContext: reforkCodexApp.messageContext,
           // #794 后续：worker-null refork 的 empty-start 首轮 opening 也走 hook 注入。
           // turnId 与下方 forkWorker 的权威 turnId 一致（非 queued 时 = parsed.messageId）；
@@ -24165,6 +24318,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it) —
       // see the Lark-message re-fork branch above.
       ds.silentIdleTurnId = undefined;
+      ds.completedIdleTurnId = undefined;
       ds.currentTurnId = turnId;
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
@@ -25391,6 +25545,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       vcMeetingRuntimeLeaseRecovery.acknowledge(context);
     },
     async onCodexAppLedgerDrained(ds) {
+      // Reap any parked HTTP steer-group members for this session: with the
+      // FIFO empty no real-final settle can still fan them out. The success
+      // path already consumed the entry, so this only fires on failure/retire
+      // drain shapes.
+      pruneSteerFanoutState(ds.session.sessionId);
       await withBotTurnMutation(ds.larkAppId, async () => {
         await closeCliMismatchedSessionsForBot(ds.larkAppId);
       });
@@ -25875,6 +26034,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
+      validateTopicHeader: (header, appId) => resolveTopicSpec(header, {
+        botCfg: getBot(appId).config,
+        scanDirs: getProjectScanDirsForBot(appId),
+      }).ok,
       handleBotAdded: (chatId, operatorOpenId, appId) => withBotTurnAdmission(
         appId,
         () => handleBotAdded(chatId, operatorOpenId, appId),
