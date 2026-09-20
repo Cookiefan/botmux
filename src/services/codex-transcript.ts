@@ -854,6 +854,55 @@ function codexAbortErrorCode(reason: unknown): string {
   return `codex_turn_aborted:${normalized}`;
 }
 
+/** Resolve a custom tool output against the rollout itself. Outputs can land
+ * in a later incremental drain than their calls, so the byte offset alone is
+ * insufficient; a backward chunk scan keeps the parser stateless without
+ * loading an arbitrarily large rollout into memory. */
+function precedingCustomToolName(path: string, beforeOffset: number, callId: string): string | undefined {
+  const consider = (line: string): string | undefined => {
+    if (!line.includes(callId)) return undefined;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { return undefined; }
+    const p = obj?.payload;
+    if (obj?.type === 'response_item'
+      && p?.type === 'custom_tool_call'
+      && p.call_id === callId
+      && typeof p.name === 'string') return p.name;
+    return undefined;
+  };
+  const chunkBytes = 64 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = beforeOffset;
+    let carry = Buffer.alloc(0);
+    while (end > 0) {
+      const start = Math.max(0, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const found = consider(block.subarray(i + 1, lineEnd).toString('utf8'));
+        if (found) return found;
+        lineEnd = i;
+        carryEnd = i;
+      }
+      carry = block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) return consider(carry.toString('utf8'));
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return undefined;
+}
+
 /** Increment-read the rollout from `fromOffset`. Mirrors the byte-offset
  *  contract of claude-transcript.drainTranscript so callers can swap them
  *  out and reuse the existing fs.watch / poll wakeup machinery. */
@@ -881,6 +930,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
   let latestThreadSettings: CodexThreadSettings | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
+  const execCallIds = new Set<string>();
   // Track byte offset within the file as we walk lines so synthetic uuids
   // are stable across re-drains.
   let cursor = start;
@@ -927,11 +977,45 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     // collecting turn for the native CoT message; they never start or close
     // a turn (the boundaries above/below stay authoritative).
     if (obj.type === 'response_item') {
+      if (p.type === 'custom_tool_call' && p.name === 'exec' && typeof p.call_id === 'string' && p.call_id) {
+        execCallIds.add(p.call_id);
+        continue;
+      }
+      if (p.type === 'custom_tool_call_output'
+        && typeof p.call_id === 'string'
+        && (execCallIds.delete(p.call_id) || precedingCustomToolName(path, lineStart, p.call_id) === 'exec')) {
+        continue;
+      }
       const cotEntries = codexCotEntriesFromResponseItem(p);
       if (cotEntries.length > 0) {
         events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
         continue;
       }
+    }
+    if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item?.type === 'CommandExecution') {
+      const item = p.item;
+      const parsed = Array.isArray(item.parsed_cmd) ? item.parsed_cmd[0] : undefined;
+      const parsedType = typeof parsed?.type === 'string' ? parsed.type : '';
+      const name = parsedType === 'read' || parsedType === 'search' || parsedType === 'list_files'
+        ? parsedType
+        : 'shell';
+      const command = Array.isArray(item.command) ? item.command : [];
+      const subject = typeof parsed?.cmd === 'string' && parsed.cmd
+        ? parsed.cmd
+        : [...command].reverse().find((part): part is string => typeof part === 'string') ?? '';
+      let args = '';
+      try { args = command.length > 0 ? JSON.stringify({ command }) : ''; } catch { /* ignore malformed command */ }
+      const id = typeof item.id === 'string' && item.id ? item.id : `${path}:${lineStart}:command`;
+      const cotEntries: CodexCotEntry[] = [toolCallEntry(id, name, args, subject)];
+      const formatted = typeof item.formatted_output === 'string' ? item.formatted_output : '';
+      const aggregated = typeof item.aggregated_output === 'string' ? item.aggregated_output : '';
+      const streams = [item.stdout, item.stderr]
+        .filter((part): part is string => typeof part === 'string' && part.length > 0)
+        .join('\n');
+      const output = formatted || aggregated || streams;
+      if (output) cotEntries.push({ kind: 'tool_result', id, result: truncateForCot(output, COT_TOOL_RESULT_MAX_CHARS) });
+      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+      continue;
     }
     // Turn terminal: event_msg `task_complete` carries the final visible text
     // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.

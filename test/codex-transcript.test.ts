@@ -333,6 +333,119 @@ describe('drainCodexRollout', () => {
     expect(r.events[1].text).toBe('hi back');
   });
 
+  it('renders native CommandExecution and hides its outer JavaScript exec wrapper', () => {
+    writeFileSync(path,
+      ev(userResponseItem('inspect the readme'))
+      + ev({
+        timestamp: '2026-04-29T07:00:00.100Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'outer-1',
+          input: 'await tools.exec_command({ cmd: "sed -n 1,20p README.md" })',
+        },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.200Z',
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'native-1',
+            command: ['/bin/bash', '-lc', "sed -n '1,20p' README.md"],
+            parsed_cmd: [{ type: 'read', cmd: "sed -n '1,20p' README.md" }],
+            formatted_output: '# BotMux\nNative output',
+          },
+        },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.300Z',
+        type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-1', output: '{"output":"wrapper output"}' },
+      }));
+
+    const result = drainCodexRollout(path, 0);
+    const cot = result.events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries).toEqual([
+      {
+        kind: 'tool_call', id: 'native-1', name: 'read',
+        args: JSON.stringify({ command: ['/bin/bash', '-lc', "sed -n '1,20p' README.md"] }),
+        subject: "sed -n '1,20p' README.md",
+      },
+      { kind: 'tool_result', id: 'native-1', result: '# BotMux\nNative output' },
+    ]);
+  });
+
+  it('suppresses exec outputs across incremental drains and polling wrappers', () => {
+    writeFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'outer-run', input: 'run command' },
+      }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events).toEqual([]);
+
+    appendFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.150Z', type: 'event_msg',
+        payload: { type: 'ignored', blob: 'x'.repeat(70 * 1024) },
+      })
+      +
+      ev({
+        timestamp: '2026-04-29T07:00:00.200Z', type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-run', output: 'control output' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.300Z', type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'outer-poll', input: 'poll command' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.400Z', type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-poll', output: 'poll output' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.500Z', type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'native-2', command: ['bash', '-lc', 'pnpm test'],
+            parsed_cmd: [{ type: 'unknown', cmd: 'pnpm test' }], stdout: 'passed', stderr: '',
+          },
+        },
+      }));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.events).toHaveLength(1);
+    expect(second.events[0].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'native-2', name: 'shell', subject: 'pnpm test' },
+      { kind: 'tool_result', id: 'native-2', result: 'passed' },
+    ]);
+  });
+
+  it('preserves non-exec custom tools', () => {
+    writeFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'apply_patch', call_id: 'patch-1', input: '*** Begin Patch' },
+      }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events.filter(event => event.kind === 'cot')).toHaveLength(1);
+
+    appendFileSync(path, ev({
+        timestamp: '2026-04-29T07:00:00.200Z', type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'patch-1', output: 'Done' },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.300Z', type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'stale-exec', input: 'run' },
+      })
+      + ev(assistantFinalResponseItem('complete')));
+    const completed = drainCodexRollout(path, first.newOffset);
+    expect(completed.events.filter(event => event.kind === 'cot')).toHaveLength(1);
+    expect(completed.events.find(event => event.kind === 'cot')?.cotEntries).toEqual([
+      { kind: 'tool_result', id: 'patch-1', result: 'Done' },
+    ]);
+  });
+
   it('skips developer role messages', () => {
     writeFileSync(path,
       ev({
