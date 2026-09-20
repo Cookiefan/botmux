@@ -741,10 +741,11 @@ describe('drainCodexRollout', () => {
       + ev({
         type: 'response_item',
         payload: { type: 'custom_tool_call_output', call_id: 'outer-1', output: '{"output":"BotMux\\n"}' },
-      }));
+      })
+      + ev(assistantFinalResponseItem('done')));
 
     const r = drainCodexRollout(path, 0);
-    expect(r.events).toHaveLength(1);
+    expect(r.events).toHaveLength(2);
     expect(r.events[0].cotEntries).toEqual([
       {
         kind: 'tool_call', id: 'exec-1', name: 'read',
@@ -767,7 +768,7 @@ describe('drainCodexRollout', () => {
     const first = drainCodexRollout(path, 0);
     expect(first.events).toEqual([]);
     expect(first.state).toEqual({
-      pendingExecCalls: [{ callId: 'outer-2', sawNativeCommand: false }],
+      pendingExecCalls: [{ callId: 'outer-2' }],
     });
 
     appendFileSync(path,
@@ -796,9 +797,10 @@ describe('drainCodexRollout', () => {
       + ev({
         type: 'response_item',
         payload: { type: 'custom_tool_call_output', call_id: 'outer-2', output: 'ignored wrapper result' },
-      }));
+      })
+      + ev(assistantFinalResponseItem('done')));
     const second = drainCodexRollout(path, first.newOffset, first.state);
-    expect(second.events).toHaveLength(2);
+    expect(second.events).toHaveLength(3);
     expect(second.events[0].cotEntries?.[0]).toMatchObject({
       kind: 'tool_call', id: 'exec-2', name: 'search', subject: 'rg TODO src',
     });
@@ -807,6 +809,44 @@ describe('drainCodexRollout', () => {
     });
     expect(JSON.stringify(second.events)).not.toContain('ignored wrapper result');
     expect(second.state).toEqual({});
+  });
+
+  it('suppresses polling/control exec wrappers when the turn later emits a native command', () => {
+    writeFileSync(path,
+      ev({
+        type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'start', input: 'start wrapper' },
+      })
+      + ev({
+        type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'start', output: 'still running' },
+      })
+      + ev({
+        type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'poll', input: 'poll wrapper' },
+      })
+      + ev({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'exec-async', command: ['/bin/bash', '-lc', 'npm test'],
+            parsed_cmd: [{ type: 'unknown', cmd: 'npm test' }], stdout: 'passed', stderr: '',
+          },
+        },
+      })
+      + ev({
+        type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'poll', output: 'finished' },
+      })
+      + ev(assistantFinalResponseItem('done')));
+
+    const r = drainCodexRollout(path, 0);
+    const calls = r.events.flatMap(event => event.cotEntries ?? [])
+      .filter(entry => entry.kind === 'tool_call');
+    expect(calls).toEqual([
+      { kind: 'tool_call', id: 'exec-async', name: 'shell', args: 'npm test', subject: 'npm test' },
+    ]);
   });
 
   it('falls back to a generic exec node when Codex emits no native command item', () => {
@@ -822,14 +862,15 @@ describe('drainCodexRollout', () => {
         type: 'response_item',
         payload: {
           type: 'custom_tool_call_output', call_id: 'legacy-exec',
-          output: '{"output":"/workspace\\n","metadata":{"exit_code":0}}',
+          output: [{ type: 'input_text', text: 'Script completed\n' }, { type: 'input_text', text: '/workspace\n' }],
         },
-      }));
+      })
+      + ev(assistantFinalResponseItem('done')));
     const r = drainCodexRollout(path, 0);
-    expect(r.events).toHaveLength(1);
+    expect(r.events).toHaveLength(2);
     expect(r.events[0].cotEntries).toEqual([
       { kind: 'tool_call', id: 'legacy-exec', name: 'exec', args: '' },
-      { kind: 'tool_result', id: 'legacy-exec', result: '/workspace\n' },
+      { kind: 'tool_result', id: 'legacy-exec', result: 'Script completed\n/workspace\n' },
     ]);
     expect(JSON.stringify(r.events)).not.toContain('tools.exec_command');
   });
@@ -841,7 +882,11 @@ describe('drainCodexRollout', () => {
         payload: { type: 'custom_tool_call', name: 'exec', call_id: 'stale', input: 'wrapper' },
       })
       + ev(assistantFinalResponseItem('done')));
-    expect(drainCodexRollout(path, 0).state).toEqual({});
+    const result = drainCodexRollout(path, 0);
+    expect(result.state).toEqual({});
+    expect(result.events[0].cotEntries).toEqual([
+      { kind: 'tool_call', id: 'stale', name: 'exec', args: '' },
+    ]);
   });
 
   it('extracts turn_aborted as a no-output terminal edge', () => {

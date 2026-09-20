@@ -257,8 +257,9 @@ export type CodexCotEntry =
 export interface CodexTranscriptState {
   pendingExecCalls?: Array<{
     callId: string;
-    sawNativeCommand: boolean;
+    output?: string;
   }>;
+  sawNativeCommand?: boolean;
 }
 
 /** Per-entry truncation caps for the CoT tool timeline (same rationale and
@@ -285,6 +286,14 @@ function toolCallEntry(id: string, name: string, args: string, rawSubject: strin
  *  unwrap to the inner output when that shape parses, otherwise show the raw
  *  string (custom tools / newer formats). */
 function stringifyCodexToolOutput(output: unknown): string {
+  if (Array.isArray(output)) {
+    return output.flatMap(block =>
+      block && typeof block === 'object'
+        && typeof (block as { text?: unknown }).text === 'string'
+        ? [(block as { text: string }).text]
+        : [],
+    ).join('');
+  }
   if (typeof output !== 'string') {
     try { return output === undefined ? '' : JSON.stringify(output); } catch { return ''; }
   }
@@ -298,9 +307,32 @@ function stringifyCodexToolOutput(output: unknown): string {
 }
 
 function cloneCodexTranscriptState(state: CodexTranscriptState | undefined): CodexTranscriptState {
-  return state?.pendingExecCalls?.length
-    ? { pendingExecCalls: state.pendingExecCalls.map(call => ({ ...call })) }
-    : {};
+  return {
+    ...(state?.pendingExecCalls?.length
+      ? { pendingExecCalls: state.pendingExecCalls.map(call => ({ ...call })) }
+      : {}),
+    ...(state?.sawNativeCommand ? { sawNativeCommand: true } : {}),
+  };
+}
+
+function pendingExecFallbackEntries(state: CodexTranscriptState): CodexCotEntry[] {
+  if (state.sawNativeCommand) return [];
+  const entries: CodexCotEntry[] = [];
+  for (const call of state.pendingExecCalls ?? []) {
+    entries.push(toolCallEntry(call.callId, 'exec', '', ''));
+    if (call.output) {
+      entries.push({
+        kind: 'tool_result', id: call.callId,
+        result: truncateForCot(call.output, COT_TOOL_RESULT_MAX_CHARS),
+      });
+    }
+  }
+  return entries;
+}
+
+function clearPendingExecState(state: CodexTranscriptState): void {
+  delete state.pendingExecCalls;
+  delete state.sawNativeCommand;
 }
 
 function commandExecutionToolName(item: any): string {
@@ -997,6 +1029,7 @@ export function drainCodexRollout(
     if (obj.type === 'response_item' && p.type === 'message' && p.role === 'user') {
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
+      clearPendingExecState(state);
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
       continue;
     }
@@ -1009,32 +1042,16 @@ export function drainCodexRollout(
         && typeof p.call_id === 'string' && p.call_id) {
         state.pendingExecCalls ??= [];
         if (!state.pendingExecCalls.some(call => call.callId === p.call_id)) {
-          state.pendingExecCalls.push({ callId: p.call_id, sawNativeCommand: false });
+          state.pendingExecCalls.push({ callId: p.call_id });
         }
         continue;
       }
       if (p.type === 'custom_tool_call_output'
         && typeof p.call_id === 'string' && p.call_id
         && state.pendingExecCalls) {
-        const pendingIndex = state.pendingExecCalls.findIndex(call => call.callId === p.call_id);
-        if (pendingIndex >= 0) {
-          const [pending] = state.pendingExecCalls.splice(pendingIndex, 1);
-          if (state.pendingExecCalls.length === 0) delete state.pendingExecCalls;
-          if (pending?.sawNativeCommand) continue;
-          const fallbackEntries: CodexCotEntry[] = [toolCallEntry(p.call_id, 'exec', '', '')];
-          const result = stringifyCodexToolOutput(p.output);
-          if (result) {
-            fallbackEntries.push({
-              kind: 'tool_result', id: p.call_id,
-              result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS),
-            });
-          }
-          events.push({
-            uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '',
-            cotEntries: fallbackEntries,
-          });
-          continue;
-        }
+        const pending = state.pendingExecCalls.find(call => call.callId === p.call_id);
+        if (pending) pending.output = stringifyCodexToolOutput(p.output);
+        if (pending) continue;
       }
       const cotEntries = codexCotEntriesFromResponseItem(p);
       if (cotEntries.length > 0) {
@@ -1044,8 +1061,7 @@ export function drainCodexRollout(
     }
     if (obj.type === 'event_msg' && p.type === 'item_completed'
       && p.item?.type === 'CommandExecution') {
-      const pendingExec = state.pendingExecCalls?.at(-1);
-      if (pendingExec) pendingExec.sawNativeCommand = true;
+      state.sawNativeCommand = true;
       const cotEntries = codexCotEntriesFromCommandExecution(p.item);
       if (cotEntries.length > 0) {
         events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
@@ -1067,6 +1083,13 @@ export function drainCodexRollout(
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
       const failed = p.error !== null && p.error !== undefined;
+      const fallbackEntries = pendingExecFallbackEntries(state);
+      if (fallbackEntries.length > 0) {
+        events.push({
+          uuid: `${path}:${lineStart}:exec-fallback`, timestampMs, kind: 'cot', text: '',
+          cotEntries: fallbackEntries,
+        });
+      }
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
@@ -1078,7 +1101,7 @@ export function drainCodexRollout(
           terminalErrorSummary: safeFailureSummary(p.error),
         } : {}),
       });
-      delete state.pendingExecCalls;
+      clearPendingExecState(state);
       continue;
     }
     // A cancelled turn writes `turn_aborted` (turn_id, reason) and NO
@@ -1096,7 +1119,7 @@ export function drainCodexRollout(
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
       });
-      delete state.pendingExecCalls;
+      clearPendingExecState(state);
       continue;
     }
     // Everything else is skipped: role=developer/system instructions and
