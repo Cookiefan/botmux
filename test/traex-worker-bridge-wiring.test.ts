@@ -23,6 +23,7 @@ describe('TRAE worker structured-bridge wiring', () => {
     const end = workerSource.indexOf('\n}\n', start);
     const body = workerSource.slice(start, end);
 
+    expect(body).toContain('if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);');
     // adoptMode is threaded into the TRAE drainer so it does not synthesise a
     // bare sentinel in adopt mode (where transcript text is posted verbatim).
     expect(body).toContain('if (structuredBridgeIsTraex())');

@@ -374,10 +374,9 @@ describe('drainCodexRollout', () => {
       },
       { kind: 'tool_result', id: 'native-1', result: '# BotMux\nNative output' },
     ]);
-    expect(result.state).toEqual({});
   });
 
-  it('keeps exec suppression state across incremental drains and polling wrappers', () => {
+  it('suppresses exec outputs across incremental drains and polling wrappers', () => {
     writeFileSync(path,
       ev({
         timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item',
@@ -385,9 +384,13 @@ describe('drainCodexRollout', () => {
       }));
     const first = drainCodexRollout(path, 0);
     expect(first.events).toEqual([]);
-    expect(first.state).toEqual({ pendingExecCallIds: ['outer-run'] });
 
     appendFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.150Z', type: 'event_msg',
+        payload: { type: 'ignored', blob: 'x'.repeat(70 * 1024) },
+      })
+      +
       ev({
         timestamp: '2026-04-29T07:00:00.200Z', type: 'response_item',
         payload: { type: 'custom_tool_call_output', call_id: 'outer-run', output: 'control output' },
@@ -410,22 +413,24 @@ describe('drainCodexRollout', () => {
           },
         },
       }));
-    const second = drainCodexRollout(path, first.newOffset, first.state);
+    const second = drainCodexRollout(path, first.newOffset);
     expect(second.events).toHaveLength(1);
     expect(second.events[0].cotEntries).toMatchObject([
       { kind: 'tool_call', id: 'native-2', name: 'shell', subject: 'pnpm test' },
       { kind: 'tool_result', id: 'native-2', result: 'passed' },
     ]);
-    expect(second.state).toEqual({});
   });
 
-  it('preserves non-exec custom tools and clears stale exec ids at turn boundaries', () => {
+  it('preserves non-exec custom tools', () => {
     writeFileSync(path,
       ev({
         timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item',
         payload: { type: 'custom_tool_call', name: 'apply_patch', call_id: 'patch-1', input: '*** Begin Patch' },
-      })
-      + ev({
+      }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events.filter(event => event.kind === 'cot')).toHaveLength(1);
+
+    appendFileSync(path, ev({
         timestamp: '2026-04-29T07:00:00.200Z', type: 'response_item',
         payload: { type: 'custom_tool_call_output', call_id: 'patch-1', output: 'Done' },
       })
@@ -434,25 +439,11 @@ describe('drainCodexRollout', () => {
         payload: { type: 'custom_tool_call', name: 'exec', call_id: 'stale-exec', input: 'run' },
       })
       + ev(assistantFinalResponseItem('complete')));
-    const completed = drainCodexRollout(path, 0);
-    expect(completed.events.filter(event => event.kind === 'cot')).toHaveLength(2);
-    expect(completed.state).toEqual({});
-
-    writeFileSync(path,
-      ev({
-        timestamp: '2026-04-29T07:01:00.100Z', type: 'response_item',
-        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'stale-abort', input: 'run' },
-      })
-      + ev({
-        timestamp: '2026-04-29T07:01:00.200Z', type: 'event_msg',
-        payload: { type: 'turn_aborted', turn_id: 'turn-aborted', reason: 'user_cancelled' },
-      }));
-    const aborted = drainCodexRollout(path, 0);
-    expect(aborted.state).toEqual({});
-
-    writeFileSync(path, ev(userResponseItem('next turn')));
-    const nextTurn = drainCodexRollout(path, 0, { pendingExecCallIds: ['stale-user'] });
-    expect(nextTurn.state).toEqual({});
+    const completed = drainCodexRollout(path, first.newOffset);
+    expect(completed.events.filter(event => event.kind === 'cot')).toHaveLength(1);
+    expect(completed.events.find(event => event.kind === 'cot')?.cotEntries).toEqual([
+      { kind: 'tool_result', id: 'patch-1', result: 'Done' },
+    ]);
   });
 
   it('skips developer role messages', () => {

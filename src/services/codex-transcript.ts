@@ -643,13 +643,6 @@ export interface CodexDrainResult {
   /** Newest executor reasoning effort observed in this byte range (from
    *  `turn_context`), latest-wins. Undefined when none appeared. */
   latestReasoningEffort?: string;
-  /** Parser state that must survive incremental byte-range drains. */
-  state?: CodexTranscriptState;
-}
-
-export interface CodexTranscriptState {
-  /** Outer Codex JS `exec` wrappers awaiting their matching output record. */
-  pendingExecCallIds?: string[];
 }
 
 /** Bounded backward-scan cap for the one-shot runtime bootstrap — runtime
@@ -861,26 +854,67 @@ function codexAbortErrorCode(reason: unknown): string {
   return `codex_turn_aborted:${normalized}`;
 }
 
+/** Resolve a custom tool output against the rollout itself. Outputs can land
+ * in a later incremental drain than their calls, so the byte offset alone is
+ * insufficient; a backward chunk scan keeps the parser stateless without
+ * loading an arbitrarily large rollout into memory. */
+function precedingCustomToolName(path: string, beforeOffset: number, callId: string): string | undefined {
+  const consider = (line: string): string | undefined => {
+    if (!line.includes(callId)) return undefined;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { return undefined; }
+    const p = obj?.payload;
+    if (obj?.type === 'response_item'
+      && p?.type === 'custom_tool_call'
+      && p.call_id === callId
+      && typeof p.name === 'string') return p.name;
+    return undefined;
+  };
+  const chunkBytes = 64 * 1024;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = beforeOffset;
+    let carry = Buffer.alloc(0);
+    while (end > 0) {
+      const start = Math.max(0, end - chunkBytes);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const found = consider(block.subarray(i + 1, lineEnd).toString('utf8'));
+        if (found) return found;
+        lineEnd = i;
+        carryEnd = i;
+      }
+      carry = block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) return consider(carry.toString('utf8'));
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return undefined;
+}
+
 /** Increment-read the rollout from `fromOffset`. Mirrors the byte-offset
  *  contract of claude-transcript.drainTranscript so callers can swap them
  *  out and reuse the existing fs.watch / poll wakeup machinery. */
-export function drainCodexRollout(
-  path: string,
-  fromOffset: number,
-  state: CodexTranscriptState = {},
-): CodexDrainResult {
-  const pendingExecCallIds = new Set(state.pendingExecCallIds ?? []);
-  const nextState = (): CodexTranscriptState => pendingExecCallIds.size > 0
-    ? { pendingExecCallIds: [...pendingExecCallIds] }
-    : {};
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '', state: nextState() };
+export function drainCodexRollout(path: string, fromOffset: number): CodexDrainResult {
+  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '', state: nextState() }; }
+  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
   let start = fromOffset;
   // Truncated/rotated jsonl — re-read from the top. Codex doesn't normally
   // rewrite rollouts, but mirror Claude's defensive handling.
   if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '', state: nextState() };
+  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
 
   const len = size - start;
   const buf = Buffer.alloc(len);
@@ -896,6 +930,7 @@ export function drainCodexRollout(
   let latestThreadSettings: CodexThreadSettings | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
+  const execCallIds = new Set<string>();
   // Track byte offset within the file as we walk lines so synthetic uuids
   // are stable across re-drains.
   let cursor = start;
@@ -932,7 +967,6 @@ export function drainCodexRollout(
     // (codex-rpc-lifecycle.rolloutUserTurnMatches), so it must stay a
     // response_item user message.
     if (obj.type === 'response_item' && p.type === 'message' && p.role === 'user') {
-      pendingExecCallIds.clear();
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
@@ -944,12 +978,12 @@ export function drainCodexRollout(
     // a turn (the boundaries above/below stay authoritative).
     if (obj.type === 'response_item') {
       if (p.type === 'custom_tool_call' && p.name === 'exec' && typeof p.call_id === 'string' && p.call_id) {
-        pendingExecCallIds.add(p.call_id);
+        execCallIds.add(p.call_id);
         continue;
       }
       if (p.type === 'custom_tool_call_output'
         && typeof p.call_id === 'string'
-        && pendingExecCallIds.delete(p.call_id)) {
+        && (execCallIds.delete(p.call_id) || precedingCustomToolName(path, lineStart, p.call_id) === 'exec')) {
         continue;
       }
       const cotEntries = codexCotEntriesFromResponseItem(p);
@@ -1009,7 +1043,6 @@ export function drainCodexRollout(
           terminalErrorSummary: safeFailureSummary(p.error),
         } : {}),
       });
-      pendingExecCallIds.clear();
       continue;
     }
     // A cancelled turn writes `turn_aborted` (turn_id, reason) and NO
@@ -1027,7 +1060,6 @@ export function drainCodexRollout(
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
       });
-      pendingExecCallIds.clear();
       continue;
     }
     // Everything else is skipped: role=developer/system instructions and
@@ -1035,7 +1067,7 @@ export function drainCodexRollout(
     // boundary comes only from task_complete. Reasoning / tool calls surface
     // as cosmetic 'cot' events above, never as boundaries.
   }
-  return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort, state: nextState() };
+  return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort };
 }
 
 function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {
