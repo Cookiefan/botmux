@@ -392,7 +392,7 @@ async function applyConfigFieldInternal(
   } else {
     (bot.config as any)[spec.configKey] = effective;
   }
-  if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(String(effective ?? bot.config.cliId))) {
+  if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(bot.config.cliId)) {
     bot.config.reasoningEffort = undefined;
   }
   const newText = spec.kind === 'cli'

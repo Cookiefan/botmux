@@ -765,7 +765,7 @@ describe('bot-config store', () => {
   });
 
   it('cli field sets and clears Forge x TraeX launch mode atomically', async () => {
-    const { registry, store } = await loaded({ cliId: 'traex' });
+    const { registry, store } = await loaded({ cliId: 'traex', reasoningEffort: 'medium' });
     const spec = store.findConfigField('cli')!;
     expect(store.coerceConfigValue(spec, 'forge-x-traex')).toMatchObject({
       ok: true,
@@ -775,13 +775,17 @@ describe('bot-config store', () => {
     const setForge = await store.applyConfigField('app_default', spec, 'forge-x-traex');
     expect(setForge.ok).toBe(true);
     expect(readConfig()).toMatchObject({ cliId: 'traex', cliLaunchMode: 'forge-traex' });
+    expect(readConfig().reasoningEffort).toBe('medium');
     expect(registry.getBot('app_default').config.cliLaunchMode).toBe('forge-traex');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('medium');
 
     const setPlain = await store.applyConfigField('app_default', spec, 'traex');
     expect(setPlain.ok).toBe(true);
     expect(readConfig().cliId).toBe('traex');
     expect(readConfig().cliLaunchMode).toBeUndefined();
+    expect(readConfig().reasoningEffort).toBe('medium');
     expect(registry.getBot('app_default').config.cliLaunchMode).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('medium');
   });
 
   it('cli field rejects Forge x TraeX when existing security isolation would make it invalid', async () => {
