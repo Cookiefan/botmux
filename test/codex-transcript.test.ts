@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromCommandExecution, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -717,6 +717,133 @@ describe('drainCodexRollout', () => {
     expect(r.events[3].cotEntries).toEqual([{ kind: 'tool_result', id: 'call_1', result: 'total 24' }]);
   });
 
+  it('uses native CommandExecution items and suppresses the outer exec wrapper', () => {
+    writeFileSync(path,
+      ev({
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'outer-1',
+          input: 'const r = await tools.exec_command({cmd:"sed -n 1,20p README.md"}); text(r.output);',
+        },
+      })
+      + ev({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'exec-1',
+            command: ['/bin/bash', '-lc', 'sed -n 1,20p README.md'],
+            parsed_cmd: [{ type: 'read', cmd: 'sed -n 1,20p README.md', path: 'README.md' }],
+            status: 'completed', stdout: 'BotMux\n', stderr: '',
+          },
+        },
+      })
+      + ev({
+        type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-1', output: '{"output":"BotMux\\n"}' },
+      }));
+
+    const r = drainCodexRollout(path, 0);
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0].cotEntries).toEqual([
+      {
+        kind: 'tool_call', id: 'exec-1', name: 'read',
+        args: 'sed -n 1,20p README.md', subject: 'sed -n 1,20p README.md',
+      },
+      { kind: 'tool_result', id: 'exec-1', result: 'BotMux\n' },
+    ]);
+    expect(JSON.stringify(r.events)).not.toContain('tools.exec_command');
+    expect(r.state).toEqual({});
+  });
+
+  it('keeps exec correlation state across incremental drains', () => {
+    writeFileSync(path, ev({
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'outer-2',
+        input: 'const r = await tools.exec_command({cmd:"rg TODO src"}); text(r.output);',
+      },
+    }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events).toEqual([]);
+    expect(first.state).toEqual({
+      pendingExecCalls: [{ callId: 'outer-2', sawNativeCommand: false }],
+    });
+
+    appendFileSync(path,
+      ev({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'exec-2', command: ['/bin/bash', '-lc', 'rg TODO src'],
+            parsed_cmd: [{ type: 'search', cmd: 'rg TODO src' }],
+            aggregated_output: 'src/a.ts:1:TODO',
+          },
+        },
+      })
+      + ev({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'exec-3', command: ['/bin/bash', '-lc', 'git status --short'],
+            parsed_cmd: [{ type: 'other', cmd: 'git status --short' }],
+            formatted_output: 'clean',
+          },
+        },
+      })
+      + ev({
+        type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-2', output: 'ignored wrapper result' },
+      }));
+    const second = drainCodexRollout(path, first.newOffset, first.state);
+    expect(second.events).toHaveLength(2);
+    expect(second.events[0].cotEntries?.[0]).toMatchObject({
+      kind: 'tool_call', id: 'exec-2', name: 'search', subject: 'rg TODO src',
+    });
+    expect(second.events[1].cotEntries?.[0]).toMatchObject({
+      kind: 'tool_call', id: 'exec-3', name: 'shell', subject: 'git status --short',
+    });
+    expect(JSON.stringify(second.events)).not.toContain('ignored wrapper result');
+    expect(second.state).toEqual({});
+  });
+
+  it('falls back to a generic exec node when Codex emits no native command item', () => {
+    writeFileSync(path,
+      ev({
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'legacy-exec',
+          input: 'const r = await tools.exec_command({cmd:"pwd"}); text(r.output);',
+        },
+      })
+      + ev({
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call_output', call_id: 'legacy-exec',
+          output: '{"output":"/workspace\\n","metadata":{"exit_code":0}}',
+        },
+      }));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0].cotEntries).toEqual([
+      { kind: 'tool_call', id: 'legacy-exec', name: 'exec', args: '' },
+      { kind: 'tool_result', id: 'legacy-exec', result: '/workspace\n' },
+    ]);
+    expect(JSON.stringify(r.events)).not.toContain('tools.exec_command');
+  });
+
+  it('clears pending exec state at terminal events', () => {
+    writeFileSync(path,
+      ev({
+        type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'stale', input: 'wrapper' },
+      })
+      + ev(assistantFinalResponseItem('done')));
+    expect(drainCodexRollout(path, 0).state).toEqual({});
+  });
+
   it('extracts turn_aborted as a no-output terminal edge', () => {
     writeFileSync(path,
       ev(userResponseItem('interrupt me')) +
@@ -1157,5 +1284,18 @@ describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
     expect(codexCotEntriesFromResponseItem({ type: 'ghost_snapshot' })).toEqual([]);
     expect(codexCotEntriesFromResponseItem({ type: 'function_call_output', call_id: 'c1', output: '' })).toEqual([]);
     expect(codexCotEntriesFromResponseItem(undefined)).toEqual([]);
+  });
+});
+
+describe('codexCotEntriesFromCommandExecution', () => {
+  it('uses the final argv element when parsed_cmd has no command label', () => {
+    expect(codexCotEntriesFromCommandExecution({
+      type: 'CommandExecution', id: 'exec-fallback',
+      command: ['/bin/bash', '-lc', 'npm test'],
+      parsed_cmd: [], stderr: 'failed',
+    })).toEqual([
+      { kind: 'tool_call', id: 'exec-fallback', name: 'shell', args: 'npm test', subject: 'npm test' },
+      { kind: 'tool_result', id: 'exec-fallback', result: 'failed' },
+    ]);
   });
 });
