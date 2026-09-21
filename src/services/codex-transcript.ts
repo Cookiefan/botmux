@@ -303,84 +303,6 @@ function stringifyCodexToolOutput(output: unknown): string {
   return output;
 }
 
-type PendingExecCall = NonNullable<CodexTranscriptState['pendingExecCalls']>[number];
-
-/** Poll wrappers are transport details of the preceding long-running exec. */
-function isExecPollWrapper(input: string): boolean {
-  return /\btools\.(?:write_stdin|wait)\s*\(/.test(input);
-}
-
-/**
- * Collapse launch + poll wrappers into one fallback tool. Native
- * CommandExecution events normally remove these before a terminal boundary;
- * this path is only for missing-native and interrupted turns.
- */
-function coalescePendingExecFallbacks(
-  calls: readonly PendingExecCall[],
-  includeIncomplete = false,
-): PendingExecCall[] {
-  const fallbacks: PendingExecCall[] = [];
-  let current: PendingExecCall | undefined;
-  for (const call of calls) {
-    // Its native command was already emitted, so the wrapper is redundant even
-    // if the outer output did not arrive before the turn ended.
-    if (call.sawNativeCommand && !call.sawNonCommandItem) continue;
-    if (!includeIncomplete && call.outputUuid === undefined) continue;
-    if (isExecPollWrapper(call.input) && current) {
-      // Keep the launch identity/title, but use the newest completed poll's
-      // output and stable line uuid when one exists.
-      if (call.outputUuid !== undefined) {
-        current.output = call.output;
-        current.outputUuid = call.outputUuid;
-        current.outputTimestampMs = call.outputTimestampMs;
-      }
-      continue;
-    }
-    current = { ...call };
-    fallbacks.push(current);
-  }
-  return fallbacks;
-}
-
-function pendingExecFallbackEvent(
-  call: PendingExecCall,
-  path: string,
-  terminalLineStart: number,
-  terminalTimestampMs: number,
-  missingResult: string,
-): CodexBridgeEvent {
-  return {
-    uuid: call.outputUuid ?? `${path}:${terminalLineStart}:exec:${call.callId}`,
-    timestampMs: call.outputTimestampMs ?? terminalTimestampMs,
-    kind: 'cot',
-    text: '',
-    cotEntries: [
-      toolCallEntry(call.callId, 'exec', call.input, subjectFromArgsString(call.input)),
-      {
-        kind: 'tool_result',
-        id: call.callId,
-        result: truncateForCot(call.output ?? missingResult, COT_TOOL_RESULT_MAX_CHARS),
-      },
-    ],
-  };
-}
-
-function commandExecutionResult(item: any): string {
-  const formatted = typeof item.formatted_output === 'string' ? item.formatted_output : '';
-  const aggregated = typeof item.aggregated_output === 'string' ? item.aggregated_output : '';
-  const streams = [item.stdout, item.stderr]
-    .filter((part): part is string => typeof part === 'string' && part.length > 0)
-    .join('\n');
-  const output = formatted || aggregated || streams;
-  if (output) return truncateForCot(output, COT_TOOL_RESULT_MAX_CHARS);
-  if (item.status === 'failed') {
-    const exitCode = typeof item.exit_code === 'number' ? ` with exit code ${item.exit_code}` : '';
-    return `Command failed${exitCode}.`;
-  }
-  // The renderer turns an empty result into its localized completed marker.
-  return '';
-}
-
 /**
  * Extract CoT (thinking process) entries from one Codex rollout
  * `response_item` payload. Returns [] for payload types that don't belong in
@@ -439,7 +361,7 @@ export function codexCotEntriesFromResponseItem(p: any): CodexCotEntry[] {
   }
   if ((p.type === 'function_call_output' || p.type === 'custom_tool_call_output') && typeof p.call_id === 'string' && p.call_id) {
     const result = stringifyCodexToolOutput(p.output);
-    return [{ kind: 'tool_result', id: p.call_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) }];
+    return result.length > 0 ? [{ kind: 'tool_result', id: p.call_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) }] : [];
   }
   return [];
 }
@@ -1057,8 +979,17 @@ export function drainCodexRollout(
             continue;
           }
           if (pending.sawNonCommandItem) {
+            const cotEntries: CodexCotEntry[] = [
+              toolCallEntry(p.call_id, 'exec', pending.input, subjectFromArgsString(pending.input)),
+            ];
+            if (pending.output) {
+              cotEntries.push({
+                kind: 'tool_result', id: p.call_id,
+                result: truncateForCot(pending.output, COT_TOOL_RESULT_MAX_CHARS),
+              });
+            }
             pendingExecCalls.splice(pendingIndex, 1);
-            events.push(pendingExecFallbackEvent(pending, path, lineStart, timestampMs, ''));
+            events.push({ uuid: pending.outputUuid, timestampMs, kind: 'cot', text: '', cotEntries });
           }
           continue;
         }
@@ -1102,10 +1033,14 @@ export function drainCodexRollout(
       let args = '';
       try { args = command.length > 0 ? JSON.stringify({ command }) : ''; } catch { /* ignore malformed command */ }
       const id = typeof item.id === 'string' && item.id ? item.id : `${path}:${lineStart}:command`;
-      const cotEntries: CodexCotEntry[] = [
-        toolCallEntry(id, name, args, subject),
-        { kind: 'tool_result', id, result: commandExecutionResult(item) },
-      ];
+      const cotEntries: CodexCotEntry[] = [toolCallEntry(id, name, args, subject)];
+      const formatted = typeof item.formatted_output === 'string' ? item.formatted_output : '';
+      const aggregated = typeof item.aggregated_output === 'string' ? item.aggregated_output : '';
+      const streams = [item.stdout, item.stderr]
+        .filter((part): part is string => typeof part === 'string' && part.length > 0)
+        .join('\n');
+      const output = formatted || aggregated || streams;
+      if (output) cotEntries.push({ kind: 'tool_result', id, result: truncateForCot(output, COT_TOOL_RESULT_MAX_CHARS) });
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
       continue;
     }
@@ -1124,14 +1059,27 @@ export function drainCodexRollout(
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
       const failed = p.error !== null && p.error !== undefined;
-      for (const pendingExec of coalescePendingExecFallbacks(pendingExecCalls)) {
-        events.push(pendingExecFallbackEvent(
-          pendingExec,
-          path,
-          lineStart,
-          timestampMs,
-          failed ? 'Tool failed before returning output.' : '',
-        ));
+      for (const pendingExec of pendingExecCalls) {
+        if (pendingExec.outputUuid === undefined) continue;
+        const cotEntries: CodexCotEntry[] = [
+          toolCallEntry(
+            pendingExec.callId,
+            'exec',
+            pendingExec.input,
+            subjectFromArgsString(pendingExec.input),
+          ),
+        ];
+        if (pendingExec.output) {
+          cotEntries.push({
+            kind: 'tool_result', id: pendingExec.callId,
+            result: truncateForCot(pendingExec.output, COT_TOOL_RESULT_MAX_CHARS),
+          });
+        }
+        events.push({
+          uuid: pendingExec.outputUuid,
+          timestampMs: pendingExec.outputTimestampMs ?? timestampMs,
+          kind: 'cot', text: '', cotEntries,
+        });
       }
       events.push({
         uuid: `${path}:${lineStart}`,
@@ -1154,15 +1102,6 @@ export function drainCodexRollout(
       && p.type === 'turn_aborted'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
-      for (const pendingExec of coalescePendingExecFallbacks(pendingExecCalls, true)) {
-        events.push(pendingExecFallbackEvent(
-          pendingExec,
-          path,
-          lineStart,
-          timestampMs,
-          'Execution interrupted before completion.',
-        ));
-      }
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
