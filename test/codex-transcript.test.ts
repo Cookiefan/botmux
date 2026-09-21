@@ -435,13 +435,54 @@ describe('drainCodexRollout', () => {
     expect(third.state).toEqual({});
   });
 
+  it('delays launch and poll wrappers until a late native command settles', () => {
+    writeFileSync(path,
+      ev(customToolCall('exec', 'outer-launch', 'start long command'))
+      + ev(customToolOutput('outer-launch', 'Script running with cell ID 123')));
+    const launch = drainCodexRollout(path, 0);
+    expect(launch.events).toEqual([]);
+
+    appendFileSync(path,
+      ev(completedItem({ type: 'Reasoning', id: 'reasoning-1' }, '2026-04-29T07:00:01.000Z'))
+      + ev(customToolCall('exec', 'outer-poll-1', 'poll command', '2026-04-29T07:00:01.100Z'))
+      + ev(customToolOutput('outer-poll-1', 'Script still running', '2026-04-29T07:00:01.300Z')));
+    const firstPoll = drainCodexRollout(path, launch.newOffset, launch.state);
+    expect(firstPoll.events).toEqual([]);
+
+    appendFileSync(path,
+      ev(completedItem({ type: 'Reasoning', id: 'reasoning-2' }, '2026-04-29T07:00:02.000Z'))
+      + ev(customToolCall('exec', 'outer-poll-2', 'poll command', '2026-04-29T07:00:02.100Z'))
+      + ev(customToolOutput('outer-poll-2', 'Script still running', '2026-04-29T07:00:02.300Z')));
+    const secondPoll = drainCodexRollout(path, firstPoll.newOffset, firstPoll.state);
+    expect(secondPoll.events).toEqual([]);
+
+    appendFileSync(path,
+      ev(completedItem({ type: 'Reasoning', id: 'reasoning-3' }, '2026-04-29T07:00:03.000Z'))
+      + ev(customToolCall('exec', 'outer-poll-3', 'poll command', '2026-04-29T07:00:03.100Z'))
+      + ev(completedItem({
+        type: 'CommandExecution', id: 'native-long', command: ['bash', '-lc', 'bun run build'],
+        parsed_cmd: [{ type: 'unknown', cmd: 'bun run build' }], formatted_output: 'build passed',
+      }, '2026-04-29T07:00:03.200Z'))
+      + ev(customToolOutput('outer-poll-3', 'Script completed', '2026-04-29T07:00:03.300Z')));
+    const completed = drainCodexRollout(path, secondPoll.newOffset, secondPoll.state);
+    expect(completed.events).toHaveLength(1);
+    expect(completed.events[0].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'native-long', name: 'shell', subject: 'bun run build' },
+      { kind: 'tool_result', id: 'native-long', result: 'build passed' },
+    ]);
+    expect(completed.state).toEqual({});
+  });
+
   it('falls back to the outer exec when no native command item appears', () => {
     writeFileSync(path,
       ev(customToolCall('exec', 'outer-fallback', 'await tools.wait({ cell_id: "123" })'))
       + ev(customToolOutput('outer-fallback', '{"output":"still running"}')));
+    const pending = drainCodexRollout(path, 0);
+    expect(pending.events).toEqual([]);
 
-    const result = drainCodexRollout(path, 0);
-    expect(result.events).toHaveLength(1);
+    appendFileSync(path, ev(assistantFinalResponseItem('done')));
+    const result = drainCodexRollout(path, pending.newOffset, pending.state);
+    expect(result.events).toHaveLength(2);
     expect(result.events[0].cotEntries).toEqual([
       {
         kind: 'tool_call', id: 'outer-fallback', name: 'exec',

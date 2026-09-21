@@ -261,6 +261,9 @@ export interface CodexTranscriptState {
     input: string;
     sawNativeCommand: boolean;
     sawNonCommandItem: boolean;
+    output?: string;
+    outputUuid?: string;
+    outputTimestampMs?: number;
   }>;
 }
 
@@ -967,19 +970,27 @@ export function drainCodexRollout(
         && typeof p.call_id === 'string' && p.call_id) {
         const pendingIndex = pendingExecCalls.findIndex(call => call.callId === p.call_id);
         if (pendingIndex >= 0) {
-          const [pending] = pendingExecCalls.splice(pendingIndex, 1);
-          if (pending?.sawNativeCommand && !pending.sawNonCommandItem) continue;
-          const cotEntries: CodexCotEntry[] = [
-            toolCallEntry(p.call_id, 'exec', pending?.input ?? '', subjectFromArgsString(pending?.input ?? '')),
-          ];
-          const result = stringifyCodexToolOutput(p.output);
-          if (result) {
-            cotEntries.push({
-              kind: 'tool_result', id: p.call_id,
-              result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS),
-            });
+          const pending = pendingExecCalls[pendingIndex]!;
+          pending.output = stringifyCodexToolOutput(p.output);
+          pending.outputUuid = `${path}:${lineStart}`;
+          pending.outputTimestampMs = timestampMs;
+          if (pending.sawNativeCommand && !pending.sawNonCommandItem) {
+            pendingExecCalls.splice(pendingIndex, 1);
+            continue;
           }
-          events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+          if (pending.sawNonCommandItem) {
+            const cotEntries: CodexCotEntry[] = [
+              toolCallEntry(p.call_id, 'exec', pending.input, subjectFromArgsString(pending.input)),
+            ];
+            if (pending.output) {
+              cotEntries.push({
+                kind: 'tool_result', id: p.call_id,
+                result: truncateForCot(pending.output, COT_TOOL_RESULT_MAX_CHARS),
+              });
+            }
+            pendingExecCalls.splice(pendingIndex, 1);
+            events.push({ uuid: pending.outputUuid, timestampMs, kind: 'cot', text: '', cotEntries });
+          }
           continue;
         }
       }
@@ -990,12 +1001,25 @@ export function drainCodexRollout(
       }
     }
     if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item?.type) {
-      const pendingExec = pendingExecCalls.at(-1);
+      let pendingExec: (typeof pendingExecCalls)[number] | undefined;
+      for (let i = pendingExecCalls.length - 1; i >= 0; i--) {
+        if (pendingExecCalls[i]!.outputUuid === undefined) {
+          pendingExec = pendingExecCalls[i];
+          break;
+        }
+      }
       if (pendingExec && p.item.type !== 'CommandExecution') pendingExec.sawNonCommandItem = true;
     }
     if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item?.type === 'CommandExecution') {
-      const pendingExec = pendingExecCalls.at(-1);
-      if (pendingExec) pendingExec.sawNativeCommand = true;
+      for (const pendingExec of pendingExecCalls) {
+        if (!pendingExec.sawNonCommandItem) pendingExec.sawNativeCommand = true;
+      }
+      for (let i = pendingExecCalls.length - 1; i >= 0; i--) {
+        const pendingExec = pendingExecCalls[i]!;
+        if (pendingExec.outputUuid !== undefined && !pendingExec.sawNonCommandItem) {
+          pendingExecCalls.splice(i, 1);
+        }
+      }
       const item = p.item;
       const parsed = Array.isArray(item.parsed_cmd) ? item.parsed_cmd[0] : undefined;
       const parsedType = typeof parsed?.type === 'string' ? parsed.type : '';
@@ -1035,6 +1059,28 @@ export function drainCodexRollout(
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
       const failed = p.error !== null && p.error !== undefined;
+      for (const pendingExec of pendingExecCalls) {
+        if (pendingExec.outputUuid === undefined) continue;
+        const cotEntries: CodexCotEntry[] = [
+          toolCallEntry(
+            pendingExec.callId,
+            'exec',
+            pendingExec.input,
+            subjectFromArgsString(pendingExec.input),
+          ),
+        ];
+        if (pendingExec.output) {
+          cotEntries.push({
+            kind: 'tool_result', id: pendingExec.callId,
+            result: truncateForCot(pendingExec.output, COT_TOOL_RESULT_MAX_CHARS),
+          });
+        }
+        events.push({
+          uuid: pendingExec.outputUuid,
+          timestampMs: pendingExec.outputTimestampMs ?? timestampMs,
+          kind: 'cot', text: '', cotEntries,
+        });
+      }
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
