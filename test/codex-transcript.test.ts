@@ -55,6 +55,30 @@ function assistantMessageResponseItem(text: string, phase?: string, ts = '2026-0
   };
 }
 
+function customToolCall(name: string, callId: string, input: string, ts = '2026-04-29T07:00:00.100Z') {
+  return {
+    timestamp: ts,
+    type: 'response_item',
+    payload: { type: 'custom_tool_call', name, call_id: callId, input },
+  };
+}
+
+function customToolOutput(callId: string, output: string, ts = '2026-04-29T07:00:00.300Z') {
+  return {
+    timestamp: ts,
+    type: 'response_item',
+    payload: { type: 'custom_tool_call_output', call_id: callId, output },
+  };
+}
+
+function completedItem(item: Record<string, unknown>, ts = '2026-04-29T07:00:00.200Z') {
+  return {
+    timestamp: ts,
+    type: 'event_msg',
+    payload: { type: 'item_completed', item },
+  };
+}
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'codex-transcript-'));
   path = join(dir, 'rollout.jsonl');
@@ -331,6 +355,196 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('hello there');
     expect(r.events[1].kind).toBe('assistant_final');
     expect(r.events[1].text).toBe('hi back');
+  });
+
+  it('renders native CommandExecution and hides its outer JavaScript exec wrapper', () => {
+    writeFileSync(path,
+      ev(userResponseItem('inspect the readme'))
+      + ev({
+        timestamp: '2026-04-29T07:00:00.100Z',
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'outer-1',
+          input: 'await tools.exec_command({ cmd: "sed -n 1,20p README.md" })',
+        },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.200Z',
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          item: {
+            type: 'CommandExecution', id: 'native-1',
+            command: ['/bin/bash', '-lc', "sed -n '1,20p' README.md"],
+            parsed_cmd: [{ type: 'read', cmd: "sed -n '1,20p' README.md" }],
+            formatted_output: '# BotMux\nNative output',
+          },
+        },
+      })
+      + ev({
+        timestamp: '2026-04-29T07:00:00.300Z',
+        type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'outer-1', output: '{"output":"wrapper output"}' },
+      }));
+
+    const result = drainCodexRollout(path, 0);
+    const cot = result.events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries).toEqual([
+      {
+        kind: 'tool_call', id: 'native-1', name: 'read',
+        args: JSON.stringify({ command: ['/bin/bash', '-lc', "sed -n '1,20p' README.md"] }),
+        subject: "sed -n '1,20p' README.md",
+      },
+      { kind: 'tool_result', id: 'native-1', result: '# BotMux\nNative output' },
+    ]);
+    expect(result.state).toEqual({});
+  });
+
+  it('keeps exec correlation state across incremental drains', () => {
+    writeFileSync(path, ev(customToolCall('exec', 'outer-run', 'run command')));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events).toEqual([]);
+    expect(first.state).toEqual({
+      pendingExecCalls: [{
+        callId: 'outer-run', input: 'run command',
+        sawNativeCommand: false, sawNonCommandItem: false,
+      }],
+    });
+
+    appendFileSync(path, ev(completedItem({
+      type: 'CommandExecution', id: 'native-2', command: ['bash', '-lc', 'pnpm test'],
+      parsed_cmd: [{ type: 'unknown', cmd: 'pnpm test' }], stdout: 'passed', stderr: '',
+    })));
+    const second = drainCodexRollout(path, first.newOffset, first.state);
+    expect(second.events).toHaveLength(1);
+    expect(second.events[0].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'native-2', name: 'shell', subject: 'pnpm test' },
+      { kind: 'tool_result', id: 'native-2', result: 'passed' },
+    ]);
+    expect(second.state).toEqual({
+      pendingExecCalls: [{
+        callId: 'outer-run', input: 'run command',
+        sawNativeCommand: true, sawNonCommandItem: false,
+      }],
+    });
+
+    appendFileSync(path, ev(customToolOutput('outer-run', 'control output')));
+    const third = drainCodexRollout(path, second.newOffset, second.state);
+    expect(third.events).toEqual([]);
+    expect(third.state).toEqual({});
+  });
+
+  it('falls back to the outer exec when no native command item appears', () => {
+    writeFileSync(path,
+      ev(customToolCall('exec', 'outer-fallback', 'await tools.wait({ cell_id: "123" })'))
+      + ev(customToolOutput('outer-fallback', '{"output":"still running"}')));
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].cotEntries).toEqual([
+      {
+        kind: 'tool_call', id: 'outer-fallback', name: 'exec',
+        args: 'await tools.wait({ cell_id: "123" })',
+        subject: 'await tools.wait({ cell_id: "123" })',
+      },
+      { kind: 'tool_result', id: 'outer-fallback', result: 'still running' },
+    ]);
+    expect(result.state).toEqual({});
+  });
+
+  it('falls back to the outer exec for a FileChange-only wrapper', () => {
+    writeFileSync(path,
+      ev(customToolCall('exec', 'outer-patch', 'await tools.apply_patch(patch)'))
+      + ev(completedItem({ type: 'FileChange', id: 'change-1', changes: [] }))
+      + ev(customToolOutput('outer-patch', 'Done')));
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'outer-patch', name: 'exec' },
+      { kind: 'tool_result', id: 'outer-patch', result: 'Done' },
+    ]);
+    expect(result.state).toEqual({});
+  });
+
+  it('keeps the outer fallback for mixed CommandExecution and FileChange items', () => {
+    writeFileSync(path,
+      ev(customToolCall('exec', 'outer-mixed', 'run command then patch'))
+      + ev(completedItem({
+        type: 'CommandExecution', id: 'native-mixed', command: ['bash', '-lc', 'pnpm test'],
+        parsed_cmd: [{ type: 'unknown', cmd: 'pnpm test' }], formatted_output: 'passed',
+      }))
+      + ev(completedItem({ type: 'FileChange', id: 'change-mixed', changes: [] }, '2026-04-29T07:00:00.250Z'))
+      + ev(customToolOutput('outer-mixed', 'Done')));
+
+    const result = drainCodexRollout(path, 0);
+    const cot = result.events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(2);
+    expect(cot[0].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'native-mixed', name: 'shell', subject: 'pnpm test' },
+      { kind: 'tool_result', id: 'native-mixed', result: 'passed' },
+    ]);
+    expect(cot[1].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'outer-mixed', name: 'exec' },
+      { kind: 'tool_result', id: 'outer-mixed', result: 'Done' },
+    ]);
+    expect(result.state).toEqual({});
+  });
+
+  it('renders every native command under one outer exec and suppresses one wrapper', () => {
+    writeFileSync(path,
+      ev(customToolCall('exec', 'outer-batch', 'run two commands'))
+      + ev(completedItem({
+        type: 'CommandExecution', id: 'native-a', command: ['bash', '-lc', 'pwd'],
+        parsed_cmd: [{ type: 'unknown', cmd: 'pwd' }], formatted_output: '/repo',
+      }))
+      + ev(completedItem({
+        type: 'CommandExecution', id: 'native-b', command: ['bash', '-lc', 'git status'],
+        parsed_cmd: [{ type: 'unknown', cmd: 'git status' }], formatted_output: 'clean',
+      }, '2026-04-29T07:00:00.250Z'))
+      + ev(customToolOutput('outer-batch', 'wrapper output')));
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events.map(event => event.cotEntries?.[0])).toMatchObject([
+      { kind: 'tool_call', id: 'native-a', subject: 'pwd' },
+      { kind: 'tool_call', id: 'native-b', subject: 'git status' },
+    ]);
+    expect(result.state).toEqual({});
+  });
+
+  it('preserves non-exec custom tools and clears pending exec state at terminal boundaries', () => {
+    writeFileSync(path,
+      ev(customToolCall('apply_patch', 'patch-1', '*** Begin Patch'))
+      + ev(customToolOutput('patch-1', 'Done'))
+      + ev(customToolCall('exec', 'stale-exec', 'run'))
+      + ev(assistantFinalResponseItem('complete')));
+    const completed = drainCodexRollout(path, 0);
+    expect(completed.events.filter(event => event.kind === 'cot')).toHaveLength(2);
+    expect(completed.state).toEqual({});
+
+    writeFileSync(path,
+      ev(customToolCall('exec', 'stale-abort', 'run'))
+      + ev({
+        timestamp: '2026-04-29T07:01:00.200Z', type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-aborted', reason: 'user_cancelled' },
+      }));
+    const aborted = drainCodexRollout(path, 0);
+    expect(aborted.state).toEqual({});
+  });
+
+  it('does not clear a pending exec when a type-ahead user event arrives', () => {
+    const state = {
+      pendingExecCalls: [{
+        callId: 'pending-user', input: 'run',
+        sawNativeCommand: false, sawNonCommandItem: false,
+      }],
+    };
+    writeFileSync(path, ev(userResponseItem('next turn')));
+    const result = drainCodexRollout(path, 0, state);
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].kind).toBe('user');
+    expect(result.state).toEqual(state);
   });
 
   it('skips developer role messages', () => {
@@ -813,9 +1027,15 @@ describe('drainCodexRollout', () => {
     // Simulate truncation: rewrite with strictly shorter content so the new
     // size is below r1.newOffset and the re-drain branch fires.
     writeFileSync(path, ev(userResponseItem('s')));
-    const r2 = drainCodexRollout(path, r1.newOffset);
+    const r2 = drainCodexRollout(path, r1.newOffset, {
+      pendingExecCalls: [{
+        callId: 'stale-after-truncate', input: 'run',
+        sawNativeCommand: true, sawNonCommandItem: false,
+      }],
+    });
     expect(r2.events).toHaveLength(1);
     expect(r2.events[0].text).toBe('s');
+    expect(r2.state).toEqual({});
   });
 });
 

@@ -254,6 +254,16 @@ export type CodexCotEntry =
   }
   | { kind: 'tool_result'; id: string; result: string };
 
+export interface CodexTranscriptState {
+  /** Outer JS exec wrappers are delayed until their native ThreadItems arrive. */
+  pendingExecCalls?: Array<{
+    callId: string;
+    input: string;
+    sawNativeCommand: boolean;
+    sawNonCommandItem: boolean;
+  }>;
+}
+
 /** Per-entry truncation caps for the CoT tool timeline (same rationale and
  *  values as claude-transcript's): args/outputs can be hundreds of KB, the
  *  bubble only needs a recognisable preview. */
@@ -643,6 +653,8 @@ export interface CodexDrainResult {
   /** Newest executor reasoning effort observed in this byte range (from
    *  `turn_context`), latest-wins. Undefined when none appeared. */
   latestReasoningEffort?: string;
+  /** Incremental correlation state for outer exec wrappers. */
+  state?: CodexTranscriptState;
 }
 
 /** Bounded backward-scan cap for the one-shot runtime bootstrap — runtime
@@ -857,15 +869,28 @@ function codexAbortErrorCode(reason: unknown): string {
 /** Increment-read the rollout from `fromOffset`. Mirrors the byte-offset
  *  contract of claude-transcript.drainTranscript so callers can swap them
  *  out and reuse the existing fs.watch / poll wakeup machinery. */
-export function drainCodexRollout(path: string, fromOffset: number): CodexDrainResult {
-  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
+export function drainCodexRollout(
+  path: string,
+  fromOffset: number,
+  previousState: CodexTranscriptState = {},
+): CodexDrainResult {
+  if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '', state: {} };
   let size: number;
-  try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
+  try { size = statSync(path).size; } catch {
+    return { events: [], newOffset: fromOffset, pendingTail: '', state: previousState };
+  }
   let start = fromOffset;
   // Truncated/rotated jsonl — re-read from the top. Codex doesn't normally
   // rewrite rollouts, but mirror Claude's defensive handling.
-  if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
+  const truncated = size < start;
+  if (truncated) start = 0;
+  const pendingExecCalls = truncated
+    ? []
+    : (previousState.pendingExecCalls ?? []).map(call => ({ ...call }));
+  const nextState = (): CodexTranscriptState => pendingExecCalls.length > 0
+    ? { pendingExecCalls }
+    : {};
+  if (size === start) return { events: [], newOffset: start, pendingTail: '', state: nextState() };
 
   const len = size - start;
   const buf = Buffer.alloc(len);
@@ -927,11 +952,73 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     // collecting turn for the native CoT message; they never start or close
     // a turn (the boundaries above/below stay authoritative).
     if (obj.type === 'response_item') {
+      if (p.type === 'custom_tool_call' && p.name === 'exec' && typeof p.call_id === 'string' && p.call_id) {
+        if (!pendingExecCalls.some(call => call.callId === p.call_id)) {
+          pendingExecCalls.push({
+            callId: p.call_id,
+            input: typeof p.input === 'string' ? p.input : '',
+            sawNativeCommand: false,
+            sawNonCommandItem: false,
+          });
+        }
+        continue;
+      }
+      if (p.type === 'custom_tool_call_output'
+        && typeof p.call_id === 'string' && p.call_id) {
+        const pendingIndex = pendingExecCalls.findIndex(call => call.callId === p.call_id);
+        if (pendingIndex >= 0) {
+          const [pending] = pendingExecCalls.splice(pendingIndex, 1);
+          if (pending?.sawNativeCommand && !pending.sawNonCommandItem) continue;
+          const cotEntries: CodexCotEntry[] = [
+            toolCallEntry(p.call_id, 'exec', pending?.input ?? '', subjectFromArgsString(pending?.input ?? '')),
+          ];
+          const result = stringifyCodexToolOutput(p.output);
+          if (result) {
+            cotEntries.push({
+              kind: 'tool_result', id: p.call_id,
+              result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS),
+            });
+          }
+          events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+          continue;
+        }
+      }
       const cotEntries = codexCotEntriesFromResponseItem(p);
       if (cotEntries.length > 0) {
         events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
         continue;
       }
+    }
+    if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item?.type) {
+      const pendingExec = pendingExecCalls.at(-1);
+      if (pendingExec && p.item.type !== 'CommandExecution') pendingExec.sawNonCommandItem = true;
+    }
+    if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item?.type === 'CommandExecution') {
+      const pendingExec = pendingExecCalls.at(-1);
+      if (pendingExec) pendingExec.sawNativeCommand = true;
+      const item = p.item;
+      const parsed = Array.isArray(item.parsed_cmd) ? item.parsed_cmd[0] : undefined;
+      const parsedType = typeof parsed?.type === 'string' ? parsed.type : '';
+      const name = parsedType === 'read' || parsedType === 'search' || parsedType === 'list_files'
+        ? parsedType
+        : 'shell';
+      const command = Array.isArray(item.command) ? item.command : [];
+      const subject = typeof parsed?.cmd === 'string' && parsed.cmd
+        ? parsed.cmd
+        : [...command].reverse().find((part): part is string => typeof part === 'string') ?? '';
+      let args = '';
+      try { args = command.length > 0 ? JSON.stringify({ command }) : ''; } catch { /* ignore malformed command */ }
+      const id = typeof item.id === 'string' && item.id ? item.id : `${path}:${lineStart}:command`;
+      const cotEntries: CodexCotEntry[] = [toolCallEntry(id, name, args, subject)];
+      const formatted = typeof item.formatted_output === 'string' ? item.formatted_output : '';
+      const aggregated = typeof item.aggregated_output === 'string' ? item.aggregated_output : '';
+      const streams = [item.stdout, item.stderr]
+        .filter((part): part is string => typeof part === 'string' && part.length > 0)
+        .join('\n');
+      const output = formatted || aggregated || streams;
+      if (output) cotEntries.push({ kind: 'tool_result', id, result: truncateForCot(output, COT_TOOL_RESULT_MAX_CHARS) });
+      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+      continue;
     }
     // Turn terminal: event_msg `task_complete` carries the final visible text
     // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
@@ -959,6 +1046,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
           terminalErrorSummary: safeFailureSummary(p.error),
         } : {}),
       });
+      pendingExecCalls.length = 0;
       continue;
     }
     // A cancelled turn writes `turn_aborted` (turn_id, reason) and NO
@@ -976,6 +1064,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
       });
+      pendingExecCalls.length = 0;
       continue;
     }
     // Everything else is skipped: role=developer/system instructions and
@@ -983,7 +1072,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     // boundary comes only from task_complete. Reasoning / tool calls surface
     // as cosmetic 'cot' events above, never as boundaries.
   }
-  return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort };
+  return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort, state: nextState() };
 }
 
 function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {
