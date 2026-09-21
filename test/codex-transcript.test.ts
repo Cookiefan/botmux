@@ -494,6 +494,30 @@ describe('drainCodexRollout', () => {
     expect(result.state).toEqual({});
   });
 
+  it('coalesces launch and poll wrappers into one terminal fallback', () => {
+    writeFileSync(path,
+      ev(customToolCall('exec', 'outer-launch', 'await tools.exec_command({ cmd: "bun run build" })'))
+      + ev(customToolOutput('outer-launch', 'Script running with cell ID 123'))
+      + ev(customToolCall('exec', 'outer-poll-1', 'await tools.write_stdin({ session_id: 123 })', '2026-04-29T07:00:01.100Z'))
+      + ev(customToolOutput('outer-poll-1', 'Script still running', '2026-04-29T07:00:01.300Z'))
+      + ev(customToolCall('exec', 'outer-poll-2', 'await tools.write_stdin({ session_id: 123 })', '2026-04-29T07:00:02.100Z'))
+      + ev(customToolOutput('outer-poll-2', 'Script completed: build passed', '2026-04-29T07:00:02.300Z'))
+      + ev(assistantFinalResponseItem('done', '2026-04-29T07:00:03.000Z')));
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events).toHaveLength(2);
+    expect(result.events[0].cotEntries).toEqual([
+      {
+        kind: 'tool_call', id: 'outer-launch', name: 'exec',
+        args: 'await tools.exec_command({ cmd: "bun run build" })',
+        subject: 'await tools.exec_command({ cmd: "bun run build" })',
+      },
+      { kind: 'tool_result', id: 'outer-launch', result: 'Script completed: build passed' },
+    ]);
+    expect(result.events[1].kind).toBe('assistant_final');
+    expect(result.state).toEqual({});
+  });
+
   it('falls back to the outer exec for a FileChange-only wrapper', () => {
     writeFileSync(path,
       ev(customToolCall('exec', 'outer-patch', 'await tools.apply_patch(patch)'))
@@ -564,14 +588,100 @@ describe('drainCodexRollout', () => {
     expect(completed.events.filter(event => event.kind === 'cot')).toHaveLength(2);
     expect(completed.state).toEqual({});
 
+    writeFileSync(path, ev(customToolCall('exec', 'stale-abort', 'run')));
+    const beforeAbort = drainCodexRollout(path, 0);
+    expect(beforeAbort.events).toEqual([]);
+
+    appendFileSync(path, ev({
+      timestamp: '2026-04-29T07:01:00.200Z', type: 'event_msg',
+      payload: { type: 'turn_aborted', turn_id: 'turn-aborted', reason: 'user_cancelled' },
+    }));
+    const aborted = drainCodexRollout(path, beforeAbort.newOffset, beforeAbort.state);
+    expect(aborted.events[0].cotEntries).toEqual([
+      { kind: 'tool_call', id: 'stale-abort', name: 'exec', args: 'run', subject: 'run' },
+      { kind: 'tool_result', id: 'stale-abort', result: 'Execution interrupted before completion.' },
+    ]);
+    expect(aborted.events[1]).toMatchObject({
+      kind: 'assistant_final', terminalStatus: 'ambiguous',
+    });
+    expect(aborted.state).toEqual({});
+  });
+
+  it('keeps one logical exec fallback when a long command is interrupted', () => {
     writeFileSync(path,
-      ev(customToolCall('exec', 'stale-abort', 'run'))
+      ev(customToolCall('exec', 'outer-launch', 'await tools.exec_command({ cmd: "bun run test" })'))
+      + ev(customToolOutput('outer-launch', 'Script running with cell ID 123'))
+      + ev(customToolCall('exec', 'outer-poll-1', 'await tools.write_stdin({ session_id: 123 })', '2026-04-29T07:00:01.100Z'))
+      + ev(customToolOutput('outer-poll-1', 'Script still running', '2026-04-29T07:00:01.300Z'))
+      + ev(customToolCall('exec', 'outer-poll-2', 'await tools.write_stdin({ session_id: 123 })', '2026-04-29T07:00:02.100Z'))
       + ev({
-        timestamp: '2026-04-29T07:01:00.200Z', type: 'event_msg',
+        timestamp: '2026-04-29T07:00:02.500Z', type: 'event_msg',
         payload: { type: 'turn_aborted', turn_id: 'turn-aborted', reason: 'user_cancelled' },
       }));
-    const aborted = drainCodexRollout(path, 0);
-    expect(aborted.state).toEqual({});
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events).toHaveLength(2);
+    expect(result.events[0].cotEntries).toEqual([
+      {
+        kind: 'tool_call', id: 'outer-launch', name: 'exec',
+        args: 'await tools.exec_command({ cmd: "bun run test" })',
+        subject: 'await tools.exec_command({ cmd: "bun run test" })',
+      },
+      { kind: 'tool_result', id: 'outer-launch', result: 'Script still running' },
+    ]);
+    expect(result.events[1]).toMatchObject({
+      kind: 'assistant_final', terminalStatus: 'ambiguous',
+      terminalErrorCode: 'codex_turn_aborted:user_cancelled',
+    });
+    expect(result.state).toEqual({});
+  });
+
+  it('does not resurrect an outer wrapper when a native command is interrupted before wrapper output', () => {
+    writeFileSync(path,
+      ev(customToolCall('exec', 'outer-run', 'await tools.exec_command({ cmd: "bun run test" })'))
+      + ev(completedItem({
+        type: 'CommandExecution', id: 'native-run', status: 'completed',
+        command: ['bash', '-lc', 'bun run test'],
+        parsed_cmd: [{ type: 'unknown', cmd: 'bun run test' }],
+        formatted_output: '',
+      }))
+      + ev({
+        timestamp: '2026-04-29T07:00:00.500Z', type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 'turn-aborted', reason: 'user_cancelled' },
+      }));
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events).toHaveLength(2);
+    expect(result.events[0].cotEntries).toEqual([
+      { kind: 'tool_call', id: 'native-run', name: 'shell', args: '{"command":["bash","-lc","bun run test"]}', subject: 'bun run test' },
+      { kind: 'tool_result', id: 'native-run', result: '' },
+    ]);
+    expect(result.events[1].kind).toBe('assistant_final');
+    expect(result.state).toEqual({});
+  });
+
+  it('closes outputless native commands and reports outputless failures', () => {
+    writeFileSync(path,
+      ev(completedItem({
+        type: 'CommandExecution', id: 'native-empty', status: 'completed',
+        command: ['bash', '-lc', 'true'], parsed_cmd: [{ type: 'unknown', cmd: 'true' }],
+        formatted_output: '', stdout: '', stderr: '',
+      }))
+      + ev(completedItem({
+        type: 'CommandExecution', id: 'native-failed', status: 'failed', exit_code: 7,
+        command: ['bash', '-lc', 'false'], parsed_cmd: [{ type: 'unknown', cmd: 'false' }],
+        formatted_output: '', stdout: '', stderr: '',
+      }, '2026-04-29T07:00:01.200Z')));
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events[0].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'native-empty', subject: 'true' },
+      { kind: 'tool_result', id: 'native-empty', result: '' },
+    ]);
+    expect(result.events[1].cotEntries).toMatchObject([
+      { kind: 'tool_call', id: 'native-failed', subject: 'false' },
+      { kind: 'tool_result', id: 'native-failed', result: 'Command failed with exit code 7.' },
+    ]);
   });
 
   it('does not clear a pending exec when a type-ahead user event arrives', () => {
@@ -1413,10 +1523,11 @@ describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
       .toEqual([{ kind: 'tool_result', id: 'c3', result: 'ok' }]);
   });
 
-  it('returns [] for messages, ghost snapshots and empty outputs', () => {
+  it('returns [] for messages and ghost snapshots, but closes empty outputs', () => {
     expect(codexCotEntriesFromResponseItem({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hi' }] })).toEqual([]);
     expect(codexCotEntriesFromResponseItem({ type: 'ghost_snapshot' })).toEqual([]);
-    expect(codexCotEntriesFromResponseItem({ type: 'function_call_output', call_id: 'c1', output: '' })).toEqual([]);
+    expect(codexCotEntriesFromResponseItem({ type: 'function_call_output', call_id: 'c1', output: '' }))
+      .toEqual([{ kind: 'tool_result', id: 'c1', result: '' }]);
     expect(codexCotEntriesFromResponseItem(undefined)).toEqual([]);
   });
 });
