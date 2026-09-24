@@ -265,7 +265,12 @@ function truncateForCot(s: string, max: number): string {
 }
 
 /** 组装 tool_call 节点：args 截断、subject 传输层截断，主题为空时不带键。 */
-function toolCallEntry(id: string, name: string, args: string, rawSubject: string): CodexCotEntry {
+function toolCallEntry(
+  id: string,
+  name: string,
+  args: string,
+  rawSubject: string,
+): Extract<CodexCotEntry, { kind: 'tool_call' }> {
   const subject = boundSubjectForTransport(rawSubject);
   return {
     kind: 'tool_call', id, name,
@@ -1253,14 +1258,22 @@ function terminalExecFallbacks(
     });
     if (preserved.length === 0) return [];
     const preserveOuterShape = call.name === 'exec' && innerCalls.length === 1;
-    const cotEntries: CodexCotEntry[] = preserved.map((inner, index) => {
+    const toolCalls = preserved.map(inner => {
       const id = preserveOuterShape || preserved.length === 1 ? call.id : `${call.id}:${inner.index}`;
       const name = preserveOuterShape ? call.name : inner.name;
       const args = preserveOuterShape ? call.input : inner.args;
       return toolCallEntry(id, name, args, subjectFromArgsString(args));
     });
-    const resultId = (cotEntries[cotEntries.length - 1] as Extract<CodexCotEntry, { kind: 'tool_call' }>).id;
-    cotEntries.push({ kind: 'tool_result', id: resultId, result: truncateForCot(call.output ?? '', COT_TOOL_RESULT_MAX_CHARS) });
+    const cotEntries: CodexCotEntry[] = toolCalls.flatMap((toolCall, index) => [
+      toolCall,
+      {
+        kind: 'tool_result' as const,
+        id: toolCall.id,
+        result: index === toolCalls.length - 1
+          ? truncateForCot(call.output ?? '', COT_TOOL_RESULT_MAX_CHARS)
+          : '',
+      },
+    ]);
     return [{
       uuid: `${path}:${call.outputOffset}`, timestampMs: call.outputTimestampMs ?? Date.now(),
       kind: 'cot' as const, text: '', cotEntries,

@@ -575,7 +575,7 @@ describe('drainCodexRollout', () => {
       ev(userResponseItem('run and poll'))
       + ev({ type: 'response_item', payload: {
         type: 'custom_tool_call', name: 'exec', call_id: 'mixed-wrapper',
-        input: 'await Promise.allSettled([tools.exec_command({ cmd: "sleep 1" }), tools.write_stdin({ session_id: 7, chars: "" })])',
+        input: 'await Promise.allSettled([tools.web__run({ query: "status" }), tools.exec_command({ cmd: "sleep 1" }), tools.write_stdin({ session_id: 7, chars: "" })])',
       } }));
     const first = drainCodexRollout(path, 0);
     expect(first.events.map(event => event.kind)).toEqual(['user']);
@@ -597,23 +597,25 @@ describe('drainCodexRollout', () => {
     expect(entries).toEqual([
       expect.objectContaining({ kind: 'tool_call', id: 'native-sleep', name: 'shell', subject: 'sleep 1' }),
       { kind: 'tool_result', id: 'native-sleep', result: '' },
-      expect.objectContaining({ kind: 'tool_call', id: 'mixed-wrapper', name: 'write_stdin' }),
-      { kind: 'tool_result', id: 'mixed-wrapper', result: 'poll complete' },
+      expect.objectContaining({ kind: 'tool_call', id: 'mixed-wrapper:0', name: 'web__run' }),
+      { kind: 'tool_result', id: 'mixed-wrapper:0', result: '' },
+      expect.objectContaining({ kind: 'tool_call', id: 'mixed-wrapper:2', name: 'write_stdin' }),
+      { kind: 'tool_result', id: 'mixed-wrapper:2', result: 'poll complete' },
     ]);
     expect(entries.some(entry => entry.kind === 'tool_call' && entry.name === 'exec')).toBe(false);
   });
 
   it('does not treat tool names inside strings as nested calls', () => {
     writeFileSync(path,
-      ev(userResponseItem('apply a patch'))
+      ev(userResponseItem('show an example'))
       + ev({ type: 'response_item', payload: {
-        type: 'custom_tool_call', name: 'exec', call_id: 'patch-wrapper',
-        input: 'await tools.apply_patch("document tools.exec_command({ cmd: \\\"fake\\\" })")',
+        type: 'custom_tool_call', name: 'exec', call_id: 'example-wrapper',
+        input: 'const example = "tools.exec_command({ cmd: \\\"fake\\\" })"; text(example)',
       } }));
 
     const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot).toHaveLength(1);
-    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'patch-wrapper', name: 'exec' });
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'example-wrapper', name: 'exec' });
   });
 
   it('keeps an unmatched command wrapper when another native command exists', () => {
