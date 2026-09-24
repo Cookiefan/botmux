@@ -854,20 +854,76 @@ function codexAbortErrorCode(reason: unknown): string {
   return `codex_turn_aborted:${normalized}`;
 }
 
+/** Find the byte immediately after the previous completed/aborted turn. An
+ * incremental drain can start in the middle of a turn, so this supplies a
+ * stable lower bound for the small backward lookups below. */
+function precedingTurnStartOffset(path: string, beforeOffset: number): number {
+  const consider = (line: Buffer, offset: number): number | undefined => {
+    let obj: any;
+    try { obj = JSON.parse(line.toString('utf8')); } catch { return undefined; }
+    const p = obj?.payload;
+    if (obj?.type !== 'event_msg' || (p?.type !== 'task_complete' && p?.type !== 'turn_aborted')) {
+      return undefined;
+    }
+    return Math.min(beforeOffset, offset + line.length + 1);
+  };
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    let end = beforeOffset;
+    let carry = Buffer.alloc(0);
+    while (end > 0) {
+      const start = Math.max(0, end - 64 * 1024);
+      const chunk = Buffer.alloc(end - start);
+      readSync(fd, chunk, 0, chunk.length, start);
+      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+      let lineEnd = block.length;
+      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+      let carryEnd = lineEnd;
+      for (let i = lineEnd - 1; i >= 0; i--) {
+        if (block[i] !== 0x0a) continue;
+        const found = consider(block.subarray(i + 1, lineEnd), start + i + 1);
+        if (found !== undefined) return found;
+        lineEnd = i;
+        carryEnd = i;
+      }
+      carry = block.subarray(0, carryEnd);
+      end = start;
+    }
+    if (carry.length > 0) return consider(carry, 0) ?? 0;
+  } catch {
+    return 0;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return 0;
+}
+
 /** Resolve a custom tool output against the rollout itself. Outputs can land
  * in a later incremental drain than their calls, so the byte offset alone is
  * insufficient; a backward chunk scan keeps the parser stateless without
  * loading an arbitrarily large rollout into memory. */
-function precedingDeferredToolName(path: string, beforeOffset: number, callId: string): string | undefined {
-  const consider = (line: string): string | undefined => {
+function precedingToolCall(
+  path: string,
+  beforeOffset: number,
+  lowerBoundOffset: number,
+  callId: string,
+): { name: string; deferred: boolean } | undefined {
+  const consider = (line: string): { name: string; deferred: boolean } | undefined => {
     if (!line.includes(callId)) return undefined;
     let obj: any;
     try { obj = JSON.parse(line); } catch { return undefined; }
     const p = obj?.payload;
     if (obj?.type !== 'response_item' || p?.call_id !== callId || typeof p.name !== 'string') return undefined;
-    if (p.type === 'function_call' && p.name === 'exec_command') return p.name;
-    if (p.type === 'custom_tool_call' && p.name === 'exec'
-      && isDeferredExecWrapper(typeof p.input === 'string' ? p.input : '')) return p.name;
+    if (p.type === 'function_call') {
+      return { name: p.name, deferred: p.name === 'exec_command' };
+    }
+    if (p.type === 'custom_tool_call') {
+      return {
+        name: p.name,
+        deferred: p.name === 'exec' && hasWrappedExecCommand(typeof p.input === 'string' ? p.input : ''),
+      };
+    }
     return undefined;
   };
   const chunkBytes = 64 * 1024;
@@ -876,8 +932,8 @@ function precedingDeferredToolName(path: string, beforeOffset: number, callId: s
     fd = openSync(path, 'r');
     let end = beforeOffset;
     let carry = Buffer.alloc(0);
-    while (end > 0) {
-      const start = Math.max(0, end - chunkBytes);
+    while (end > lowerBoundOffset) {
+      const start = Math.max(lowerBoundOffset, end - chunkBytes);
       const chunk = Buffer.alloc(end - start);
       readSync(fd, chunk, 0, chunk.length, start);
       const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
@@ -904,12 +960,131 @@ function precedingDeferredToolName(path: string, beforeOffset: number, callId: s
 }
 
 function wrappedToolNames(input: string): string[] {
-  return [...input.matchAll(/\btools\.([A-Za-z_$][\w$]*)\s*\(/g)].map(match => match[1]!);
+  return wrappedToolCalls(input).map(call => call.name);
 }
 
-function isDeferredExecWrapper(input: string): boolean {
-  const toolNames = wrappedToolNames(input);
-  return toolNames.length > 0 && toolNames.every(name => name === 'exec_command');
+interface WrappedToolCall {
+  name: string;
+  args: string;
+  source: string;
+  index: number;
+}
+
+/** Extract direct `tools.foo(...)` calls from an exec wrapper without
+ * evaluating its JavaScript. Balancing parentheses keeps object literals,
+ * strings and template literals intact for command identity matching. */
+function wrappedToolCalls(input: string): WrappedToolCall[] {
+  const calls: WrappedToolCall[] = [];
+  let quote: '"' | "'" | '`' | undefined;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let cursor = 0; cursor < input.length; cursor++) {
+    const char = input[cursor]!;
+    const next = input[cursor + 1];
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        cursor++;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      cursor++;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      cursor++;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (!input.startsWith('tools.', cursor)
+      || (cursor > 0 && /[\w$]/.test(input[cursor - 1]!))) continue;
+    let nameEnd = cursor + 'tools.'.length;
+    while (nameEnd < input.length && /[\w$]/.test(input[nameEnd]!)) nameEnd++;
+    const name = input.slice(cursor + 'tools.'.length, nameEnd);
+    if (!name || !/[A-Za-z_$]/.test(name[0]!)) continue;
+    let open = nameEnd;
+    while (open < input.length && /\s/.test(input[open]!)) open++;
+    if (input[open] !== '(') continue;
+    let depth = 0;
+    let innerQuote: '"' | "'" | '`' | undefined;
+    let innerEscaped = false;
+    let innerLineComment = false;
+    let innerBlockComment = false;
+    let end = -1;
+    for (let i = open; i < input.length; i++) {
+      const innerChar = input[i]!;
+      const innerNext = input[i + 1];
+      if (innerLineComment) {
+        if (innerChar === '\n') innerLineComment = false;
+        continue;
+      }
+      if (innerBlockComment) {
+        if (innerChar === '*' && innerNext === '/') {
+          innerBlockComment = false;
+          i++;
+        }
+        continue;
+      }
+      if (innerQuote) {
+        if (innerEscaped) {
+          innerEscaped = false;
+        } else if (innerChar === '\\') {
+          innerEscaped = true;
+        } else if (innerChar === innerQuote) {
+          innerQuote = undefined;
+        }
+        continue;
+      }
+      if (innerChar === '/' && innerNext === '/') {
+        innerLineComment = true;
+        i++;
+      } else if (innerChar === '/' && innerNext === '*') {
+        innerBlockComment = true;
+        i++;
+      } else if (innerChar === '"' || innerChar === "'" || innerChar === '`') {
+        innerQuote = innerChar;
+      } else if (innerChar === '(') {
+        depth++;
+      } else if (innerChar === ')' && --depth === 0) {
+        end = i;
+        break;
+      }
+    }
+    if (end === -1) break;
+    calls.push({
+      name,
+      args: input.slice(open + 1, end),
+      source: input.slice(cursor, end + 1),
+      index: calls.length,
+    });
+    cursor = end;
+  }
+  return calls;
+}
+
+function hasWrappedExecCommand(input: string): boolean {
+  return wrappedToolNames(input).includes('exec_command');
 }
 
 function nativeCommandCandidates(item: any): string[] {
@@ -976,65 +1151,69 @@ function wrapperContainsCommand(input: string, command: string): boolean {
  * outer exec wrappers so native CommandExecution can replace only the exact
  * exec_command it represents. Non-command tools and unmatched commands are
  * restored at the terminal boundary. */
-function terminalExecFallbacks(path: string, beforeOffset: number): CodexBridgeEvent[] {
-  const relevant: Array<{ offset: number; timestampMs: number; payload: any; type: string }> = [];
-  let fd: number | undefined;
-  try {
-    fd = openSync(path, 'r');
-    let end = beforeOffset;
-    let carry = Buffer.alloc(0);
-    let reachedUser = false;
-    while (end > 0 && !reachedUser) {
-      const start = Math.max(0, end - 64 * 1024);
-      const chunk = Buffer.alloc(end - start);
-      readSync(fd, chunk, 0, chunk.length, start);
-      const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
-      let lineEnd = block.length;
-      if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
-      let carryEnd = lineEnd;
-      const consider = (line: Buffer, offset: number): void => {
-        let obj: any;
-        try { obj = JSON.parse(line.toString('utf8')); } catch { return; }
-        const p = obj?.payload;
-        if ((obj?.type === 'response_item' && p?.type === 'message' && p.role === 'user')
-          || (obj?.type === 'event_msg' && (p?.type === 'task_complete' || p?.type === 'turn_aborted'))) {
-          reachedUser = true;
-          return;
+type TerminalExecEntry = { offset: number; timestampMs: number; payload: any; type: string };
+
+function terminalExecFallbacks(
+  path: string,
+  beforeOffset: number,
+  turnStartOffset: number,
+  knownRelevant?: TerminalExecEntry[],
+): CodexBridgeEvent[] {
+  const relevant: TerminalExecEntry[] = knownRelevant ?? [];
+  if (!knownRelevant) {
+    let fd: number | undefined;
+    try {
+      fd = openSync(path, 'r');
+      let end = beforeOffset;
+      let carry = Buffer.alloc(0);
+      while (end > turnStartOffset) {
+        const start = Math.max(turnStartOffset, end - 64 * 1024);
+        const chunk = Buffer.alloc(end - start);
+        readSync(fd, chunk, 0, chunk.length, start);
+        const block = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+        let lineEnd = block.length;
+        if (lineEnd > 0 && block[lineEnd - 1] === 0x0a) lineEnd--;
+        let carryEnd = lineEnd;
+        const consider = (line: Buffer, offset: number): void => {
+          let obj: any;
+          try { obj = JSON.parse(line.toString('utf8')); } catch { return; }
+          const p = obj?.payload;
+          if ((obj?.type === 'response_item' && (
+            p?.type === 'custom_tool_call' || p?.type === 'custom_tool_call_output'
+            || p?.type === 'function_call' || p?.type === 'function_call_output'
+          ))
+            || (obj?.type === 'event_msg' && p?.type === 'item_completed')) {
+            const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
+            relevant.push({ offset, timestampMs: Number.isFinite(ts) ? ts : Date.now(), payload: p, type: obj.type });
+          }
+        };
+        for (let i = lineEnd - 1; i >= 0; i--) {
+          if (block[i] !== 0x0a) continue;
+          if (lineEnd > i + 1) consider(block.subarray(i + 1, lineEnd), start + i + 1);
+          lineEnd = i;
+          carryEnd = i;
         }
-        if ((obj?.type === 'response_item' && (
-          p?.type === 'custom_tool_call' || p?.type === 'custom_tool_call_output'
-          || p?.type === 'function_call' || p?.type === 'function_call_output'
-        ))
-          || (obj?.type === 'event_msg' && p?.type === 'item_completed')) {
-          const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
-          relevant.push({ offset, timestampMs: Number.isFinite(ts) ? ts : Date.now(), payload: p, type: obj.type });
-        }
-      };
-      for (let i = lineEnd - 1; i >= 0 && !reachedUser; i--) {
-        if (block[i] !== 0x0a) continue;
-        if (lineEnd > i + 1) consider(block.subarray(i + 1, lineEnd), start + i + 1);
-        lineEnd = i;
-        carryEnd = i;
+        carry = block.subarray(0, carryEnd);
+        end = start;
+        if (start === turnStartOffset && carry.length > 0) consider(carry, turnStartOffset);
       }
-      carry = block.subarray(0, carryEnd);
-      end = start;
-      if (start === 0 && carry.length > 0 && !reachedUser) consider(carry, 0);
+    } catch {
+      return [];
+    } finally {
+      if (fd !== undefined) closeSync(fd);
     }
-  } catch {
-    return [];
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
 
   const calls: Array<{
     id: string; name: string; input: string; output?: string; outputOffset?: number; outputTimestampMs?: number;
   }> = [];
   const nativeCommands: Array<{ id?: string; candidates: string[] }> = [];
-  for (const entry of relevant.reverse()) {
+  const orderedRelevant = knownRelevant ? relevant : relevant.reverse();
+  for (const entry of orderedRelevant) {
     const p = entry.payload;
     if (entry.type === 'response_item' && p.type === 'custom_tool_call' && p.name === 'exec'
       && typeof p.call_id === 'string' && p.call_id
-      && isDeferredExecWrapper(typeof p.input === 'string' ? p.input : '')) {
+      && hasWrappedExecCommand(typeof p.input === 'string' ? p.input : '')) {
       calls.push({ id: p.call_id, name: 'exec', input: typeof p.input === 'string' ? p.input : '' });
     } else if (entry.type === 'response_item' && p.type === 'function_call' && p.name === 'exec_command'
       && typeof p.call_id === 'string' && p.call_id) {
@@ -1058,13 +1237,30 @@ function terminalExecFallbacks(path: string, beforeOffset: number): CodexBridgeE
   }
   return calls.flatMap(call => {
     if (call.outputOffset === undefined) return [];
-    const execCommandCount = call.name === 'exec_command' ? 1 : wrappedToolNames(call.input).length;
-    const matchingNativeCount = nativeCommands.filter(native =>
-      native.id === call.id || native.candidates.some(command => wrapperContainsCommand(call.input, command)),
-    ).length;
-    if (matchingNativeCount >= execCommandCount) return [];
-    const cotEntries: CodexCotEntry[] = [toolCallEntry(call.id, call.name, call.input, subjectFromArgsString(call.input))];
-    cotEntries.push({ kind: 'tool_result', id: call.id, result: truncateForCot(call.output ?? '', COT_TOOL_RESULT_MAX_CHARS) });
+    const innerCalls = call.name === 'exec_command'
+      ? [{ name: 'exec_command', args: call.input, source: call.input, index: 0 }]
+      : wrappedToolCalls(call.input);
+    const availableNative = new Set(nativeCommands.map((_, index) => index));
+    const preserved = innerCalls.filter(inner => {
+      if (inner.name !== 'exec_command') return true;
+      const nativeIndex = nativeCommands.findIndex((native, index) => availableNative.has(index) && (
+        native.id === call.id
+        || native.candidates.some(command => wrapperContainsCommand(inner.source, command))
+      ));
+      if (nativeIndex === -1) return true;
+      availableNative.delete(nativeIndex);
+      return false;
+    });
+    if (preserved.length === 0) return [];
+    const preserveOuterShape = call.name === 'exec' && innerCalls.length === 1;
+    const cotEntries: CodexCotEntry[] = preserved.map((inner, index) => {
+      const id = preserveOuterShape || preserved.length === 1 ? call.id : `${call.id}:${inner.index}`;
+      const name = preserveOuterShape ? call.name : inner.name;
+      const args = preserveOuterShape ? call.input : inner.args;
+      return toolCallEntry(id, name, args, subjectFromArgsString(args));
+    });
+    const resultId = (cotEntries[cotEntries.length - 1] as Extract<CodexCotEntry, { kind: 'tool_call' }>).id;
+    cotEntries.push({ kind: 'tool_result', id: resultId, result: truncateForCot(call.output ?? '', COT_TOOL_RESULT_MAX_CHARS) });
     return [{
       uuid: `${path}:${call.outputOffset}`, timestampMs: call.outputTimestampMs ?? Date.now(),
       kind: 'cot' as const, text: '', cotEntries,
@@ -1099,7 +1295,13 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
   let latestThreadSettings: CodexThreadSettings | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
-  const deferredToolCallIds = new Set<string>();
+  // Remember both deferred and ordinary calls seen in this drain. A plain
+  // deferred-id set cannot distinguish an ordinary call from a call that
+  // landed in an earlier incremental chunk, which forced every ordinary
+  // output through a synchronous backward file scan.
+  const toolCallDeferralById = new Map<string, boolean>();
+  let turnStartOffset = start === 0 ? 0 : precedingTurnStartOffset(path, start);
+  const turnExecEntries: TerminalExecEntry[] = [];
   // Track byte offset within the file as we walk lines so synthetic uuids
   // are stable across re-drains.
   let cursor = start;
@@ -1131,6 +1333,12 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     if (!p || typeof p !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    if ((obj.type === 'response_item' && (
+      p.type === 'custom_tool_call' || p.type === 'custom_tool_call_output'
+      || p.type === 'function_call' || p.type === 'function_call_output'
+    )) || (obj.type === 'event_msg' && p.type === 'item_completed')) {
+      turnExecEntries.push({ offset: lineStart, timestampMs, payload: p, type: obj.type });
+    }
     // User turn-start: response_item message role=user. Stable across every
     // codex version, and the ONLY event the RPC rollout-match probe reads
     // (codex-rpc-lifecycle.rolloutUserTurnMatches), so it must stay a
@@ -1146,20 +1354,20 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     // collecting turn for the native CoT message; they never start or close
     // a turn (the boundaries above/below stay authoritative).
     if (obj.type === 'response_item') {
-      if (p.type === 'custom_tool_call' && p.name === 'exec' && typeof p.call_id === 'string' && p.call_id
-        && isDeferredExecWrapper(typeof p.input === 'string' ? p.input : '')) {
-        deferredToolCallIds.add(p.call_id);
-        continue;
+      if (p.type === 'custom_tool_call' && typeof p.call_id === 'string' && p.call_id) {
+        const deferred = p.name === 'exec' && hasWrappedExecCommand(typeof p.input === 'string' ? p.input : '');
+        toolCallDeferralById.set(p.call_id, deferred);
+        if (deferred) continue;
       }
       if (p.type === 'function_call' && p.name === 'exec_command' && typeof p.call_id === 'string' && p.call_id) {
-        deferredToolCallIds.add(p.call_id);
+        toolCallDeferralById.set(p.call_id, true);
         continue;
       }
       if ((p.type === 'custom_tool_call_output' || p.type === 'function_call_output')
-        && typeof p.call_id === 'string'
-        && (deferredToolCallIds.delete(p.call_id)
-          || ['exec', 'exec_command'].includes(precedingDeferredToolName(path, lineStart, p.call_id) ?? ''))) {
-        continue;
+        && typeof p.call_id === 'string') {
+        const knownDeferral = toolCallDeferralById.get(p.call_id);
+        toolCallDeferralById.delete(p.call_id);
+        if (knownDeferral ?? precedingToolCall(path, lineStart, turnStartOffset, p.call_id)?.deferred) continue;
       }
       const cotEntries = codexCotEntriesFromResponseItem(p);
       if (cotEntries.length > 0) {
@@ -1200,7 +1408,12 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
       const failed = p.error !== null && p.error !== undefined;
-      events.push(...terminalExecFallbacks(path, lineStart));
+      events.push(...terminalExecFallbacks(
+        path,
+        lineStart,
+        turnStartOffset,
+        turnStartOffset >= start ? turnExecEntries : undefined,
+      ));
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
@@ -1212,6 +1425,9 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
           terminalErrorSummary: safeFailureSummary(p.error),
         } : {}),
       });
+      turnStartOffset = cursor;
+      turnExecEntries.length = 0;
+      toolCallDeferralById.clear();
       continue;
     }
     // A cancelled turn writes `turn_aborted` (turn_id, reason) and NO
@@ -1221,7 +1437,12 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       && p.type === 'turn_aborted'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
-      events.push(...terminalExecFallbacks(path, lineStart));
+      events.push(...terminalExecFallbacks(
+        path,
+        lineStart,
+        turnStartOffset,
+        turnStartOffset >= start ? turnExecEntries : undefined,
+      ));
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
@@ -1230,6 +1451,9 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
       });
+      turnStartOffset = cursor;
+      turnExecEntries.length = 0;
+      toolCallDeferralById.clear();
       continue;
     }
     // Everything else is skipped: role=developer/system instructions and

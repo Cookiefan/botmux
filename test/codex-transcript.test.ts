@@ -570,6 +570,52 @@ describe('drainCodexRollout', () => {
     ]);
   });
 
+  it('splits mixed exec wrappers and suppresses only the matched command', () => {
+    writeFileSync(path,
+      ev(userResponseItem('run and poll'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'mixed-wrapper',
+        input: 'await Promise.allSettled([tools.exec_command({ cmd: "sleep 1" }), tools.write_stdin({ session_id: 7, chars: "" })])',
+      } }));
+    const first = drainCodexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user']);
+
+    appendFileSync(path, ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'mixed-wrapper', output: '{"output":"poll complete"}',
+      } }));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.events).toEqual([]);
+
+    appendFileSync(path, ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-sleep', command: ['bash', '-lc', 'sleep 1'], stdout: '',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const entries = drainCodexRollout(path, second.newOffset).events
+      .filter(event => event.kind === 'cot')
+      .flatMap(event => event.cotEntries ?? []);
+    expect(entries).toEqual([
+      expect.objectContaining({ kind: 'tool_call', id: 'native-sleep', name: 'shell', subject: 'sleep 1' }),
+      { kind: 'tool_result', id: 'native-sleep', result: '' },
+      expect.objectContaining({ kind: 'tool_call', id: 'mixed-wrapper', name: 'write_stdin' }),
+      { kind: 'tool_result', id: 'mixed-wrapper', result: 'poll complete' },
+    ]);
+    expect(entries.some(entry => entry.kind === 'tool_call' && entry.name === 'exec')).toBe(false);
+  });
+
+  it('does not treat tool names inside strings as nested calls', () => {
+    writeFileSync(path,
+      ev(userResponseItem('apply a patch'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'patch-wrapper',
+        input: 'await tools.apply_patch("document tools.exec_command({ cmd: \\\"fake\\\" })")',
+      } }));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'patch-wrapper', name: 'exec' });
+  });
+
   it('keeps an unmatched command wrapper when another native command exists', () => {
     writeFileSync(path,
       ev(userResponseItem('run both'))
@@ -594,6 +640,29 @@ describe('drainCodexRollout', () => {
 
     const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot.map(event => event.cotEntries?.[0]?.id)).toEqual(['native-late', 'early-wrapper']);
+  });
+
+  it('does not let injected user records truncate terminal fallbacks', () => {
+    writeFileSync(path,
+      ev(userResponseItem('first'))
+      + ev(assistantFinalResponseItem('first done'))
+      + ev(userResponseItem('run legacy command'))
+      + ev({ type: 'response_item', payload: {
+        type: 'function_call', name: 'exec_command', call_id: 'legacy-unmatched',
+        arguments: '{"cmd":"echo legacy"}',
+      } })
+      + ev(userResponseItem('<session_id>abc</session_id><botmux_reminder>continue</botmux_reminder>'))
+      + ev({ type: 'response_item', payload: {
+        type: 'function_call_output', call_id: 'legacy-unmatched', output: '{"output":"legacy"}',
+      } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries).toEqual([
+      expect.objectContaining({ kind: 'tool_call', id: 'legacy-unmatched', name: 'exec_command' }),
+      { kind: 'tool_result', id: 'legacy-unmatched', result: 'legacy' },
+    ]);
   });
 
   it('does not duplicate a shell command merely because it also changes files', () => {
