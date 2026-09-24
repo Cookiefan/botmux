@@ -648,6 +648,15 @@ export interface CodexDrainResult {
   /** Newest executor reasoning effort observed in this byte range (from
    *  `turn_context`), latest-wins. Undefined when none appeared. */
   latestReasoningEffort?: string;
+  /** Stateless-reader continuation carried by the worker between live ticks.
+   *  `nextOffset` binds the turn lower bound to the exact cursor it follows,
+   *  so truncation or an unrelated seek cannot reuse stale state. */
+  state?: CodexDrainState;
+}
+
+export interface CodexDrainState {
+  nextOffset: number;
+  turnStartOffset: number;
 }
 
 /** Bounded backward-scan cap for the one-shot runtime bootstrap — runtime
@@ -1284,7 +1293,11 @@ function terminalExecFallbacks(
 /** Increment-read the rollout from `fromOffset`. Mirrors the byte-offset
  *  contract of claude-transcript.drainTranscript so callers can swap them
  *  out and reuse the existing fs.watch / poll wakeup machinery. */
-export function drainCodexRollout(path: string, fromOffset: number): CodexDrainResult {
+export function drainCodexRollout(
+  path: string,
+  fromOffset: number,
+  previousState?: CodexDrainState,
+): CodexDrainResult {
   if (!existsSync(path)) return { events: [], newOffset: 0, pendingTail: '' };
   let size: number;
   try { size = statSync(path).size; } catch { return { events: [], newOffset: fromOffset, pendingTail: '' }; }
@@ -1292,7 +1305,14 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
   // Truncated/rotated jsonl — re-read from the top. Codex doesn't normally
   // rewrite rollouts, but mirror Claude's defensive handling.
   if (size < start) start = 0;
-  if (size === start) return { events: [], newOffset: start, pendingTail: '' };
+  const reusableState = start === fromOffset && previousState?.nextOffset === start
+    && previousState.turnStartOffset >= 0
+    && previousState.turnStartOffset <= start
+    ? previousState
+    : undefined;
+  if (size === start) {
+    return { events: [], newOffset: start, pendingTail: '', state: reusableState };
+  }
 
   const len = size - start;
   const buf = Buffer.alloc(len);
@@ -1313,7 +1333,17 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
   // landed in an earlier incremental chunk, which forced every ordinary
   // output through a synchronous backward file scan.
   const toolCallDeferralById = new Map<string, boolean>();
-  let turnStartOffset = start === 0 ? 0 : precedingTurnStartOffset(path, start);
+  // Most live drains only consume newly appended lines in the current turn.
+  // Reuse the worker-carried lower bound across ticks, or resolve it lazily
+  // once when a cross-drain lookup / terminal fallback first needs it.
+  let turnStartOffset: number | undefined = start === 0
+    ? 0
+    : reusableState?.turnStartOffset;
+  let turnFullyCovered = turnStartOffset === start;
+  const resolveTurnStartOffset = (): number => {
+    turnStartOffset ??= precedingTurnStartOffset(path, start);
+    return turnStartOffset;
+  };
   const turnExecEntries: TerminalExecEntry[] = [];
   // Track byte offset within the file as we walk lines so synthetic uuids
   // are stable across re-drains.
@@ -1380,7 +1410,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
         && typeof p.call_id === 'string') {
         const knownDeferral = toolCallDeferralById.get(p.call_id);
         toolCallDeferralById.delete(p.call_id);
-        if (knownDeferral ?? precedingToolCall(path, lineStart, turnStartOffset, p.call_id)?.deferred) continue;
+        if (knownDeferral ?? precedingToolCall(path, lineStart, resolveTurnStartOffset(), p.call_id)?.deferred) continue;
       }
       const cotEntries = codexCotEntriesFromResponseItem(p);
       if (cotEntries.length > 0) {
@@ -1421,11 +1451,14 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
       const failed = p.error !== null && p.error !== undefined;
+      const terminalTurnStart = turnFullyCovered
+        ? (turnStartOffset ?? start)
+        : resolveTurnStartOffset();
       events.push(...terminalExecFallbacks(
         path,
         lineStart,
-        turnStartOffset,
-        turnStartOffset >= start ? turnExecEntries : undefined,
+        terminalTurnStart,
+        turnFullyCovered ? turnExecEntries : undefined,
       ));
       events.push({
         uuid: `${path}:${lineStart}`,
@@ -1439,6 +1472,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
         } : {}),
       });
       turnStartOffset = cursor;
+      turnFullyCovered = true;
       turnExecEntries.length = 0;
       toolCallDeferralById.clear();
       continue;
@@ -1450,11 +1484,14 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
       && p.type === 'turn_aborted'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
+      const terminalTurnStart = turnFullyCovered
+        ? (turnStartOffset ?? start)
+        : resolveTurnStartOffset();
       events.push(...terminalExecFallbacks(
         path,
         lineStart,
-        turnStartOffset,
-        turnStartOffset >= start ? turnExecEntries : undefined,
+        terminalTurnStart,
+        turnFullyCovered ? turnExecEntries : undefined,
       ));
       events.push({
         uuid: `${path}:${lineStart}`,
@@ -1465,6 +1502,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
         terminalErrorCode: codexAbortErrorCode(p.reason),
       });
       turnStartOffset = cursor;
+      turnFullyCovered = true;
       turnExecEntries.length = 0;
       toolCallDeferralById.clear();
       continue;
@@ -1474,7 +1512,17 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     // boundary comes only from task_complete. Reasoning / tool calls surface
     // as cosmetic 'cot' events above, never as boundaries.
   }
-  return { events, newOffset, pendingTail, latestThreadSettings, latestModel, latestReasoningEffort };
+  return {
+    events,
+    newOffset,
+    pendingTail,
+    latestThreadSettings,
+    latestModel,
+    latestReasoningEffort,
+    ...(turnStartOffset !== undefined ? {
+      state: { nextOffset: newOffset, turnStartOffset },
+    } : {}),
+  };
 }
 
 function codexThreadSettingsFromEvent(obj: any): CodexThreadSettings | undefined {

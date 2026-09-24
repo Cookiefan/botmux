@@ -1183,6 +1183,47 @@ describe('drainCodexRollout', () => {
     expect(r2.events[0].kind).toBe('assistant_final');
   });
 
+  it('reuses the turn lower bound when tool calls and outputs cross ticks', () => {
+    writeFileSync(path, ev(userResponseItem('long running turn')) + ev({
+      type: 'response_item',
+      payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'cross-tick-0',
+        input: 'await tools.exec_command({ cmd: "echo 0" })',
+      },
+    }));
+    let drained = drainCodexRollout(path, 0);
+
+    const startedAt = performance.now();
+    for (let i = 0; i < 128; i++) {
+      appendFileSync(path,
+        ev({ type: 'event_msg', payload: { type: 'progress', blob: 'x'.repeat(64 * 1024) } })
+        + ev({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output', call_id: `cross-tick-${i}`, output: 'ok',
+          },
+        })
+        + ev({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call', name: 'exec', call_id: `cross-tick-${i + 1}`,
+            input: `await tools.exec_command({ cmd: "echo ${i + 1}" })`,
+          },
+        }));
+      drained = drainCodexRollout(path, drained.newOffset, drained.state);
+      expect(drained.events).toEqual([]);
+      expect(drained.state).toEqual({
+        nextOffset: drained.newOffset,
+        turnStartOffset: 0,
+      });
+    }
+    const elapsedMs = performance.now() - startedAt;
+
+    // This reads roughly 8 MiB in total. Eagerly reverse-scanning from every
+    // tick made the same fixture quadratic and took several seconds.
+    expect(elapsedMs).toBeLessThan(2_000);
+  });
+
   it('partial trailing line is held back as pendingTail', () => {
     writeFileSync(path, ev(userResponseItem('complete')) + '{"type":"response_item",partial');
     const r = drainCodexRollout(path, 0);
@@ -1212,9 +1253,10 @@ describe('drainCodexRollout', () => {
     // Simulate truncation: rewrite with strictly shorter content so the new
     // size is below r1.newOffset and the re-drain branch fires.
     writeFileSync(path, ev(userResponseItem('s')));
-    const r2 = drainCodexRollout(path, r1.newOffset);
+    const r2 = drainCodexRollout(path, r1.newOffset, r1.state);
     expect(r2.events).toHaveLength(1);
     expect(r2.events[0].text).toBe('s');
+    expect(r2.state).toEqual({ nextOffset: r2.newOffset, turnStartOffset: 0 });
   });
 });
 
