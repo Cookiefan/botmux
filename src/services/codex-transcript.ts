@@ -858,16 +858,16 @@ function codexAbortErrorCode(reason: unknown): string {
  * in a later incremental drain than their calls, so the byte offset alone is
  * insufficient; a backward chunk scan keeps the parser stateless without
  * loading an arbitrarily large rollout into memory. */
-function precedingCustomToolName(path: string, beforeOffset: number, callId: string): string | undefined {
+function precedingDeferredToolName(path: string, beforeOffset: number, callId: string): string | undefined {
   const consider = (line: string): string | undefined => {
     if (!line.includes(callId)) return undefined;
     let obj: any;
     try { obj = JSON.parse(line); } catch { return undefined; }
     const p = obj?.payload;
-    if (obj?.type === 'response_item'
-      && p?.type === 'custom_tool_call'
-      && p.call_id === callId
-      && typeof p.name === 'string') return p.name;
+    if (obj?.type !== 'response_item' || p?.call_id !== callId || typeof p.name !== 'string') return undefined;
+    if (p.type === 'function_call' && p.name === 'exec_command') return p.name;
+    if (p.type === 'custom_tool_call' && p.name === 'exec'
+      && isDeferredExecWrapper(typeof p.input === 'string' ? p.input : '')) return p.name;
     return undefined;
   };
   const chunkBytes = 64 * 1024;
@@ -903,9 +903,79 @@ function precedingCustomToolName(path: string, beforeOffset: number, callId: str
   return undefined;
 }
 
-/** Reconstruct the current turn only when it ends. The live reader can hide
- * exec wrappers without worker state; a backward scan restores wrappers if
- * Codex never wrote a native command event (or also changed a file). */
+function wrappedToolNames(input: string): string[] {
+  return [...input.matchAll(/\btools\.([A-Za-z_$][\w$]*)\s*\(/g)].map(match => match[1]!);
+}
+
+function isDeferredExecWrapper(input: string): boolean {
+  const toolNames = wrappedToolNames(input);
+  return toolNames.length > 0 && toolNames.every(name => name === 'exec_command');
+}
+
+function nativeCommandCandidates(item: any): string[] {
+  const candidates: string[] = [];
+  for (const parsed of Array.isArray(item?.parsed_cmd) ? item.parsed_cmd : []) {
+    if (typeof parsed?.cmd === 'string' && parsed.cmd) candidates.push(parsed.cmd);
+  }
+  if (Array.isArray(item?.command)) {
+    const script = [...item.command].reverse().find((part): part is string => typeof part === 'string' && part.length > 0);
+    if (script) candidates.push(script);
+  }
+  return [...new Set(candidates)];
+}
+
+function commandTemplateMatches(input: string, command: string): boolean {
+  const templateStart = /\bcmd\s*:\s*`/g;
+  let match: RegExpExecArray | null;
+  while ((match = templateStart.exec(input)) !== null) {
+    let end = match.index + match[0].length;
+    let escaped = false;
+    for (; end < input.length; end++) {
+      const char = input[end]!;
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (char === '`') break;
+    }
+    const template = input.slice(match.index + match[0].length, end);
+    const chunks = template.split(/\$\{[^}]*\}/g).filter(chunk => chunk.length >= 3);
+    let cursor = 0;
+    let matched = chunks.length > 0;
+    for (const chunk of chunks) {
+      const index = command.indexOf(chunk, cursor);
+      if (index === -1) {
+        matched = false;
+        break;
+      }
+      cursor = index + chunk.length;
+    }
+    if (matched) return true;
+    templateStart.lastIndex = end + 1;
+  }
+  return false;
+}
+
+function wrapperContainsCommand(input: string, command: string): boolean {
+  if (input.includes(command)) return true;
+  try {
+    if (input.includes(JSON.stringify(command).slice(1, -1))) return true;
+  } catch {
+    // Fall through to the shell-token normalisation below.
+  }
+  const withoutTokenQuotes = command.replace(/(['"])([^\s'"]+)\1/g, '$2');
+  return (withoutTokenQuotes !== command && input.includes(withoutTokenQuotes))
+    || commandTemplateMatches(input, command);
+}
+
+/** Reconstruct the current turn only when it ends. The live reader defers
+ * outer exec wrappers so native CommandExecution can replace only the exact
+ * exec_command it represents. Non-command tools and unmatched commands are
+ * restored at the terminal boundary. */
 function terminalExecFallbacks(path: string, beforeOffset: number): CodexBridgeEvent[] {
   const relevant: Array<{ offset: number; timestampMs: number; payload: any; type: string }> = [];
   let fd: number | undefined;
@@ -931,7 +1001,10 @@ function terminalExecFallbacks(path: string, beforeOffset: number): CodexBridgeE
           reachedUser = true;
           return;
         }
-        if ((obj?.type === 'response_item' && (p?.type === 'custom_tool_call' || p?.type === 'custom_tool_call_output'))
+        if ((obj?.type === 'response_item' && (
+          p?.type === 'custom_tool_call' || p?.type === 'custom_tool_call_output'
+          || p?.type === 'function_call' || p?.type === 'function_call_output'
+        ))
           || (obj?.type === 'event_msg' && p?.type === 'item_completed')) {
           const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
           relevant.push({ offset, timestampMs: Number.isFinite(ts) ? ts : Date.now(), payload: p, type: obj.type });
@@ -954,15 +1027,20 @@ function terminalExecFallbacks(path: string, beforeOffset: number): CodexBridgeE
   }
 
   const calls: Array<{
-    id: string; input: string; output?: string; outputOffset?: number; outputTimestampMs?: number;
-    sawNative: boolean; sawOtherItem: boolean;
+    id: string; name: string; input: string; output?: string; outputOffset?: number; outputTimestampMs?: number;
   }> = [];
+  const nativeCommands: Array<{ id?: string; candidates: string[] }> = [];
   for (const entry of relevant.reverse()) {
     const p = entry.payload;
     if (entry.type === 'response_item' && p.type === 'custom_tool_call' && p.name === 'exec'
+      && typeof p.call_id === 'string' && p.call_id
+      && isDeferredExecWrapper(typeof p.input === 'string' ? p.input : '')) {
+      calls.push({ id: p.call_id, name: 'exec', input: typeof p.input === 'string' ? p.input : '' });
+    } else if (entry.type === 'response_item' && p.type === 'function_call' && p.name === 'exec_command'
       && typeof p.call_id === 'string' && p.call_id) {
-      calls.push({ id: p.call_id, input: typeof p.input === 'string' ? p.input : '', sawNative: false, sawOtherItem: false });
-    } else if (entry.type === 'response_item' && p.type === 'custom_tool_call_output') {
+      calls.push({ id: p.call_id, name: 'exec_command', input: typeof p.arguments === 'string' ? p.arguments : '' });
+    } else if (entry.type === 'response_item'
+      && (p.type === 'custom_tool_call_output' || p.type === 'function_call_output')) {
       const call = calls.find(candidate => candidate.id === p.call_id);
       if (call) {
         call.output = stringifyCodexToolOutput(p.output);
@@ -971,16 +1049,21 @@ function terminalExecFallbacks(path: string, beforeOffset: number): CodexBridgeE
       }
     } else if (entry.type === 'event_msg' && p.type === 'item_completed') {
       if (p.item?.type === 'CommandExecution') {
-        for (const call of calls) if (!call.sawOtherItem) call.sawNative = true;
-      } else if (p.item?.type === 'FileChange') {
-        const latest = calls[calls.length - 1];
-        if (latest) latest.sawOtherItem = true;
+        nativeCommands.push({
+          id: typeof p.item.id === 'string' ? p.item.id : undefined,
+          candidates: nativeCommandCandidates(p.item),
+        });
       }
     }
   }
   return calls.flatMap(call => {
-    if (call.outputOffset === undefined || (call.sawNative && !call.sawOtherItem)) return [];
-    const cotEntries: CodexCotEntry[] = [toolCallEntry(call.id, 'exec', call.input, subjectFromArgsString(call.input))];
+    if (call.outputOffset === undefined) return [];
+    const execCommandCount = call.name === 'exec_command' ? 1 : wrappedToolNames(call.input).length;
+    const matchingNativeCount = nativeCommands.filter(native =>
+      native.id === call.id || native.candidates.some(command => wrapperContainsCommand(call.input, command)),
+    ).length;
+    if (matchingNativeCount >= execCommandCount) return [];
+    const cotEntries: CodexCotEntry[] = [toolCallEntry(call.id, call.name, call.input, subjectFromArgsString(call.input))];
     cotEntries.push({ kind: 'tool_result', id: call.id, result: truncateForCot(call.output ?? '', COT_TOOL_RESULT_MAX_CHARS) });
     return [{
       uuid: `${path}:${call.outputOffset}`, timestampMs: call.outputTimestampMs ?? Date.now(),
@@ -1016,7 +1099,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
   let latestThreadSettings: CodexThreadSettings | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
-  const execCallIds = new Set<string>();
+  const deferredToolCallIds = new Set<string>();
   // Track byte offset within the file as we walk lines so synthetic uuids
   // are stable across re-drains.
   let cursor = start;
@@ -1063,13 +1146,19 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     // collecting turn for the native CoT message; they never start or close
     // a turn (the boundaries above/below stay authoritative).
     if (obj.type === 'response_item') {
-      if (p.type === 'custom_tool_call' && p.name === 'exec' && typeof p.call_id === 'string' && p.call_id) {
-        execCallIds.add(p.call_id);
+      if (p.type === 'custom_tool_call' && p.name === 'exec' && typeof p.call_id === 'string' && p.call_id
+        && isDeferredExecWrapper(typeof p.input === 'string' ? p.input : '')) {
+        deferredToolCallIds.add(p.call_id);
         continue;
       }
-      if (p.type === 'custom_tool_call_output'
+      if (p.type === 'function_call' && p.name === 'exec_command' && typeof p.call_id === 'string' && p.call_id) {
+        deferredToolCallIds.add(p.call_id);
+        continue;
+      }
+      if ((p.type === 'custom_tool_call_output' || p.type === 'function_call_output')
         && typeof p.call_id === 'string'
-        && (execCallIds.delete(p.call_id) || precedingCustomToolName(path, lineStart, p.call_id) === 'exec')) {
+        && (deferredToolCallIds.delete(p.call_id)
+          || ['exec', 'exec_command'].includes(precedingDeferredToolName(path, lineStart, p.call_id) ?? ''))) {
         continue;
       }
       const cotEntries = codexCotEntriesFromResponseItem(p);
@@ -1080,11 +1169,8 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     }
     if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item?.type === 'CommandExecution') {
       const item = p.item;
-      const parsed = Array.isArray(item.parsed_cmd) ? item.parsed_cmd[0] : undefined;
       const command = Array.isArray(item.command) ? item.command : [];
-      const subject = typeof parsed?.cmd === 'string' && parsed.cmd
-        ? parsed.cmd
-        : [...command].reverse().find((part): part is string => typeof part === 'string') ?? '';
+      const subject = nativeCommandCandidates(item)[0] ?? '';
       let args = '';
       try { args = command.length > 0 ? JSON.stringify({ command }) : ''; } catch { /* ignore malformed command */ }
       const id = typeof item.id === 'string' && item.id ? item.id : `${path}:${lineStart}:command`;

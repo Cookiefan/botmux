@@ -391,7 +391,10 @@ describe('drainCodexRollout', () => {
     writeFileSync(path,
       ev({
         timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item',
-        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'outer-run', input: 'run command' },
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'outer-run',
+          input: 'await tools.exec_command({ cmd: "code --list-extensions --show-versions 2>/dev/null | rg -i \'openai|codex|chatgpt|continue|cline\' | head -35" })',
+        },
       }));
     const first = drainCodexRollout(path, 0);
     expect(first.events).toEqual([]);
@@ -408,7 +411,10 @@ describe('drainCodexRollout', () => {
       })
       + ev({
         timestamp: '2026-04-29T07:00:00.300Z', type: 'response_item',
-        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'outer-poll', input: 'poll command' },
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'outer-poll',
+          input: 'await tools.exec_command({ cmd: "code --list-extensions --show-versions 2>/dev/null | rg -i \'openai|codex|chatgpt|continue|cline\' | head -35" })',
+        },
       })
       + ev({
         timestamp: '2026-04-29T07:00:00.400Z', type: 'response_item',
@@ -449,7 +455,10 @@ describe('drainCodexRollout', () => {
       })
       + ev({
         timestamp: '2026-04-29T07:00:00.300Z', type: 'response_item',
-        payload: { type: 'custom_tool_call', name: 'exec', call_id: 'stale-exec', input: 'run' },
+        payload: {
+          type: 'custom_tool_call', name: 'exec', call_id: 'stale-exec',
+          input: 'await tools.exec_command({ cmd: "echo stale" })',
+        },
       })
       + ev(assistantFinalResponseItem('complete')));
     const completed = drainCodexRollout(path, first.newOffset);
@@ -462,7 +471,8 @@ describe('drainCodexRollout', () => {
   it('restores an exec wrapper at turn completion when no native command arrives', () => {
     writeFileSync(path, ev(userResponseItem('run a custom tool')) + ev({
       type: 'response_item', payload: {
-        type: 'custom_tool_call', name: 'exec', call_id: 'fallback-1', input: 'await tools.some_tool()'
+        type: 'custom_tool_call', name: 'exec', call_id: 'fallback-1',
+        input: 'await tools.exec_command({ cmd: "echo fallback" })',
       },
     }));
     const first = drainCodexRollout(path, 0);
@@ -487,7 +497,8 @@ describe('drainCodexRollout', () => {
     writeFileSync(path,
       ev(userResponseItem('first'))
       + ev({ type: 'response_item', payload: {
-        type: 'custom_tool_call', name: 'exec', call_id: 'old', input: 'old'
+        type: 'custom_tool_call', name: 'exec', call_id: 'old',
+        input: 'await tools.exec_command({ cmd: "echo old" })',
       } })
       + ev({ type: 'response_item', payload: {
         type: 'custom_tool_call_output', call_id: 'old', output: 'old output'
@@ -524,7 +535,130 @@ describe('drainCodexRollout', () => {
       } } })
       + ev(assistantFinalResponseItem('done')));
     const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
-    expect(cot.map(event => event.cotEntries?.[0]?.id)).toEqual(['native-3', 'mixed']);
+    const calls = cot.flatMap(event => event.cotEntries ?? []).filter(entry => entry.kind === 'tool_call');
+    expect(calls.map(entry => entry.id)).toEqual(['mixed', 'native-3']);
+  });
+
+  it('keeps non-command exec wrappers that precede a native shell command', () => {
+    writeFileSync(path,
+      ev(userResponseItem('plan then inspect'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'plan-wrapper',
+        input: 'await tools.update_plan({ plan: [] })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'plan-wrapper', output: '{"output":"updated"}',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'shell-wrapper',
+        input: 'await tools.exec_command({ cmd: "git status --short" })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'shell-wrapper', output: '{"output":"wrapper"}',
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-status', command: ['bash', '-lc', 'git status --short'], stdout: 'clean',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot.flatMap(event => event.cotEntries ?? [])).toEqual([
+      expect.objectContaining({ kind: 'tool_call', id: 'plan-wrapper', name: 'exec' }),
+      { kind: 'tool_result', id: 'plan-wrapper', result: 'updated' },
+      expect.objectContaining({ kind: 'tool_call', id: 'native-status', name: 'shell' }),
+      { kind: 'tool_result', id: 'native-status', result: 'clean' },
+    ]);
+  });
+
+  it('keeps an unmatched command wrapper when another native command exists', () => {
+    writeFileSync(path,
+      ev(userResponseItem('run both'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'early-wrapper',
+        input: 'await tools.exec_command({ cmd: "echo early" })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'early-wrapper', output: '{"output":"early"}',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'late-wrapper',
+        input: 'await tools.exec_command({ cmd: "echo late" })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'late-wrapper', output: '{"output":"late"}',
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-late', command: ['bash', '-lc', 'echo late'], stdout: 'late',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot.map(event => event.cotEntries?.[0]?.id)).toEqual(['native-late', 'early-wrapper']);
+  });
+
+  it('does not duplicate a shell command merely because it also changes files', () => {
+    const command = 'mkdir -p tmp && cp a tmp/a';
+    writeFileSync(path,
+      ev(userResponseItem('copy the file'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'copy-wrapper',
+        input: `await tools.exec_command({ cmd: ${JSON.stringify(command)} })`,
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-copy', command: ['bash', '-lc', command], stdout: '',
+      } } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'FileChange', id: 'copy-files',
+      } } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'copy-wrapper', output: '{"output":""}',
+      } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'native-copy' });
+  });
+
+  it('deduplicates legacy exec_command function calls by call id', () => {
+    writeFileSync(path,
+      ev(userResponseItem('inspect'))
+      + ev({ type: 'response_item', payload: {
+        type: 'function_call', name: 'exec_command', call_id: 'legacy-call',
+        arguments: '{"cmd":"pwd"}',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'function_call_output', call_id: 'legacy-call', output: '{"output":"/repo"}',
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'legacy-call', command: ['bash', '-lc', 'pwd'], stdout: '/repo',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'legacy-call', name: 'shell' });
+  });
+
+  it('matches a native command produced from a wrapper template literal', () => {
+    writeFileSync(path,
+      ev(userResponseItem('inspect docs'))
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'template-wrapper',
+        input: 'const doc = "abc"; await tools.exec_command({ cmd: `fetch --doc ${doc} --format json` })',
+      } })
+      + ev({ type: 'response_item', payload: {
+        type: 'custom_tool_call_output', call_id: 'template-wrapper', output: '{"output":"wrapper"}',
+      } })
+      + ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
+        type: 'CommandExecution', id: 'native-template',
+        command: ['bash', '-lc', 'fetch --doc abc --format json'], stdout: 'native',
+      } } })
+      + ev(assistantFinalResponseItem('done')));
+
+    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    expect(cot).toHaveLength(1);
+    expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'native-template' });
   });
 
   it('skips developer role messages', () => {
